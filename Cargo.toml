@@ -1,0 +1,21 @@
+[package]
+name = "protomorph"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+opt-level = 3 # Default for release, optimizes for speed
+lto = "fat"   # Enables more aggressive Link-Time Optimization
+codegen-units = 1 # Allows whole-program optimization, increases compile time
+panic = "abort" # Optional: reduces binary size if panics should terminate the process
+
+[dependencies]
+asset-importer = { version = "0.7", default-features = false, features = ["system"] }
+bitflags = "2"
+bytemuck = { version = "1.24", features = ["derive"] }
+glam = { version = "0.32", features = ["bytemuck"] }
+glyphon = "0.10"
+pollster = "0.4"
+rand = "0.9"
+wgpu = "28.0"
+winit = "0.30"
