@@ -378,7 +378,8 @@ pub struct GpuMaterialProps {
     pub emissive_color: [f32; 3],
     pub emissive_intensity: f32,
     pub roughness: f32,
-    pub _pad: [f32; 3],
+    pub fresnel_f0: f32,
+    pub _pad: [f32; 2],
 }
 
 impl GpuMaterialProps {
@@ -399,7 +400,8 @@ impl GpuMaterialProps {
             },
             emissive_intensity: mat.emissive.intensity,
             roughness: 0.5,  // hardcoded; ignore assimp PBR data for now
-            _pad: [0.0; 3],
+            fresnel_f0: 0.15,  // compromise between dielectric 0.04 and Halo 3's 0.5
+            _pad: [0.0; 2],
         }
     }
 }

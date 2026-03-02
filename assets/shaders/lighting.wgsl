@@ -237,6 +237,11 @@ fn fresnel_exact(f0: vec3<f32>, v_dot_h: f32) -> vec3<f32> {
     return clamp(0.5 * ((gmc * gmc) / (gpc * gpc + vec3(0.00001))) * (vec3(1.0) + r * r), vec3(0.0), vec3(1.0));
 }
 
+// Halo 3 lighting constants
+const ANALYTICAL_SPECULAR_CONTRIBUTION: f32 = 0.5;  // other half from SH area specular (not implemented)
+const ALBEDO_BLEND: f32 = 0.0;  // 0=white specular, 1=albedo-tinted (metallic)
+const ANTI_SHADOW_CONTROL: f32 = 0.1;  // 0=no attenuation, 1=aggressive shadow-edge kill
+
 // Single HDR output — bloom prefilter handles brightness extraction
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -252,6 +257,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let material_ambient_amount = mat_sample.r;
     let material_specular_amount = mat_sample.g;
     let roughness = max(mat_sample.b, 0.05);  // Halo 3: max(roughness, 0.05)
+    let fresnel_f0 = mat_sample.a;
 
     let ambient_occlusion = textureSample(t_ssao, s_nearest, uv).r;
 
@@ -290,16 +296,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
             let D = beckmann_ndf(n_dot_h, roughness);
             let G = ct_geometry(n_dot_h, n_dot_v, n_dot_l, v_dot_h);
-            let F = fresnel_exact(vec3(0.04), v_dot_h);  // f0=0.04 dielectric
+            let F = fresnel_exact(vec3(fresnel_f0), v_dot_h);
 
-            // Halo 3 denominator: pi * NdotV (not standard 4 * NdotL * NdotV)
-            let ct = D * saturate(G) / (3.14159 * n_dot_v + 0.00001) * F;
+            // Standard Cook-Torrance denominator: 4 * NdotV (post NdotL cancellation)
+            let ct = D * saturate(G) / (4.0 * n_dot_v + 0.00001) * F;
 
-            // Anti-shadow clamp — cook_torrance.fx line 298
-            let clamped = min(ct, vec3(n_dot_l + 1.0));
+            // Anti-shadow clamp — cook_torrance.fx line 298, tunable control
+            let clamped = min(ct, vec3(n_dot_l + (1.0 - ANTI_SHADOW_CONTROL)));
 
-            // specular_amount and spec_tex scale the result (NOT used as f0)
-            specular_color = material_specular_amount * albedo_specular.a * clamped * light.specular_color;
+            // Albedo blend: interpolate specular tint between white and surface albedo
+            let spec_tint = mix(vec3(1.0), albedo_specular.rgb, ALBEDO_BLEND);
+
+            specular_color = ANALYTICAL_SPECULAR_CONTRIBUTION * material_specular_amount * albedo_specular.a * (clamped * spec_tint) * light.specular_color;
         }
 
         // Attenuation for non-directional lights

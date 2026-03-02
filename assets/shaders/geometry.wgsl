@@ -27,7 +27,7 @@ struct MaterialProps {
     emissive_color: vec3<f32>,
     emissive_intensity: f32,
     roughness: f32,
-    _pad1: f32,
+    fresnel_f0: f32,
     _pad2: f32,
     _pad3: f32,
 };
@@ -130,7 +130,7 @@ fn fs_main(in: VertexOutput) -> GBufferOutput {
         material.ambient_amount,
         material.specular_amount,
         material.roughness,
-        0.0
+        material.fresnel_f0
     );
 
     return out;

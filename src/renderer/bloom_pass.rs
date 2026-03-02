@@ -51,8 +51,8 @@ impl BloomPass {
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some(&format!("bloom_params_{i}")),
                         contents: bytemuck::bytes_of(&BloomDownsampleParams {
-                            threshold: 0.6,
-                            knee: 0.6,
+                            threshold: 0.8,
+                            knee: 0.3,
                             texel_size: [0.0, 0.0],
                         }),
                         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -453,8 +453,8 @@ fn update_bloom_params(
     mip_sizes: &[(u32, u32)],
 ) {
     let params0 = BloomDownsampleParams {
-        threshold: 0.6,
-        knee: 0.6,
+        threshold: 0.8,
+        knee: 0.3,
         texel_size: [1.0 / screen_w as f32, 1.0 / screen_h as f32],
     };
 
