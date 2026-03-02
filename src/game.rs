@@ -1,6 +1,7 @@
 use crate::{
     animation::AnimationManager,
     camera::Camera,
+    gpu_types::GpuAtmosphereData,
     lights::{LightData, LightIndex, LightStore},
     model::ModelData,
     objects::{ObjectIndex, ObjectStore},
@@ -48,6 +49,7 @@ pub struct GameState {
     pub camera: Camera,
     pub model_data: Vec<ModelData>,
     pub fps_counter: FpsCounter,
+    pub atmosphere: GpuAtmosphereData,
 
     flashlight_index: LightIndex,
     weapon_index: ObjectIndex,
@@ -76,39 +78,61 @@ impl GameState {
         flashlight.casts_shadow = true;
         let flashlight_index = lights.new_light(flashlight);
 
-        // Angled spot light over the grunt
-        let mut grunt_spot = LightData::new_spot();
-        grunt_spot.position = Vec3::new(-3.0, 2.0, 5.0);
-        grunt_spot.direction = (Vec3::new(-5.0, 0.0, 0.0) - grunt_spot.position).normalize();
-        grunt_spot.diffuse_color = Vec3::splat(2.0);
-        grunt_spot.ambient_color = Vec3::splat(0.1);
-        grunt_spot.specular_color = Vec3::splat(2.0);
-        grunt_spot.constant_atten = 1.0;
-        grunt_spot.linear_atten = 0.02;
-        grunt_spot.quadratic_atten = 0.005;
-        grunt_spot.inner_cutoff = 20.0;
-        grunt_spot.outer_cutoff = 35.0;
-        grunt_spot.casts_shadow = true;
-        lights.new_light(grunt_spot);
+        // // Angled spot light over the grunt
+        // let mut grunt_spot = LightData::new_spot();
+        // grunt_spot.position = Vec3::new(-3.0, 2.0, 5.0);
+        // grunt_spot.direction = (Vec3::new(-5.0, 0.0, 0.0) - grunt_spot.position).normalize();
+        // grunt_spot.diffuse_color = Vec3::splat(2.0);
+        // grunt_spot.ambient_color = Vec3::splat(0.1);
+        // grunt_spot.specular_color = Vec3::splat(2.0);
+        // grunt_spot.constant_atten = 1.0;
+        // grunt_spot.linear_atten = 0.02;
+        // grunt_spot.quadratic_atten = 0.005;
+        // grunt_spot.inner_cutoff = 20.0;
+        // grunt_spot.outer_cutoff = 35.0;
+        // grunt_spot.casts_shadow = true;
+        // lights.new_light(grunt_spot);
 
-        // Noon summer sun
-        let mut sun = LightData::new_point();
-        sun.position = Vec3::new(0.0, 0.0, 10.0);
+        // // Warm sunset — low sun from front-left
+        // let mut sun = LightData::new_directional();
+        // let sun_dir = Vec3::new(-0.7, 0.4, -0.2).normalize();
+        // sun.direction = sun_dir;
+        // sun.diffuse_color = Vec3::new(1.4, 0.7, 0.3);
+        // sun.ambient_color = Vec3::new(0.12, 0.08, 0.06);
+        // sun.specular_color = Vec3::new(1.4, 0.7, 0.3);
+        // sun.casts_shadow = true;
+        // lights.new_light(sun);
+
+        // Noon summer sun (directional with CSM shadows)
+        let mut sun = LightData::new_directional();
+        let sun_dir = Vec3::new(-0.5, 0.3, -0.866).normalize();
+        sun.direction = sun_dir;
         sun.diffuse_color = Vec3::new(1.0, 0.95, 0.8);
         sun.ambient_color = Vec3::new(0.15, 0.14, 0.12);
         sun.specular_color = Vec3::new(1.0, 0.95, 0.8);
-        sun.constant_atten = 1.0;
-        sun.linear_atten = 0.007;
-        sun.quadratic_atten = 0.0002;
         sun.casts_shadow = true;
         lights.new_light(sun);
 
+        let atmo_sun = -sun_dir; // direction TO the sun = negation of light travel
         let mut state = Self {
             objects: ObjectStore::new(),
             lights,
             camera,
             model_data: Vec::new(),
             fps_counter: FpsCounter::new(),
+            atmosphere: GpuAtmosphereData {
+                sun_direction: atmo_sun.to_array(),
+                atmosphere_enable: 1.0,
+                rayleigh_coefficients: [0.02, 0.05, 0.1],
+                rayleigh_height_scale: 20.0,
+                mie_coefficient: 0.01,
+                mie_height_scale: 8.0,
+                mie_g: 0.76,
+                max_fog_thickness: 50.0,
+                inscatter_scale: 1.0,
+                reference_height: 0.0,
+                _pad: [0.0; 2],
+            },
             flashlight_index,
             weapon_index: ObjectIndex(0),
             grunt_index: ObjectIndex(0),

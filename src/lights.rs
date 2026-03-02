@@ -52,6 +52,24 @@ impl LightData {
         }
     }
 
+    pub fn new_directional() -> Self {
+        Self {
+            light_type: LightType::Directional,
+            hidden: false,
+            casts_shadow: false,
+            position: Vec3::ZERO,
+            direction: Vec3::new(0.0, 0.0, -1.0),
+            diffuse_color: Vec3::ONE,
+            ambient_color: Vec3::splat(0.05),
+            specular_color: Vec3::ONE,
+            constant_atten: 1.0,
+            linear_atten: 0.0,
+            quadratic_atten: 0.0,
+            inner_cutoff: 0.0,
+            outer_cutoff: 0.0,
+        }
+    }
+
     pub fn new_spot() -> Self {
         Self {
             light_type: LightType::Spot,

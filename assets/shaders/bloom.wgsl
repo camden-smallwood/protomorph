@@ -1,4 +1,4 @@
-// HDR + bloom composite with ACES tone mapping
+// HDR + bloom composite with ACES tone mapping, saturation control, film grain
 // Reads the HDR lighting buffer and bloom texture, composites, tone maps, outputs to sRGB swapchain
 
 @group(0) @binding(0) var t_base: texture_2d<f32>;
@@ -8,8 +8,8 @@
 struct CompositeParams {
     bloom_strength: f32,
     exposure: f32,
-    _pad1: f32,
-    _pad2: f32,
+    saturation: f32,
+    grain_intensity: f32,
 };
 @group(0) @binding(3) var<uniform> params: CompositeParams;
 
@@ -41,13 +41,31 @@ fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Hash-based noise for film grain
+fn hash(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let base = textureSample(t_base, s_filtering, in.tex_coords).rgb;
     let bloom = textureSample(t_bloom, s_filtering, in.tex_coords).rgb;
 
     let hdr = base + bloom * params.bloom_strength;
-    let tonemapped = aces_tonemap(hdr * params.exposure);
+    var color = aces_tonemap(hdr * params.exposure);
 
-    return vec4<f32>(tonemapped, 1.0);
+    // Saturation adjustment
+    let luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    color = mix(vec3(luma), color, params.saturation);
+
+    // Film grain
+    if (params.grain_intensity > 0.0) {
+        let noise = hash(in.clip_position.xy) * 2.0 - 1.0;
+        let grain_amount = params.grain_intensity * (1.0 - luma * 0.5);
+        color += vec3(noise * grain_amount);
+    }
+
+    return vec4(color, 1.0);
 }

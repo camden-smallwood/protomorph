@@ -24,9 +24,12 @@ pub struct GBuffer {
 
 pub struct IntermediateTargets {
     pub ssao_view: wgpu::TextureView,
+    pub ssao_blur_view: wgpu::TextureView,
     pub lighting_base_view: wgpu::TextureView,
+    pub god_rays_view: wgpu::TextureView,
     pub bloom_mip_views: Vec<wgpu::TextureView>,
     pub bloom_mip_sizes: Vec<(u32, u32)>,
+    pub post_composite_view: wgpu::TextureView,
 }
 
 pub struct FallbackTextures {
@@ -82,7 +85,12 @@ pub fn create_gbuffer(device: &wgpu::Device, w: u32, h: u32) -> GBuffer {
     }
 }
 
-pub fn create_intermediates(device: &wgpu::Device, w: u32, h: u32) -> IntermediateTargets {
+pub fn create_intermediates(
+    device: &wgpu::Device,
+    w: u32,
+    h: u32,
+    surface_format: wgpu::TextureFormat,
+) -> IntermediateTargets {
     let ssao = create_screen_texture(
         device,
         (w / 2).max(1),
@@ -91,12 +99,36 @@ pub fn create_intermediates(device: &wgpu::Device, w: u32, h: u32) -> Intermedia
         "ssao",
     );
 
+    let ssao_blur = create_screen_texture(
+        device,
+        (w / 2).max(1),
+        (h / 2).max(1),
+        wgpu::TextureFormat::R8Unorm,
+        "ssao_blur",
+    );
+
     let lighting_base = create_screen_texture(
         device,
         w,
         h,
         wgpu::TextureFormat::Rgba16Float,
         "lighting_base",
+    );
+
+    let god_rays = create_screen_texture(
+        device,
+        (w / 2).max(1),
+        (h / 2).max(1),
+        wgpu::TextureFormat::Rgba16Float,
+        "god_rays",
+    );
+
+    let post_composite = create_screen_texture(
+        device,
+        w,
+        h,
+        surface_format,
+        "post_composite",
     );
 
     let mut bloom_mip_views = Vec::with_capacity(BLOOM_MIP_COUNT);
@@ -124,9 +156,12 @@ pub fn create_intermediates(device: &wgpu::Device, w: u32, h: u32) -> Intermedia
 
     IntermediateTargets {
         ssao_view: dv(&ssao),
+        ssao_blur_view: dv(&ssao_blur),
         lighting_base_view: dv(&lighting_base),
+        god_rays_view: dv(&god_rays),
         bloom_mip_views,
         bloom_mip_sizes,
+        post_composite_view: dv(&post_composite),
     }
 }
 
@@ -167,6 +202,7 @@ pub struct SharedResources {
 
     // Lighting
     pub lighting_buffer: wgpu::Buffer,
+    pub atmosphere_buffer: wgpu::Buffer,
     pub lighting_uniforms_bgl: wgpu::BindGroupLayout,
     pub lighting_uniforms_bind_group: wgpu::BindGroup,
 
@@ -295,6 +331,13 @@ impl SharedResources {
             mapped_at_creation: false,
         });
 
+        let atmosphere_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("atmosphere_buffer"),
+            size: size_of::<GpuAtmosphereData>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // --- Bind groups ---
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("camera_bg"),
@@ -331,10 +374,16 @@ impl SharedResources {
         let lighting_uniforms_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lighting_uniforms_bg"),
             layout: &lighting_uniforms_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: lighting_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: lighting_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: atmosphere_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         Self {
@@ -358,6 +407,7 @@ impl SharedResources {
             node_matrices_stride,
             node_matrices_bind_group,
             lighting_buffer,
+            atmosphere_buffer,
             lighting_uniforms_bgl,
             lighting_uniforms_bind_group,
             material_bgl,
@@ -439,11 +489,19 @@ pub fn create_node_matrices_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout 
 pub fn create_lighting_uniforms_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("lighting_uniforms_bgl"),
-        entries: &[uniform_entry(
-            0,
-            size_of::<GpuLightingUniforms>() as u64,
-            wgpu::ShaderStages::FRAGMENT,
-            false,
-        )],
+        entries: &[
+            uniform_entry(
+                0,
+                size_of::<GpuLightingUniforms>() as u64,
+                wgpu::ShaderStages::FRAGMENT,
+                false,
+            ),
+            uniform_entry(
+                1,
+                size_of::<GpuAtmosphereData>() as u64,
+                wgpu::ShaderStages::FRAGMENT,
+                false,
+            ),
+        ],
     })
 }

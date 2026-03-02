@@ -399,8 +399,25 @@ impl GpuMaterialProps {
                 mat.base.color_emissive.into()
             },
             emissive_intensity: mat.emissive.intensity,
-            roughness: 0.5,  // hardcoded; ignore assimp PBR data for now
-            fresnel_f0: 0.15,  // compromise between dielectric 0.04 and Halo 3's 0.5
+            roughness: {
+                if mat.pbr.roughness_factor > 0.0 {
+                    // PBR workflow (glTF, USDZ) — direct [0,1] roughness
+                    mat.pbr.roughness_factor
+                } else if mat.base.shininess > 1.0 {
+                    // Legacy Blinn-Phong — Beckmann NDF mapping
+                    (2.0 / (mat.base.shininess + 2.0)).sqrt()
+                } else {
+                    0.5
+                }
+            },
+            fresnel_f0: {
+                if mat.pbr.metallic_factor > 0.0 {
+                    // Metallic workflow — blend dielectric (0.04) to conductor (0.5)
+                    0.04 + mat.pbr.metallic_factor * 0.46
+                } else {
+                    0.15
+                }
+            },
             _pad: [0.0; 2],
         }
     }

@@ -9,7 +9,7 @@ const LIGHT_TYPE_SPOT: u32 = 2u;
 // Shadow constants — must match gpu_types.rs
 const SHADOW_MAP_SIZE_F: f32 = 1024.0;
 const SHADOW_PCF_SPREAD: f32 = 3.0;
-const SHADOW_NORMAL_BIAS_SCALE: f32 = 4.0;
+const SHADOW_NORMAL_BIAS_SCALE: f32 = 3.0;
 
 // Group 0: G-buffer textures (5 textures + sampler)
 @group(0) @binding(0) var t_position_depth: texture_2d<f32>;
@@ -48,6 +48,21 @@ struct LightingUniforms {
 };
 @group(1) @binding(0) var<uniform> lighting: LightingUniforms;
 
+struct AtmosphereData {
+    sun_direction: vec3<f32>,
+    atmosphere_enable: f32,
+    rayleigh_coefficients: vec3<f32>,
+    rayleigh_height_scale: f32,
+    mie_coefficient: f32,
+    mie_height_scale: f32,
+    mie_g: f32,
+    max_fog_thickness: f32,
+    inscatter_scale: f32,
+    reference_height: f32,
+    _pad: vec2<f32>,
+};
+@group(1) @binding(1) var<uniform> atmosphere: AtmosphereData;
+
 // Group 2: Shadow maps
 @group(2) @binding(0) var t_shadow_cube_0: texture_depth_cube;
 @group(2) @binding(1) var t_shadow_cube_1: texture_depth_cube;
@@ -59,8 +74,33 @@ struct ShadowData {
     point_params: array<vec4<f32>, 2>,
     spot_view_proj: array<mat4x4<f32>, 2>,
     spot_params: array<vec4<f32>, 2>,
+    cascade_view_proj: array<mat4x4<f32>, 3>,
+    cascade_splits: vec4<f32>,
+    cascade_texel_sizes: vec4<f32>,
+    light_size_uv: vec4<f32>,
+    pcss_params: vec4<f32>,
 };
 @group(2) @binding(5) var<uniform> shadow_data: ShadowData;
+@group(2) @binding(6) var t_shadow_cascade: texture_depth_2d_array;
+
+// Group 3: Environment cubemap
+@group(3) @binding(0) var t_env_cubemap: texture_cube<f32>;
+@group(3) @binding(1) var s_env_filtering: sampler;
+
+struct EnvProbeData {
+    probe_position: vec3<f32>,
+    env_roughness_scale: f32,
+    env_specular_contribution: f32,
+    env_mip_count: f32,
+    env_intensity: f32,
+    env_diffuse_intensity: f32,
+};
+@group(3) @binding(2) var<uniform> env_probe: EnvProbeData;
+
+struct SHCoefficients {
+    coefficients: array<vec4<f32>, 9>,
+};
+@group(3) @binding(3) var<uniform> sh_data: SHCoefficients;
 
 // 8-sample Poisson disk for PCF (unit disk, values in [-1, 1])
 const POISSON_DISK: array<vec2<f32>, 8> = array<vec2<f32>, 8>(
@@ -95,7 +135,8 @@ fn apply_normal_offset(
 ) -> vec3<f32> {
     let n_dot_l = max(dot(frag_normal, light_dir), 0.0);
     let texel_world = 2.0 * dist / SHADOW_MAP_SIZE_F;
-    return frag_pos + frag_normal * (1.0 - n_dot_l) * texel_world * SHADOW_NORMAL_BIAS_SCALE;
+    let bias_factor = max(1.0 - n_dot_l, 0.2);
+    return frag_pos + frag_normal * bias_factor * texel_world * SHADOW_NORMAL_BIAS_SCALE;
 }
 
 // Fullscreen quad vertex
@@ -171,13 +212,22 @@ fn calculate_spot_shadow(
     light_dir: vec3<f32>,
     screen_pos: vec2<f32>,
 ) -> f32 {
+    let params = shadow_data.spot_params[shadow_idx];
+    let spot_texel_size = params.y; // 1.0 / spot_shadow_map_size
     let view_proj = shadow_data.spot_view_proj[shadow_idx];
 
-    // Normal offset bias
+    // Normal offset bias — use actual spot map texel size
     let dist = length(light_pos - frag_pos);
-    let biased_pos = apply_normal_offset(frag_pos, frag_normal, light_dir, dist);
+    let n_dot_l = max(dot(frag_normal, light_dir), 0.0);
+    let texel_world = 2.0 * dist * spot_texel_size;
+    let bias_factor = max(1.0 - n_dot_l, 0.2);
+    let biased_pos = frag_pos + frag_normal * bias_factor * texel_world * SHADOW_NORMAL_BIAS_SCALE;
 
     let frag_light_space = view_proj * vec4(biased_pos, 1.0);
+
+    // Per-pixel slope bias replacing hardware slope_scale (smooth across triangle boundaries)
+    let tan_theta = sqrt(1.0 - n_dot_l * n_dot_l) / max(n_dot_l, 0.001);
+    let depth_bias = 0.001 + min(tan_theta, 10.0) * 0.0005;
 
     // Fragment behind the light — no shadow
     if (frag_light_space.w <= 0.0) {
@@ -188,27 +238,160 @@ fn calculate_spot_shadow(
 
     // NDC XY [-1,1] -> UV [0,1], flip Y for wgpu texture coords
     let uv = vec2(proj.x * 0.5 + 0.5, -proj.y * 0.5 + 0.5);
+    // Shift reference depth toward light to fight acne at grazing angles
+    let ref_z = proj.z - depth_bias;
 
     // Out of range = not in shadow
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || proj.z < 0.0 || proj.z > 1.0) {
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ref_z < 0.0 || proj.z > 1.0) {
         return 1.0;
     }
 
     // Rotated Poisson disk PCF
-    let texel_size = 1.0 / SHADOW_MAP_SIZE_F;
     let rotation = random_angle(screen_pos);
 
     var shadow = 0.0;
     for (var i = 0u; i < 8u; i++) {
         let p = rotate_offset(POISSON_DISK[i], rotation);
-        let offset_uv = uv + p * SHADOW_PCF_SPREAD * texel_size;
+        let offset_uv = uv + p * SHADOW_PCF_SPREAD * spot_texel_size;
         if (shadow_idx == 0u) {
-            shadow += textureSampleCompareLevel(t_shadow_2d_0, s_shadow_compare, offset_uv, proj.z);
+            shadow += textureSampleCompareLevel(t_shadow_2d_0, s_shadow_compare, offset_uv, ref_z);
         } else {
-            shadow += textureSampleCompareLevel(t_shadow_2d_1, s_shadow_compare, offset_uv, proj.z);
+            shadow += textureSampleCompareLevel(t_shadow_2d_1, s_shadow_compare, offset_uv, ref_z);
         }
     }
     return shadow / 8.0;
+}
+
+const CSM_MAP_SIZE_F: f32 = 2048.0;
+const CSM_BLEND_FRACTION: f32 = 0.1; // blend in last 10% before each split boundary
+
+// 4x4 grid offsets for blocker search (normalized to [-1,1])
+const BLOCKER_SEARCH_SAMPLES: u32 = 16u;
+
+fn find_blocker_depth_cascade(
+    uv: vec2<f32>,
+    receiver_depth: f32,
+    cascade_idx: u32,
+    search_radius: f32,
+) -> vec2<f32> {
+    let texel_size = 1.0 / CSM_MAP_SIZE_F;
+    let search_size = search_radius * texel_size;
+
+    var blocker_sum = 0.0;
+    var blocker_count = 0.0;
+
+    // 4x4 grid search
+    for (var y = -1.5; y <= 1.5; y += 1.0) {
+        for (var x = -1.5; x <= 1.5; x += 1.0) {
+            let offset = vec2(x, y) * search_size / 1.5;
+            let sample_uv = uv + offset;
+
+            if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0) {
+                continue;
+            }
+
+            let coords = vec2<i32>(vec2<f32>(sample_uv * CSM_MAP_SIZE_F));
+            let depth = textureLoad(t_shadow_cascade, coords, cascade_idx, 0);
+
+            if (depth < receiver_depth) {
+                blocker_sum += depth;
+                blocker_count += 1.0;
+            }
+        }
+    }
+
+    return vec2(blocker_sum, blocker_count);
+}
+
+fn sample_cascade_pcss(
+    frag_pos: vec3<f32>,
+    frag_normal: vec3<f32>,
+    light_dir: vec3<f32>,
+    screen_pos: vec2<f32>,
+    cascade_idx: u32,
+) -> f32 {
+    let texel_world = shadow_data.cascade_texel_sizes[cascade_idx];
+    let n_dot_l = max(dot(frag_normal, light_dir), 0.0);
+    let bias_factor = max(1.0 - n_dot_l, 0.2);
+    let biased_pos = frag_pos + frag_normal * bias_factor * texel_world * SHADOW_NORMAL_BIAS_SCALE;
+
+    let view_proj = shadow_data.cascade_view_proj[cascade_idx];
+    let frag_light_space = view_proj * vec4(biased_pos, 1.0);
+    let proj = frag_light_space.xyz / frag_light_space.w;
+    let uv = vec2(proj.x * 0.5 + 0.5, -proj.y * 0.5 + 0.5);
+
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || proj.z < 0.0 || proj.z > 1.0) {
+        return 1.0;
+    }
+
+    let light_size = shadow_data.light_size_uv[cascade_idx];
+    let search_radius = shadow_data.pcss_params.x;
+    let min_penumbra = shadow_data.pcss_params.y;
+    let max_penumbra = shadow_data.pcss_params.z;
+
+    // Blocker search
+    let blocker_result = find_blocker_depth_cascade(uv, proj.z, cascade_idx, search_radius);
+    let blocker_count = blocker_result.y;
+
+    // No blockers — fully lit
+    if (blocker_count < 0.5) {
+        return 1.0;
+    }
+
+    let avg_blocker_depth = blocker_result.x / blocker_count;
+
+    // Penumbra estimation
+    let penumbra = light_size * (proj.z - avg_blocker_depth) / max(avg_blocker_depth, 0.0001);
+    let pcf_radius = clamp(penumbra * CSM_MAP_SIZE_F, min_penumbra, max_penumbra);
+
+    // Variable-radius PCF with rotated Poisson disk
+    let texel_size = 1.0 / CSM_MAP_SIZE_F;
+    let rotation = random_angle(screen_pos);
+    var shadow = 0.0;
+    for (var i = 0u; i < 8u; i++) {
+        let p = rotate_offset(POISSON_DISK[i], rotation);
+        let offset_uv = uv + p * pcf_radius * texel_size;
+        shadow += textureSampleCompareLevel(
+            t_shadow_cascade, s_shadow_compare,
+            offset_uv, cascade_idx, proj.z
+        );
+    }
+    return shadow / 8.0;
+}
+
+fn calculate_directional_shadow(
+    frag_pos: vec3<f32>,
+    camera_pos: vec3<f32>,
+    frag_normal: vec3<f32>,
+    light_dir: vec3<f32>,
+    screen_pos: vec2<f32>,
+) -> f32 {
+    // Select cascade based on camera distance
+    let dist = length(frag_pos - camera_pos);
+    var cascade_idx = 0u;
+    if (dist > shadow_data.cascade_splits.x) { cascade_idx = 1u; }
+    if (dist > shadow_data.cascade_splits.y) { cascade_idx = 2u; }
+
+    // Beyond last cascade — no shadow
+    if (dist > shadow_data.cascade_splits.z) { return 1.0; }
+
+    let shadow_current = sample_cascade_pcss(frag_pos, frag_normal, light_dir, screen_pos, cascade_idx);
+
+    // Blend at cascade transitions: in the last 10% before each split boundary,
+    // sample both current and next cascade and mix between them
+    let splits = shadow_data.cascade_splits;
+    var split_end = splits.x;
+    if (cascade_idx == 1u) { split_end = splits.y; }
+    if (cascade_idx == 2u) { split_end = splits.z; }
+
+    let blend_start = split_end * (1.0 - CSM_BLEND_FRACTION);
+    if (cascade_idx < 2u && dist > blend_start) {
+        let shadow_next = sample_cascade_pcss(frag_pos, frag_normal, light_dir, screen_pos, cascade_idx + 1u);
+        let blend_t = (dist - blend_start) / (split_end - blend_start);
+        return mix(shadow_current, shadow_next, blend_t);
+    }
+
+    return shadow_current;
 }
 
 // Beckmann NDF — cook_torrance.fx lines 280-284
@@ -242,6 +425,114 @@ const ANALYTICAL_SPECULAR_CONTRIBUTION: f32 = 0.5;  // other half from SH area s
 const ALBEDO_BLEND: f32 = 0.0;  // 0=white specular, 1=albedo-tinted (metallic)
 const ANTI_SHADOW_CONTROL: f32 = 0.1;  // 0=no attenuation, 1=aggressive shadow-edge kill
 
+// Halo 3 rim fresnel — cook_torrance.fx lines 1403-1475
+const RIM_FRESNEL_COEFFICIENT: f32 = 0.5;
+const RIM_FRESNEL_POWER: f32 = 3.0;
+const RIM_FRESNEL_COLOR: vec3<f32> = vec3<f32>(1.0, 1.0, 1.0);
+const RIM_FRESNEL_ALBEDO_BLEND: f32 = 0.3;
+
+// Evaluate L2 SH irradiance at a given normal direction
+fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
+    // SH basis functions (real, orthonormal)
+    let y00: f32 = 0.282095;
+    let y1x: f32 = 0.488603;
+    let y20: f32 = 0.315392;
+    let y21: f32 = 1.092548;
+    let y22: f32 = 0.546274;
+
+    var result = vec3<f32>(0.0);
+    // L0
+    result += sh_data.coefficients[0].rgb * y00;
+    // L1
+    result += sh_data.coefficients[1].rgb * y1x * n.y;
+    result += sh_data.coefficients[2].rgb * y1x * n.z;
+    result += sh_data.coefficients[3].rgb * y1x * n.x;
+    // L2
+    result += sh_data.coefficients[4].rgb * y21 * n.x * n.y;
+    result += sh_data.coefficients[5].rgb * y21 * n.y * n.z;
+    result += sh_data.coefficients[6].rgb * y20 * (3.0 * n.z * n.z - 1.0);
+    result += sh_data.coefficients[7].rgb * y21 * n.x * n.z;
+    result += sh_data.coefficients[8].rgb * y22 * (n.x * n.x - n.y * n.y);
+
+    return max(result, vec3(0.0));
+}
+
+// Environment cubemap sampling — environment_mapping.fx
+fn sample_environment(
+    normal: vec3<f32>,
+    view_dir: vec3<f32>,
+    roughness: f32,
+    fresnel_f0: f32,
+) -> vec3<f32> {
+    let R = reflect(-view_dir, normal);
+    let lod = roughness * env_probe.env_roughness_scale * (env_probe.env_mip_count - 1.0);
+    let env_color = textureSampleLevel(t_env_cubemap, s_env_filtering, R, lod).rgb;
+
+    // Schlick approximation for environment fresnel
+    let n_dot_v = max(dot(normal, view_dir), 0.0);
+    let fresnel = fresnel_f0 + (1.0 - fresnel_f0) * pow(1.0 - n_dot_v, 5.0);
+
+    return env_color * fresnel * env_probe.env_specular_contribution * env_probe.env_intensity;
+}
+
+// Atmospheric scattering — atmosphere.fx lines 31-107
+fn compute_scattering(camera_pos: vec3<f32>, world_pos: vec3<f32>) -> array<vec3<f32>, 2> {
+    let ray = world_pos - camera_pos;
+    var dist = length(ray);
+    dist = min(dist, atmosphere.max_fog_thickness);
+
+    if (dist < 0.001) {
+        return array<vec3<f32>, 2>(vec3(1.0), vec3(0.0));
+    }
+
+    let ray_dir = normalize(ray);
+
+    // Height-based density (atmosphere.fx lines 45-85)
+    let h_cam = max(camera_pos.z - atmosphere.reference_height, 0.0);
+    let h_frag = max(world_pos.z - atmosphere.reference_height, 0.0);
+    let diff = h_cam - h_frag;
+
+    var rayleigh_depth: f32;
+    var mie_depth: f32;
+
+    if (abs(diff) > 0.001) {
+        // Analytic integral of exponential density along ray
+        rayleigh_depth = (exp(-h_frag / atmosphere.rayleigh_height_scale)
+                       - exp(-h_cam / atmosphere.rayleigh_height_scale))
+                       * dist * atmosphere.rayleigh_height_scale / diff;
+        mie_depth = (exp(-h_frag / atmosphere.mie_height_scale)
+                  - exp(-h_cam / atmosphere.mie_height_scale))
+                  * dist * atmosphere.mie_height_scale / diff;
+    } else {
+        // Nearly horizontal ray — use average height
+        rayleigh_depth = exp(-h_cam / atmosphere.rayleigh_height_scale) * dist;
+        mie_depth = exp(-h_cam / atmosphere.mie_height_scale) * dist;
+    }
+
+    // Extinction (Beer's law)
+    let extinction = exp(-(atmosphere.rayleigh_coefficients * rayleigh_depth
+                         + vec3(atmosphere.mie_coefficient) * mie_depth));
+
+    // Phase functions
+    let cos_theta = dot(ray_dir, normalize(atmosphere.sun_direction));
+
+    // Rayleigh: (3/16π)(1 + cos²θ)
+    let rayleigh_phase = 0.05968 * (1.0 + cos_theta * cos_theta);
+
+    // Mie: Henyey-Greenstein
+    let g = atmosphere.mie_g;
+    let g2 = g * g;
+    let mie_phase = 0.07958 * (1.0 - g2) / pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5);
+
+    // Inscatter
+    let scatter = vec3(1.0) - extinction;
+    let inscatter = (atmosphere.rayleigh_coefficients * rayleigh_phase
+                   + vec3(atmosphere.mie_coefficient) * mie_phase)
+                   * scatter * atmosphere.inscatter_scale;
+
+    return array<vec3<f32>, 2>(extinction, inscatter);
+}
+
 // Single HDR output — bloom prefilter handles brightness extraction
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -264,6 +555,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Standard per-fragment view direction (correct for all light types)
     let view_direction = normalize(lighting.camera_position - frag_position);
     let screen_pos = in.clip_position.xy;
+
+    // Rim fresnel — computed once per pixel (approximates SH area lighting)
+    let n_dot_v_rim = max(dot(frag_normal, view_direction), 0.0);
+    let rim_factor = pow(1.0 - n_dot_v_rim, RIM_FRESNEL_POWER);
+    let rim_color = mix(RIM_FRESNEL_COLOR, albedo_specular.rgb, RIM_FRESNEL_ALBEDO_BLEND);
+    let rim_fresnel = RIM_FRESNEL_COEFFICIENT * material_specular_amount * albedo_specular.a * rim_color * rim_factor;
 
     var light_color = vec3<f32>(0.0);
 
@@ -336,6 +633,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 shadow_factor = calculate_point_shadow(frag_position, light.position, si, frag_normal, light_direction, screen_pos);
             } else if (light.light_type == LIGHT_TYPE_SPOT) {
                 shadow_factor = calculate_spot_shadow(frag_position, light.position, si, frag_normal, light_direction, screen_pos);
+            } else if (light.light_type == LIGHT_TYPE_DIRECTIONAL) {
+                shadow_factor = calculate_directional_shadow(
+                    frag_position, lighting.camera_position,
+                    frag_normal, light_direction, screen_pos
+                );
             }
         }
         diffuse_color *= shadow_factor;
@@ -344,10 +646,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         light_color += ambient_color + diffuse_color + specular_color;
     }
 
+    // Environment cubemap specular
+    if (env_probe.env_specular_contribution > 0.0) {
+        let envmap = sample_environment(frag_normal, view_direction, roughness, fresnel_f0);
+        light_color += envmap * material_specular_amount * albedo_specular.a;
+    }
+
+    // Diffuse indirect — SH irradiance (L2 spherical harmonics)
+    if (env_probe.env_diffuse_intensity > 0.0) {
+        let sh_irradiance = evaluate_sh_irradiance(frag_normal);
+        light_color += sh_irradiance * albedo_specular.rgb * ambient_occlusion
+                     * env_probe.env_diffuse_intensity;
+    }
+
+    // Rim fresnel
+    light_color += rim_fresnel;
+
     // Emissive: luminance from normal.w, tinted by albedo color (added once)
     // HDR boost so emissive exceeds bloom threshold and produces visible glow
     let emissive_color = albedo_specular.rgb * emissive_luma * 5.0;
     light_color += emissive_color;
+
+    // Atmospheric scattering — atmosphere.fx + entry_points.fx
+    if (atmosphere.atmosphere_enable > 0.5) {
+        let scattering = compute_scattering(lighting.camera_position, frag_position);
+        light_color = light_color * scattering[0] + scattering[1];
+    }
 
     return vec4<f32>(light_color, 1.0);
 }

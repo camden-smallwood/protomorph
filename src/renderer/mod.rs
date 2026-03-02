@@ -1,9 +1,13 @@
 mod bloom_pass;
+mod env_probe_pass;
+mod fxaa_pass;
 mod geometry_pass;
+mod god_rays_pass;
 mod helpers;
 mod lighting_pass;
 mod shadow_pass;
 mod shared;
+mod ssao_blur_pass;
 mod ssao_pass;
 mod text_pass;
 
@@ -56,10 +60,14 @@ pub struct Renderer {
     intermediates: IntermediateTargets,
 
     shadow_pass: shadow_pass::ShadowPass,
+    env_probe_pass: env_probe_pass::EnvProbePass,
     geometry_pass: geometry_pass::GeometryPass,
     ssao_pass: ssao_pass::SsaoPass,
+    ssao_blur_pass: ssao_blur_pass::SsaoBlurPass,
     lighting_pass: lighting_pass::LightingPass,
+    god_rays_pass: god_rays_pass::GodRaysPass,
     bloom_pass: bloom_pass::BloomPass,
+    fxaa_pass: fxaa_pass::FxaaPass,
     text_pass: text_pass::TextPass,
 
     models: Vec<GpuModel>,
@@ -119,15 +127,34 @@ impl Renderer {
         let shared = SharedResources::new(device, queue, config);
 
         let gbuffer = create_gbuffer(&shared.device, shared.config.width, shared.config.height);
-        let intermediates =
-            create_intermediates(&shared.device, shared.config.width, shared.config.height);
+        let intermediates = create_intermediates(
+            &shared.device,
+            shared.config.width,
+            shared.config.height,
+            shared.config.format,
+        );
 
         let shadow_pass = shadow_pass::ShadowPass::new(&shared);
+        let env_probe_pass = env_probe_pass::EnvProbePass::new(&shared);
         let geometry_pass = geometry_pass::GeometryPass::new(&shared);
         let ssao_pass = ssao_pass::SsaoPass::new(&shared, &gbuffer);
-        let lighting_pass =
-            lighting_pass::LightingPass::new(&shared, &gbuffer, &intermediates, &shadow_pass.bgl);
+        let ssao_blur_pass =
+            ssao_blur_pass::SsaoBlurPass::new(&shared, &gbuffer, &intermediates);
+        let lighting_pass = lighting_pass::LightingPass::new(
+            &shared,
+            &gbuffer,
+            &intermediates,
+            &shadow_pass.bgl,
+            &env_probe_pass.bgl,
+        );
+        let god_rays_pass = god_rays_pass::GodRaysPass::new(
+            &shared,
+            &gbuffer.position_depth_view,
+            &intermediates.god_rays_view,
+        );
         let bloom_pass = bloom_pass::BloomPass::new(&shared, &intermediates, shared.config.format);
+        let fxaa_pass =
+            fxaa_pass::FxaaPass::new(&shared, &intermediates, shared.config.format);
         let text_pass = text_pass::TextPass::new(&shared);
 
         Self {
@@ -136,10 +163,14 @@ impl Renderer {
             gbuffer,
             intermediates,
             shadow_pass,
+            env_probe_pass,
             geometry_pass,
             ssao_pass,
+            ssao_blur_pass,
             lighting_pass,
+            god_rays_pass,
             bloom_pass,
+            fxaa_pass,
             text_pass,
             models: Vec::new(),
             render_list: Vec::with_capacity(MAX_OBJECTS),
@@ -321,12 +352,25 @@ impl Renderer {
             .configure(&self.shared.device, &self.shared.config);
 
         self.gbuffer = create_gbuffer(&self.shared.device, width, height);
-        self.intermediates = create_intermediates(&self.shared.device, width, height);
+        self.intermediates = create_intermediates(
+            &self.shared.device,
+            width,
+            height,
+            self.shared.config.format,
+        );
 
         self.ssao_pass.resize(&self.shared, &self.gbuffer);
+        self.ssao_blur_pass
+            .resize(&self.shared, &self.gbuffer, &self.intermediates);
         self.lighting_pass
             .resize(&self.shared, &self.gbuffer, &self.intermediates);
+        self.god_rays_pass.resize(
+            &self.shared,
+            &self.gbuffer.position_depth_view,
+            &self.intermediates,
+        );
         self.bloom_pass.resize(&self.shared, &self.intermediates);
+        self.fxaa_pass.resize(&self.shared, &self.intermediates);
     }
 
     pub fn render(&mut self, game: &GameState) {
@@ -403,6 +447,8 @@ impl Renderer {
         self.shadow_pass.prepare(
             &self.shared,
             &game.lights,
+            game.camera.view,
+            game.camera.projection,
             &mut point_shadow_casters,
             &mut spot_shadow_casters,
             &mut shadow_assignments,
@@ -419,6 +465,12 @@ impl Renderer {
             &self.shared.lighting_buffer,
             0,
             bytemuck::bytes_of(&light_uniforms),
+        );
+
+        self.shared.queue.write_buffer(
+            &self.shared.atmosphere_buffer,
+            0,
+            bytemuck::bytes_of(&game.atmosphere),
         );
 
         // Acquire surface
@@ -454,6 +506,14 @@ impl Renderer {
                 });
 
         // === Shadow depth passes ===
+        let has_directional_shadow = game
+            .lights
+            .iter()
+            .any(|(_, l)| {
+                !l.hidden
+                    && l.casts_shadow
+                    && l.light_type == crate::lights::LightType::Directional
+            });
         self.shadow_pass.record(
             &mut encoder,
             &self.shared,
@@ -461,6 +521,34 @@ impl Renderer {
             &render_list,
             &point_shadow_casters,
             &spot_shadow_casters,
+            has_directional_shadow,
+        );
+
+        // === Env probe cubemap pass ===
+        // Extract sun parameters for SH computation
+        let (sun_dir_to_sun, sun_diffuse, sun_ambient) = {
+            let mut sd = glam::Vec3::new(0.0, 0.0, 1.0);
+            let mut sc = glam::Vec3::ONE;
+            let mut sa = glam::Vec3::splat(0.05);
+            for (_idx, light) in game.lights.iter() {
+                if !light.hidden && light.light_type == crate::lights::LightType::Directional {
+                    sd = -light.direction.normalize(); // direction TO the sun
+                    sc = light.diffuse_color;
+                    sa = light.ambient_color;
+                    break;
+                }
+            }
+            (sd, sc, sa)
+        };
+        self.env_probe_pass.record(
+            &mut encoder,
+            &self.shared,
+            &self.models,
+            &render_list,
+            game.camera.position,
+            sun_dir_to_sun,
+            sun_diffuse,
+            sun_ambient,
         );
 
         // === Geometry pass ===
@@ -476,21 +564,45 @@ impl Renderer {
         self.ssao_pass
             .record(&mut encoder, &self.shared, &self.intermediates.ssao_view);
 
+        // === SSAO blur pass ===
+        self.ssao_blur_pass.record(
+            &mut encoder,
+            &self.shared,
+            &self.intermediates.ssao_blur_view,
+        );
+
         // === Lighting pass ===
         self.lighting_pass.record(
             &mut encoder,
             &self.shared,
             &self.intermediates.lighting_base_view,
             &self.shadow_pass.bind_group,
+            &self.env_probe_pass.bind_group,
         );
 
-        // === Bloom pass ===
+        // === God rays pass (between lighting and bloom) ===
+        self.god_rays_pass.record(
+            &mut encoder,
+            &self.shared,
+            &self.intermediates.god_rays_view,
+            &self.intermediates.lighting_base_view,
+            game.camera.view,
+            game.camera.projection,
+            sun_dir_to_sun,
+            sun_diffuse,
+        );
+
+        // === Bloom pass (writes to intermediate, not surface) ===
         self.bloom_pass.record(
             &mut encoder,
             &self.shared,
             &self.intermediates,
-            &surface_view,
+            &self.intermediates.post_composite_view,
         );
+
+        // === FXAA pass (reads intermediate, writes to surface) ===
+        self.fxaa_pass
+            .record(&mut encoder, &self.shared, &surface_view);
 
         // === Text overlay ===
         {

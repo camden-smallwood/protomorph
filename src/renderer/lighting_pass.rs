@@ -14,6 +14,7 @@ impl LightingPass {
         gbuffer: &GBuffer,
         intermediates: &IntermediateTargets,
         shadow_bgl: &wgpu::BindGroupLayout,
+        env_probe_bgl: &wgpu::BindGroupLayout,
     ) -> Self {
         let gbuffer_bgl = create_lighting_gbuffer_bgl(&shared.device);
 
@@ -22,6 +23,7 @@ impl LightingPass {
             &gbuffer_bgl,
             &shared.lighting_uniforms_bgl,
             shadow_bgl,
+            env_probe_bgl,
         );
 
         let gbuffer_bind_group = create_lighting_gbuffer_bind_group(
@@ -60,6 +62,7 @@ impl LightingPass {
         shared: &SharedResources,
         lighting_base_view: &wgpu::TextureView,
         shadow_bind_group: &wgpu::BindGroup,
+        env_probe_bind_group: &wgpu::BindGroup,
     ) {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("lighting_pass"),
@@ -72,6 +75,7 @@ impl LightingPass {
         rpass.set_bind_group(0, &self.gbuffer_bind_group, &[]);
         rpass.set_bind_group(1, &shared.lighting_uniforms_bind_group, &[]);
         rpass.set_bind_group(2, shadow_bind_group, &[]);
+        rpass.set_bind_group(3, env_probe_bind_group, &[]);
         rpass.set_vertex_buffer(0, shared.quad_vertex_buffer.slice(..));
         rpass.draw(0..6, 0..1);
     }
@@ -132,7 +136,7 @@ fn create_lighting_gbuffer_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: wgpu::BindingResource::TextureView(&intermediates.ssao_view),
+                resource: wgpu::BindingResource::TextureView(&intermediates.ssao_blur_view),
             },
             wgpu::BindGroupEntry {
                 binding: 5,
@@ -151,11 +155,12 @@ fn create_lighting_pipeline(
     gbuffer_bgl: &wgpu::BindGroupLayout,
     uniforms_bgl: &wgpu::BindGroupLayout,
     shadow_bgl: &wgpu::BindGroupLayout,
+    env_probe_bgl: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
     create_fullscreen_pipeline(
         device,
         wgpu::include_wgsl!("../../assets/shaders/lighting.wgsl"),
-        &[gbuffer_bgl, uniforms_bgl, shadow_bgl],
+        &[gbuffer_bgl, uniforms_bgl, shadow_bgl, env_probe_bgl],
         &[Some(wgpu::ColorTargetState {
             format: wgpu::TextureFormat::Rgba16Float,
             blend: None,

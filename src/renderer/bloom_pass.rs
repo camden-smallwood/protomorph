@@ -80,7 +80,8 @@ impl BloomPass {
                     contents: bytemuck::bytes_of(&CompositeParams {
                         bloom_strength: 0.15,
                         exposure: 2.0,
-                        _pad: [0.0; 2],
+                        saturation: 0.85,
+                        grain_intensity: 0.0,
                     }),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
