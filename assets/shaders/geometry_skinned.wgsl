@@ -24,7 +24,7 @@ struct MaterialProps {
     specular_amount: f32,
     emissive_color: vec3<f32>,
     emissive_intensity: f32,
-    specular_shininess: f32,
+    roughness: f32,
     _pad1: f32,
     _pad2: f32,
     _pad3: f32,
@@ -155,7 +155,7 @@ fn fs_main(in: VertexOutput) -> GBufferOutput {
     out.material_out = vec4<f32>(
         material.ambient_amount,
         material.specular_amount,
-        material.specular_shininess / 256.0,
+        material.roughness,
         0.0
     );
 

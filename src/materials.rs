@@ -377,7 +377,7 @@ pub struct GpuMaterialProps {
     pub specular_amount: f32,
     pub emissive_color: [f32; 3],
     pub emissive_intensity: f32,
-    pub specular_shininess: f32,
+    pub roughness: f32,
     pub _pad: [f32; 3],
 }
 
@@ -398,7 +398,7 @@ impl GpuMaterialProps {
                 mat.base.color_emissive.into()
             },
             emissive_intensity: mat.emissive.intensity,
-            specular_shininess: mat.specular.glossiness_factor,
+            roughness: 0.5,  // hardcoded; ignore assimp PBR data for now
             _pad: [0.0; 3],
         }
     }

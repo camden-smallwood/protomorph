@@ -1,4 +1,4 @@
-// Deferred lighting pass — reads compact G-buffer, Blinn-Phong, up to 16 lights
+// Deferred lighting pass — reads compact G-buffer, Cook-Torrance (Halo 3), up to 16 lights
 // Port of C's lighting.fs
 // G-buffer layout: position_depth, normal (w=emissive_luma), albedo_specular, material, ssao
 
@@ -211,6 +211,32 @@ fn calculate_spot_shadow(
     return shadow / 8.0;
 }
 
+// Beckmann NDF — cook_torrance.fx lines 280-284
+fn beckmann_ndf(n_dot_h: f32, roughness: f32) -> f32 {
+    let r2 = roughness * roughness;
+    let c2 = n_dot_h * n_dot_h;
+    let c4 = c2 * c2;
+    return exp((c2 - 1.0) / (r2 * c2)) / (r2 * c4 + 0.00001);
+}
+
+// Cook-Torrance geometry — cook_torrance.fx line 271
+// Note: saturate(v_dot_h) in denominator, not raw v_dot_h
+fn ct_geometry(n_dot_h: f32, n_dot_v: f32, n_dot_l: f32, v_dot_h: f32) -> f32 {
+    return 2.0 * n_dot_h * min(n_dot_v, n_dot_l) / (saturate(v_dot_h) + 0.00001);
+}
+
+// Exact Fresnel — cook_torrance.fx lines 273-278
+// Derives IOR from f0, computes full Fresnel (not Schlick)
+fn fresnel_exact(f0: vec3<f32>, v_dot_h: f32) -> vec3<f32> {
+    let sqrt_f0 = sqrt(clamp(f0, vec3(0.0), vec3(0.999)));
+    let n = (vec3(1.0) + sqrt_f0) / (vec3(1.0) - sqrt_f0);
+    let g = sqrt(max(n * n + vec3(v_dot_h * v_dot_h) - vec3(1.0), vec3(0.0)));
+    let gpc = g + vec3(v_dot_h);
+    let gmc = g - vec3(v_dot_h);
+    let r = (vec3(v_dot_h) * gpc - vec3(1.0)) / (vec3(v_dot_h) * gmc + vec3(1.0));
+    return clamp(0.5 * ((gmc * gmc) / (gpc * gpc + vec3(0.00001))) * (vec3(1.0) + r * r), vec3(0.0), vec3(1.0));
+}
+
 // Single HDR output — bloom prefilter handles brightness extraction
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -225,7 +251,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let mat_sample = textureSample(t_material, s_nearest, uv);
     let material_ambient_amount = mat_sample.r;
     let material_specular_amount = mat_sample.g;
-    let material_specular_shininess = mat_sample.b * 256.0;
+    let roughness = max(mat_sample.b, 0.05);  // Halo 3: max(roughness, 0.05)
 
     let ambient_occlusion = textureSample(t_ssao, s_nearest, uv).r;
 
@@ -250,15 +276,30 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Ambient (per-light, scaled by AO)
         var ambient_color = material_ambient_amount * light.ambient_color * albedo_specular.rgb * ambient_occlusion;
 
-        // Diffuse
+        // Diffuse — unchanged
         let diffuse_amount = max(dot(light_direction, frag_normal), 0.0);
         var diffuse_color = diffuse_amount * albedo_specular.rgb * light.diffuse_color;
 
-        // Specular (Blinn-Phong, matching C's lighting.fs)
+        // Specular — Cook-Torrance (Halo 3 cook_torrance.fx)
         var specular_color = vec3<f32>(0.0);
-        if (diffuse_amount > 0.0) {
-            let spec_intensity = pow(max(dot(frag_normal, halfway_direction), 0.0), material_specular_shininess);
-            specular_color = material_specular_amount * (spec_intensity * light.specular_color) * albedo_specular.a;
+        let n_dot_l = dot(frag_normal, light_direction);
+        let n_dot_v = dot(frag_normal, view_direction);
+        if (min(n_dot_l, n_dot_v) > 0.0) {
+            let n_dot_h = max(dot(frag_normal, halfway_direction), 0.0);
+            let v_dot_h = max(dot(view_direction, halfway_direction), 0.0);
+
+            let D = beckmann_ndf(n_dot_h, roughness);
+            let G = ct_geometry(n_dot_h, n_dot_v, n_dot_l, v_dot_h);
+            let F = fresnel_exact(vec3(0.04), v_dot_h);  // f0=0.04 dielectric
+
+            // Halo 3 denominator: pi * NdotV (not standard 4 * NdotL * NdotV)
+            let ct = D * saturate(G) / (3.14159 * n_dot_v + 0.00001) * F;
+
+            // Anti-shadow clamp — cook_torrance.fx line 298
+            let clamped = min(ct, vec3(n_dot_l + 1.0));
+
+            // specular_amount and spec_tex scale the result (NOT used as f0)
+            specular_color = material_specular_amount * albedo_specular.a * clamped * light.specular_color;
         }
 
         // Attenuation for non-directional lights
