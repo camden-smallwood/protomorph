@@ -420,30 +420,42 @@ impl ShadowPass {
                 };
                 let light_view = Mat4::look_at_rh(center - sun_dir * 50.0, center, up);
 
-                // Transform corners to light space, find AABB
-                let mut min_ls = Vec3::splat(f32::MAX);
-                let mut max_ls = Vec3::splat(f32::MIN);
+                // Bounding sphere of frustum slice — use sphere radius for X/Y
+                // so off-screen shadow casters near the frustum are still captured.
+                let mut sphere_radius = 0.0f32;
                 for corner in &world_corners {
-                    let ls = (light_view * Vec4::new(corner.x, corner.y, corner.z, 1.0)).truncate();
-                    min_ls = min_ls.min(ls);
-                    max_ls = max_ls.max(ls);
+                    sphere_radius = sphere_radius.max((*corner - center).length());
                 }
 
-                // Extend Z range to capture shadow casters behind the frustum
-                min_ls.z -= 100.0;
+                // Transform corners to light space for Z range only
+                let mut min_z = f32::MAX;
+                let mut max_z = f32::MIN;
+                for corner in &world_corners {
+                    let ls = (light_view * Vec4::new(corner.x, corner.y, corner.z, 1.0)).truncate();
+                    min_z = min_z.min(ls.z);
+                    max_z = max_z.max(ls.z);
+                }
 
-                // Build orthographic projection
+                // Extend Z range in both directions:
+                // toward the light (max_z) to capture casters between light and frustum
+                // (e.g. objects behind the camera), and away (min_z) for depth margin.
+                max_z += 100.0;
+                min_z -= 100.0;
+
+                // Build orthographic projection:
+                // X/Y: sphere-based (captures off-screen shadow casters)
+                // Z: tight AABB + extension
                 let ortho_proj = Mat4::orthographic_rh(
-                    min_ls.x, max_ls.x, min_ls.y, max_ls.y, -max_ls.z, -min_ls.z,
+                    -sphere_radius, sphere_radius,
+                    -sphere_radius, sphere_radius,
+                    -max_z, -min_z,
                 );
 
                 let cascade_vp = ortho_proj * light_view;
                 shadow_data.cascade_view_proj[cascade] = cascade_vp.to_cols_array_2d();
 
-                let ortho_width = max_ls.x - min_ls.x;
-                let ortho_height = max_ls.y - min_ls.y;
                 shadow_data.cascade_texel_sizes[cascade] =
-                    ortho_width.max(ortho_height) / CSM_MAP_SIZE as f32;
+                    (2.0 * sphere_radius) / CSM_MAP_SIZE as f32;
 
                 // Upload camera uniform for this cascade's render pass
                 let cam = CameraUniforms {
