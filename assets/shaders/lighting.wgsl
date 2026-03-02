@@ -77,8 +77,6 @@ struct ShadowData {
     cascade_view_proj: array<mat4x4<f32>, 3>,
     cascade_splits: vec4<f32>,
     cascade_texel_sizes: vec4<f32>,
-    light_size_uv: vec4<f32>,
-    pcss_params: vec4<f32>,
 };
 @group(2) @binding(5) var<uniform> shadow_data: ShadowData;
 @group(2) @binding(6) var t_shadow_cascade: texture_depth_2d_array;
@@ -265,45 +263,7 @@ fn calculate_spot_shadow(
 const CSM_MAP_SIZE_F: f32 = 2048.0;
 const CSM_BLEND_FRACTION: f32 = 0.1; // blend in last 10% before each split boundary
 
-// 4x4 grid offsets for blocker search (normalized to [-1,1])
-const BLOCKER_SEARCH_SAMPLES: u32 = 16u;
-
-fn find_blocker_depth_cascade(
-    uv: vec2<f32>,
-    receiver_depth: f32,
-    cascade_idx: u32,
-    search_radius: f32,
-) -> vec2<f32> {
-    let texel_size = 1.0 / CSM_MAP_SIZE_F;
-    let search_size = search_radius * texel_size;
-
-    var blocker_sum = 0.0;
-    var blocker_count = 0.0;
-
-    // 4x4 grid search
-    for (var y = -1.5; y <= 1.5; y += 1.0) {
-        for (var x = -1.5; x <= 1.5; x += 1.0) {
-            let offset = vec2(x, y) * search_size / 1.5;
-            let sample_uv = uv + offset;
-
-            if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0) {
-                continue;
-            }
-
-            let coords = vec2<i32>(vec2<f32>(sample_uv * CSM_MAP_SIZE_F));
-            let depth = textureLoad(t_shadow_cascade, coords, cascade_idx, 0);
-
-            if (depth < receiver_depth) {
-                blocker_sum += depth;
-                blocker_count += 1.0;
-            }
-        }
-    }
-
-    return vec2(blocker_sum, blocker_count);
-}
-
-fn sample_cascade_pcss(
+fn sample_cascade_pcf(
     frag_pos: vec3<f32>,
     frag_normal: vec3<f32>,
     light_dir: vec3<f32>,
@@ -324,33 +284,13 @@ fn sample_cascade_pcss(
         return 1.0;
     }
 
-    let light_size = shadow_data.light_size_uv[cascade_idx];
-    let search_radius = shadow_data.pcss_params.x;
-    let min_penumbra = shadow_data.pcss_params.y;
-    let max_penumbra = shadow_data.pcss_params.z;
-
-    // Blocker search
-    let blocker_result = find_blocker_depth_cascade(uv, proj.z, cascade_idx, search_radius);
-    let blocker_count = blocker_result.y;
-
-    // No blockers — fully lit
-    if (blocker_count < 0.5) {
-        return 1.0;
-    }
-
-    let avg_blocker_depth = blocker_result.x / blocker_count;
-
-    // Penumbra estimation
-    let penumbra = light_size * (proj.z - avg_blocker_depth) / max(avg_blocker_depth, 0.0001);
-    let pcf_radius = clamp(penumbra * CSM_MAP_SIZE_F, min_penumbra, max_penumbra);
-
-    // Variable-radius PCF with rotated Poisson disk
+    // Rotated Poisson disk PCF
     let texel_size = 1.0 / CSM_MAP_SIZE_F;
     let rotation = random_angle(screen_pos);
     var shadow = 0.0;
     for (var i = 0u; i < 8u; i++) {
         let p = rotate_offset(POISSON_DISK[i], rotation);
-        let offset_uv = uv + p * pcf_radius * texel_size;
+        let offset_uv = uv + p * SHADOW_PCF_SPREAD * texel_size;
         shadow += textureSampleCompareLevel(
             t_shadow_cascade, s_shadow_compare,
             offset_uv, cascade_idx, proj.z
@@ -375,7 +315,7 @@ fn calculate_directional_shadow(
     // Beyond last cascade — no shadow
     if (dist > shadow_data.cascade_splits.z) { return 1.0; }
 
-    let shadow_current = sample_cascade_pcss(frag_pos, frag_normal, light_dir, screen_pos, cascade_idx);
+    let shadow_current = sample_cascade_pcf(frag_pos, frag_normal, light_dir, screen_pos, cascade_idx);
 
     // Blend at cascade transitions: in the last 10% before each split boundary,
     // sample both current and next cascade and mix between them
@@ -386,7 +326,7 @@ fn calculate_directional_shadow(
 
     let blend_start = split_end * (1.0 - CSM_BLEND_FRACTION);
     if (cascade_idx < 2u && dist > blend_start) {
-        let shadow_next = sample_cascade_pcss(frag_pos, frag_normal, light_dir, screen_pos, cascade_idx + 1u);
+        let shadow_next = sample_cascade_pcf(frag_pos, frag_normal, light_dir, screen_pos, cascade_idx + 1u);
         let blend_t = (dist - blend_start) / (split_end - blend_start);
         return mix(shadow_current, shadow_next, blend_t);
     }

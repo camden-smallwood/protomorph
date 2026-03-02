@@ -6,7 +6,7 @@ A real-time 3D rendering engine written in Rust, targeting Halo 3-era graphical 
 
 - **Deferred Rendering** with a 4-target G-buffer (position/depth, normals, albedo/specular, material properties)
 - **Cook-Torrance BRDF** matching Halo 3's microfacet shading model (GGX NDF, Schlick Fresnel, Smith geometry)
-- **Cascaded Shadow Mapping** with 3 cascades, PCSS soft shadows, and cascade blending
+- **Cascaded Shadow Mapping** with 3 cascades, rotated Poisson disk PCF, and cascade blending
 - **Point & Spot Light Shadows** via cubemap and 2D depth maps with rotated Poisson disk PCF
 - **Environment Probes** with runtime cubemap capture, L2 spherical harmonics for diffuse IBL, and roughness-based mip selection for specular IBL
 - **Screen-Space Ambient Occlusion** with 32-sample hemisphere kernel and bilateral depth-aware blur
@@ -47,9 +47,9 @@ Protomorph uses a pass-based deferred rendering architecture. Each frame execute
 
 ```
 Shadow Pass          Depth-only rendering to shadow maps
-  Point lights         6-face cubemap per light (1024x1024)
-  Spot lights          2D depth map per light (2048x2048)
-  Directional (CSM)    3-cascade texture array (2048x2048)
+  Point lights         6-face cubemap per light (1024x1024), Poisson PCF
+  Spot lights          2D depth map per light (2048x2048), Poisson PCF
+  Directional (CSM)    3-cascade texture array (2048x2048), Poisson PCF
         |
 Env Probe Pass       Forward-render scene to 128x128 cubemap,
                      compute L2 SH coefficients, generate mips
@@ -132,7 +132,7 @@ Protomorph targets the rendering techniques documented in Bungie's **"Lighting a
 | Technique | Halo 3 | Protomorph | Notes |
 |-----------|--------|------------|-------|
 | Baked shadows in lightmaps | Static shadow occlusion in SH lightmaps | Not applicable | No lightmap pipeline |
-| Shadow maps (directional) | Shadow mapping for dynamic objects | 3-cascade CSM with PCSS | Exceeds Halo 3 with cascade blending + penumbra estimation |
+| Shadow maps (directional) | Shadow mapping for dynamic objects | 3-cascade CSM with PCF + cascade blending | Equivalent |
 | Shadow maps (point) | Cubemap shadow maps + PCF | Cubemap shadows + rotated Poisson PCF | Equivalent or better |
 | Shadow maps (spot) | 2D shadow maps + PCF | 2D shadows + rotated Poisson PCF | Equivalent or better |
 | PRT self-shadowing | Precomputed self-occlusion per object region | Not implemented | -- |
@@ -201,7 +201,7 @@ Protomorph targets the rendering techniques documented in Bungie's **"Lighting a
 
 ### Summary
 
-Protomorph implements the core of Halo 3's rendering philosophy — Cook-Torrance shading, environment probes with spherical harmonics, shadow mapping, atmospheric scattering, and HDR bloom — while substituting modern techniques where appropriate (GGX over Beckmann, ACES tone mapping over dual-buffer HDR, FXAA and SSAO which Halo 3 lacked entirely). The main gaps are in content pipeline features (baked SH lightmaps, PRT), specialized material models (glass, organism, two-lobe phong), and gameplay-facing systems (particles, water, decals, physics, motion blur).
+Protomorph implements the core of Halo 3's rendering philosophy — Cook-Torrance shading, environment probes with spherical harmonics, cascaded shadow mapping, atmospheric scattering, and HDR bloom — while substituting modern techniques where appropriate (GGX over Beckmann, ACES tone mapping over dual-buffer HDR, FXAA and SSAO which Halo 3 lacked entirely). The main gaps are in content pipeline features (baked SH lightmaps, PRT), specialized material models (glass, organism, two-lobe phong), and gameplay-facing systems (particles, water, decals, physics, motion blur).
 
 ## Dependencies
 

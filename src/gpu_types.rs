@@ -100,8 +100,6 @@ pub struct GpuShadowData {
     pub cascade_view_proj: [[[f32; 4]; 4]; CSM_CASCADE_COUNT],
     pub cascade_splits: [f32; 4],
     pub cascade_texel_sizes: [f32; 4], // world-space texel size per cascade, [3] = pad
-    pub light_size_uv: [f32; 4],       // per-cascade light size in UV space, [3] = pad
-    pub pcss_params: [f32; 4],         // [blocker_search_radius, min_penumbra, max_penumbra, pad]
 }
 
 #[repr(C)]

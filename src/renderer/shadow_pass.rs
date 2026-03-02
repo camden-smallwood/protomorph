@@ -464,14 +464,6 @@ impl ShadowPass {
                 0.0,
             ];
 
-            // PCSS light size per cascade (sun angular size in UV space)
-            let sun_angular_size: f32 = 0.015;
-            for cascade in 0..CSM_CASCADE_COUNT {
-                shadow_data.light_size_uv[cascade] = sun_angular_size;
-            }
-
-            // PCSS params: [blocker_search_radius, min_penumbra, max_penumbra, pad]
-            shadow_data.pcss_params = [8.0, 1.0, 16.0, 0.0];
         }
 
         shared.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&shadow_data));
