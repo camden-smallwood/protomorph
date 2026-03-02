@@ -496,12 +496,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let view_direction = normalize(lighting.camera_position - frag_position);
     let screen_pos = in.clip_position.xy;
 
-    // Rim fresnel — computed once per pixel (approximates SH area lighting)
-    let n_dot_v_rim = max(dot(frag_normal, view_direction), 0.0);
-    let rim_factor = pow(1.0 - n_dot_v_rim, RIM_FRESNEL_POWER);
-    let rim_color = mix(RIM_FRESNEL_COLOR, albedo_specular.rgb, RIM_FRESNEL_ALBEDO_BLEND);
-    let rim_fresnel = RIM_FRESNEL_COEFFICIENT * material_specular_amount * albedo_specular.a * rim_color * rim_factor;
-
     var light_color = vec3<f32>(0.0);
 
     for (var i = 0u; i < lighting.light_count; i++) {
@@ -593,14 +587,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Diffuse indirect — SH irradiance (L2 spherical harmonics)
+    var sh_irradiance = vec3<f32>(0.0);
     if (env_probe.env_diffuse_intensity > 0.0) {
-        let sh_irradiance = evaluate_sh_irradiance(frag_normal);
+        sh_irradiance = evaluate_sh_irradiance(frag_normal);
         light_color += sh_irradiance * albedo_specular.rgb * ambient_occlusion
                      * env_probe.env_diffuse_intensity;
     }
 
-    // Rim fresnel
-    light_color += rim_fresnel;
+    // Rim fresnel — modulated by SH irradiance (approximates area light at grazing angles)
+    let n_dot_v_rim = max(dot(frag_normal, view_direction), 0.0);
+    let rim_factor = pow(1.0 - n_dot_v_rim, RIM_FRESNEL_POWER);
+    let rim_color = mix(RIM_FRESNEL_COLOR, albedo_specular.rgb, RIM_FRESNEL_ALBEDO_BLEND);
+    let rim_fresnel = RIM_FRESNEL_COEFFICIENT * material_specular_amount * albedo_specular.a * rim_color * rim_factor;
+    light_color += rim_fresnel * sh_irradiance;
 
     // Emissive: luminance from normal.w, tinted by albedo color (added once)
     // HDR boost so emissive exceeds bloom threshold and produces visible glow

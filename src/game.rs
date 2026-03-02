@@ -93,9 +93,14 @@ impl GameState {
         // grunt_spot.casts_shadow = true;
         // lights.new_light(grunt_spot);
 
+        // More angled sun angle
+        let sun_dir = Vec3::new(-0.7, 0.4, -0.2).normalize();
+
+        // More overhead sun angle:
+        // let sun_dir = Vec3::new(-0.5, 0.3, -0.866).normalize();
+
         // // Warm sunset — low sun from front-left
         // let mut sun = LightData::new_directional();
-        // let sun_dir = Vec3::new(-0.7, 0.4, -0.2).normalize();
         // sun.direction = sun_dir;
         // sun.diffuse_color = Vec3::new(1.4, 0.7, 0.3);
         // sun.ambient_color = Vec3::new(0.12, 0.08, 0.06);
@@ -103,9 +108,8 @@ impl GameState {
         // sun.casts_shadow = true;
         // lights.new_light(sun);
 
-        // Noon summer sun (directional with CSM shadows)
+        // Noon summer sun
         let mut sun = LightData::new_directional();
-        let sun_dir = Vec3::new(-0.5, 0.3, -0.866).normalize();
         sun.direction = sun_dir;
         sun.diffuse_color = Vec3::new(1.0, 0.95, 0.8);
         sun.ambient_color = Vec3::new(0.15, 0.14, 0.12);

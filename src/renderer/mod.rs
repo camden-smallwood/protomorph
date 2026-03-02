@@ -528,8 +528,8 @@ impl Renderer {
         // Extract sun parameters for SH computation
         let (sun_dir_to_sun, sun_diffuse, sun_ambient) = {
             let mut sd = glam::Vec3::new(0.0, 0.0, 1.0);
-            let mut sc = glam::Vec3::ONE;
-            let mut sa = glam::Vec3::splat(0.05);
+            let mut sc = glam::Vec3::ZERO;
+            let mut sa = glam::Vec3::ZERO;
             for (_idx, light) in game.lights.iter() {
                 if !light.hidden && light.light_type == crate::lights::LightType::Directional {
                     sd = -light.direction.normalize(); // direction TO the sun

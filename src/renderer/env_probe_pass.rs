@@ -382,6 +382,21 @@ impl EnvProbePass {
         sun_color: Vec3,
         ambient_color: Vec3,
     ) {
+        // Scale env probe contribution by actual sun presence — the cubemap
+        // forward render uses a hardcoded light approximation that only makes
+        // sense when a directional sun exists.  Without one the cubemap content
+        // is wrong, so suppress the lighting pass from sampling it.
+        let sun_lum = sun_color.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+        if sun_lum > 0.001 {
+            self.probe_data.env_intensity = 1.0;
+            self.probe_data.env_specular_contribution = 0.5;
+            self.probe_data.env_diffuse_intensity = 0.3;
+        } else {
+            self.probe_data.env_intensity = 0.0;
+            self.probe_data.env_specular_contribution = 0.0;
+            self.probe_data.env_diffuse_intensity = 0.0;
+        }
+
         // Upload probe data
         self.probe_data.probe_position = camera_position.into();
         shared.queue.write_buffer(
@@ -430,9 +445,9 @@ impl EnvProbePass {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.08,
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
