@@ -361,7 +361,8 @@ fn fresnel_exact(f0: vec3<f32>, v_dot_h: f32) -> vec3<f32> {
 }
 
 // Halo 3 lighting constants
-const ANALYTICAL_SPECULAR_CONTRIBUTION: f32 = 0.5;  // other half from SH area specular (not implemented)
+const ANALYTICAL_SPECULAR_CONTRIBUTION: f32 = 0.5;  // other half from SH area specular
+const AREA_SPECULAR_CONTRIBUTION: f32 = 0.5;        // SH-convolved BRDF contribution
 const ALBEDO_BLEND: f32 = 0.0;  // 0=white specular, 1=albedo-tinted (metallic)
 const ANTI_SHADOW_CONTROL: f32 = 0.1;  // 0=no attenuation, 1=aggressive shadow-edge kill
 
@@ -371,30 +372,186 @@ const RIM_FRESNEL_POWER: f32 = 3.0;
 const RIM_FRESNEL_COLOR: vec3<f32> = vec3<f32>(1.0, 1.0, 1.0);
 const RIM_FRESNEL_ALBEDO_BLEND: f32 = 0.3;
 
-// Evaluate L2 SH irradiance at a given normal direction
-fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
-    // SH basis functions (real, orthonormal)
-    let y00: f32 = 0.282095;
-    let y1x: f32 = 0.488603;
-    let y20: f32 = 0.315392;
-    let y21: f32 = 1.092548;
-    let y22: f32 = 0.546274;
+// Diffuse cosine-lobe ZH transfer coefficients (applied at eval time, not baked)
+const A0_TRANSFER: f32 = 3.14159265;   // π
+const A1_TRANSFER: f32 = 2.09439510;   // 2π/3
+const A2_TRANSFER: f32 = 0.78539816;   // π/4
 
+// SH basis normalization constants
+const SH_Y00: f32 = 0.282095;   // 1/(2√π)
+const SH_Y1X: f32 = 0.488603;   // √3/(2√π)
+const SH_Y20: f32 = 0.315392;   // √5/(4√π) * (1/2)
+const SH_Y21: f32 = 1.092548;   // √15/(2√π)
+const SH_Y22: f32 = 0.546274;   // √15/(4√π)
+
+// Evaluate L2 SH irradiance at a given normal direction.
+// Applies diffuse cosine-lobe transfer (A_l) at evaluation time.
+fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
     var result = vec3<f32>(0.0);
     // L0
-    result += sh_data.coefficients[0].rgb * y00;
+    result += sh_data.coefficients[0].rgb * SH_Y00 * A0_TRANSFER;
     // L1
-    result += sh_data.coefficients[1].rgb * y1x * n.y;
-    result += sh_data.coefficients[2].rgb * y1x * n.z;
-    result += sh_data.coefficients[3].rgb * y1x * n.x;
+    result += sh_data.coefficients[1].rgb * SH_Y1X * n.y * A1_TRANSFER;
+    result += sh_data.coefficients[2].rgb * SH_Y1X * n.z * A1_TRANSFER;
+    result += sh_data.coefficients[3].rgb * SH_Y1X * n.x * A1_TRANSFER;
     // L2
-    result += sh_data.coefficients[4].rgb * y21 * n.x * n.y;
-    result += sh_data.coefficients[5].rgb * y21 * n.y * n.z;
-    result += sh_data.coefficients[6].rgb * y20 * (3.0 * n.z * n.z - 1.0);
-    result += sh_data.coefficients[7].rgb * y21 * n.x * n.z;
-    result += sh_data.coefficients[8].rgb * y22 * (n.x * n.x - n.y * n.y);
+    result += sh_data.coefficients[4].rgb * SH_Y21 * n.x * n.y * A2_TRANSFER;
+    result += sh_data.coefficients[5].rgb * SH_Y21 * n.y * n.z * A2_TRANSFER;
+    result += sh_data.coefficients[6].rgb * SH_Y20 * (3.0 * n.z * n.z - 1.0) * A2_TRANSFER;
+    result += sh_data.coefficients[7].rgb * SH_Y21 * n.x * n.z * A2_TRANSFER;
+    result += sh_data.coefficients[8].rgb * SH_Y22 * (n.x * n.x - n.y * n.y) * A2_TRANSFER;
 
     return max(result, vec3(0.0));
+}
+
+// Dominant light extraction from SH — entry_points.fx:752-755, spherical_harmonics.fx:130-150
+// Returns (dominant_direction, dominant_intensity)
+fn extract_dominant_light_from_sh() -> array<vec3<f32>, 2> {
+    // Luminance-weighted L1 direction (Rec. 709 weights)
+    // L1 basis order: [1]=Y1,-1(y), [2]=Y1,0(z), [3]=Y1,1(x)
+    let lum_y = sh_data.coefficients[1].r * 0.212656 + sh_data.coefficients[1].g * 0.715158 + sh_data.coefficients[1].b * 0.0721856;
+    let lum_z = sh_data.coefficients[2].r * 0.212656 + sh_data.coefficients[2].g * 0.715158 + sh_data.coefficients[2].b * 0.0721856;
+    let lum_x = sh_data.coefficients[3].r * 0.212656 + sh_data.coefficients[3].g * 0.715158 + sh_data.coefficients[3].b * 0.0721856;
+
+    let l1_lum = vec3<f32>(lum_x, lum_y, lum_z);
+    let l1_len = length(l1_lum);
+
+    if (l1_len < 0.0001) {
+        return array<vec3<f32>, 2>(vec3(0.0, 0.0, 1.0), vec3(0.0));
+    }
+
+    let dominant_dir = normalize(l1_lum);
+
+    // Estimate intensity: L1 magnitude relates to directional component
+    // L1 coefficient for a directional light: L * Y1x * d_component
+    // The magnitude of the luminance L1 vector ~ L * Y1x
+    // So L ~ |L1_lum| / Y1x, and the dominant intensity per channel:
+    let scale = 1.0 / SH_Y1X;
+    let dominant_intensity = vec3<f32>(
+        length(vec3<f32>(sh_data.coefficients[1].r, sh_data.coefficients[2].r, sh_data.coefficients[3].r)) * scale,
+        length(vec3<f32>(sh_data.coefficients[1].g, sh_data.coefficients[2].g, sh_data.coefficients[3].g)) * scale,
+        length(vec3<f32>(sh_data.coefficients[1].b, sh_data.coefficients[2].b, sh_data.coefficients[3].b)) * scale,
+    );
+
+    return array<vec3<f32>, 2>(dominant_dir, dominant_intensity);
+}
+
+// Diffuse SH with dominant light subtract+re-add — spherical_harmonics.fx:130-150
+// Subtracts the dominant light's SH contribution, evaluates residual ambient,
+// then re-adds dominant light as max(N.L, 0) * intensity * 0.281.
+fn evaluate_sh_irradiance_with_dominant_light(
+    n: vec3<f32>,
+    dominant_dir: vec3<f32>,
+    dominant_intensity: vec3<f32>,
+) -> array<vec3<f32>, 2> {
+    // Subtract dominant light from L0 and L1 coefficients
+    // dir_eval = -Y1x * dominant_dir components (matching basis order)
+    let dir_eval_y = -SH_Y1X * dominant_dir.y;
+    let dir_eval_z = -SH_Y1X * dominant_dir.z;
+    let dir_eval_x = -SH_Y1X * dominant_dir.x;
+
+    // Modified coefficients (L0 + L1 only, per Halo's ravi_order_2_with_dominant_light)
+    // Halo subtracts per-channel: constants[ch].xyz -= dir_eval.zxy * dominant_intensity[ch]
+    // Our layout is transposed: [basis] = (R,G,B)
+    var c0 = sh_data.coefficients[0].rgb - SH_Y00 * dominant_intensity;
+    var c1 = sh_data.coefficients[1].rgb - vec3<f32>(dir_eval_y) * dominant_intensity;  // Y1,-1(y)
+    var c2 = sh_data.coefficients[2].rgb - vec3<f32>(dir_eval_z) * dominant_intensity;  // Y1,0(z)
+    var c3 = sh_data.coefficients[3].rgb - vec3<f32>(dir_eval_x) * dominant_intensity;  // Y1,1(x)
+
+    // Evaluate residual ambient (L0+L1 only, Halo's order-2 evaluation)
+    // Uses Ravi Ramamoorthi's constants: c4=0.886227, c2_ravi=0.511664
+    let c4_ravi = 0.886227;
+    let c2_ravi = 0.511664;
+
+    var x1 = vec3<f32>(0.0);
+    // Per-channel dot(normal, L1_per_channel) — transposed access
+    x1 = vec3<f32>(
+        n.y * c1.r + n.z * c2.r + n.x * c3.r,
+        n.y * c1.g + n.z * c2.g + n.x * c3.g,
+        n.y * c1.b + n.z * c2.b + n.x * c3.b,
+    );
+
+    let residual_ambient = (c4_ravi * c0 + (-2.0 * c2_ravi) * x1) / 3.14159265;
+
+    // Re-add dominant light with sharp N.L falloff
+    let n_dot_l = max(dot(dominant_dir, n), 0.0);
+    let dominant_diffuse = n_dot_l * dominant_intensity * 0.281;
+
+    let total_diffuse = max(residual_ambient + dominant_diffuse, vec3(0.0));
+
+    return array<vec3<f32>, 2>(total_diffuse, dominant_diffuse);
+}
+
+// Halo 3 area specular — spherical_harmonics.fx:568-611
+// Evaluates SH-convolved specular BRDF at the reflection direction.
+// Uses roughness-dependent polynomial-fitted transfer coefficients.
+//
+// Protomorph stores SH as [basis_i] = (R,G,B,pad) while Halo expects
+// per-channel [channel] = (basis values...). We transpose the access.
+fn evaluate_sh_area_specular(reflection_dir: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let roughness_sq = roughness * roughness;
+
+    let c_dc = 0.282095;
+    let c_linear = -(0.5128945834 + (-0.1407369526) * roughness + (-0.002660066620) * roughness_sq) * 0.60;
+    let c_quadratic = -(0.7212524717 + (-0.5541015389) * roughness + 0.07960539966 * roughness_sq) * 0.5;
+
+    // L0: x0 = coefficients[0].rgb (per-basis, already RGB)
+    let x0 = sh_data.coefficients[0].rgb;
+
+    // L1: Halo does dot(reflection_dir, per_channel_L1[ch].xyz)
+    // Our layout: [1]=(R,G,B) for Y1,-1(y), [2] for Y1,0(z), [3] for Y1,1(x)
+    // Per-channel linear: x1.r = r.y*coeff[1].r + r.z*coeff[2].r + r.x*coeff[3].r
+    let x1 = vec3<f32>(
+        reflection_dir.y * sh_data.coefficients[1].r + reflection_dir.z * sh_data.coefficients[2].r + reflection_dir.x * sh_data.coefficients[3].r,
+        reflection_dir.y * sh_data.coefficients[1].g + reflection_dir.z * sh_data.coefficients[2].g + reflection_dir.x * sh_data.coefficients[3].g,
+        reflection_dir.y * sh_data.coefficients[1].b + reflection_dir.z * sh_data.coefficients[2].b + reflection_dir.x * sh_data.coefficients[3].b,
+    );
+
+    // L2 quadratic: cross-component products for Y2,-2, Y2,-1, Y2,1
+    let quadratic_a = reflection_dir.xyz * reflection_dir.yzx;
+    // Per-channel: x2.r = dot(quadratic_a, (coeff[4].r, coeff[5].r, coeff[7].r))
+    // Basis indices: [4]=Y2,-2(xy), [5]=Y2,-1(yz), [7]=Y2,1(xz)
+    let x2 = vec3<f32>(
+        quadratic_a.x * sh_data.coefficients[4].r + quadratic_a.y * sh_data.coefficients[5].r + quadratic_a.z * sh_data.coefficients[7].r,
+        quadratic_a.x * sh_data.coefficients[4].g + quadratic_a.y * sh_data.coefficients[5].g + quadratic_a.z * sh_data.coefficients[7].g,
+        quadratic_a.x * sh_data.coefficients[4].b + quadratic_a.y * sh_data.coefficients[5].b + quadratic_a.z * sh_data.coefficients[7].b,
+    );
+
+    // Squared terms for Y2,0 and Y2,2
+    let quadratic_b = vec4<f32>(
+        reflection_dir.x * reflection_dir.x,
+        reflection_dir.y * reflection_dir.y,
+        reflection_dir.z * reflection_dir.z,
+        1.0 / 3.0,
+    );
+    // Basis indices: [8]=Y2,2(x²-y²), [6]=Y2,0(3z²-1)
+    // Halo packs these as (x², y², -z²*sqrt3, z²*sqrt3) — but in the new_phong_3 path
+    // it's simpler: just dot(quadratic_b, per_channel_constants[7..9])
+    // For our layout: x3.r = r.x²*coeff[8].r + r.y²*(-coeff[8].r) + stuff for coeff[6]
+    // Actually, Halo's pack_constants_texture_array maps:
+    //   constants[7] = (-sh[8].r, sh[8].r, -sh[6].r*sqrt3, sh[6].r*sqrt3)
+    //   etc. for g, b channels
+    // But calculate_area_specular_new_phong_3 uses a DIFFERENT layout than sh_glossy_ct.
+    // It directly dots quadratic_b=(x²,y²,z²,1/3) against constants[7..9].
+    // In Halo's pack_constants_texture_array:
+    //   constants[7].rgba = (-sh8.r, sh8.r, -sh6.r*√3, sh6.r*√3)
+    // So: dot(quadratic_b, constants[7]) = -sh8.r*x² + sh8.r*y² - sh6.r*√3*z² + sh6.r*√3/3
+    //   = sh8.r*(y²-x²) + sh6.r*√3*(1/3 - z²)
+    //   = -sh8.r*(x²-y²) - sh6.r*√3*(z² - 1/3)
+    // Our basis: coeff[8] stores Y22 = 0.546274*(x²-y²), coeff[6] stores Y20 = 0.315392*(3z²-1)
+    // The raw SH coefficient for Y22 basis is coeff[8]/Y22_norm, similarly for Y20.
+    // But since we store L*Y_lm, the coefficients already include the basis function.
+    // Let me just directly compute the L2 quadratic contribution using our basis:
+    let x3 = vec3<f32>(
+        sh_data.coefficients[6].r * (3.0 * reflection_dir.z * reflection_dir.z - 1.0)
+            + sh_data.coefficients[8].r * (reflection_dir.x * reflection_dir.x - reflection_dir.y * reflection_dir.y),
+        sh_data.coefficients[6].g * (3.0 * reflection_dir.z * reflection_dir.z - 1.0)
+            + sh_data.coefficients[8].g * (reflection_dir.x * reflection_dir.x - reflection_dir.y * reflection_dir.y),
+        sh_data.coefficients[6].b * (3.0 * reflection_dir.z * reflection_dir.z - 1.0)
+            + sh_data.coefficients[8].b * (reflection_dir.x * reflection_dir.x - reflection_dir.y * reflection_dir.y),
+    );
+
+    return max(x0 * c_dc + x1 * c_linear + x2 * c_quadratic + x3 * c_quadratic, vec3(0.0));
 }
 
 // Environment cubemap sampling — environment_mapping.fx
@@ -586,12 +743,52 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         light_color += envmap * material_specular_amount * albedo_specular.a;
     }
 
-    // Diffuse indirect — SH irradiance (L2 spherical harmonics)
+    // Area specular — SH-convolved BRDF (the other half of frequency-decomposed specular)
+    if (env_probe.env_intensity > 0.0) {
+        let reflection = reflect(-view_direction, frag_normal);
+        let area_spec = evaluate_sh_area_specular(reflection, roughness);
+        let spec_tint = mix(vec3(1.0), albedo_specular.rgb, ALBEDO_BLEND);
+        light_color += area_spec * AREA_SPECULAR_CONTRIBUTION * material_specular_amount
+                     * albedo_specular.a * spec_tint;
+    }
+
+    // Diffuse indirect — SH with dominant light subtract+re-add
+    // Extracts the dominant directional light from SH, subtracts it, evaluates
+    // residual ambient, then re-adds with sharp N.L for crisper light/shadow.
     var sh_irradiance = vec3<f32>(0.0);
     if (env_probe.env_diffuse_intensity > 0.0) {
-        sh_irradiance = evaluate_sh_irradiance(frag_normal);
+        let dominant = extract_dominant_light_from_sh();
+        let dominant_dir = dominant[0];
+        let dominant_intensity = dominant[1];
+
+        let sh_result = evaluate_sh_irradiance_with_dominant_light(
+            frag_normal, dominant_dir, dominant_intensity
+        );
+        sh_irradiance = sh_result[0];
         light_color += sh_irradiance * albedo_specular.rgb * ambient_occlusion
                      * env_probe.env_diffuse_intensity;
+
+        // Dominant light Cook-Torrance specular — same BRDF as analytical lights
+        let dom_n_dot_l = dot(frag_normal, dominant_dir);
+        let dom_n_dot_v = dot(frag_normal, view_direction);
+        if (min(dom_n_dot_l, dom_n_dot_v) > 0.0) {
+            let dom_half = normalize(dominant_dir + view_direction);
+            let dom_n_dot_h = max(dot(frag_normal, dom_half), 0.0);
+            let dom_v_dot_h = max(dot(view_direction, dom_half), 0.0);
+
+            let dom_D = beckmann_ndf(dom_n_dot_h, roughness);
+            let dom_G = ct_geometry(dom_n_dot_h, dom_n_dot_v, dom_n_dot_l, dom_v_dot_h);
+            let dom_F = fresnel_exact(vec3(fresnel_f0), dom_v_dot_h);
+
+            let dom_ct = dom_D * saturate(dom_G) / (4.0 * dom_n_dot_v + 0.00001) * dom_F;
+            let dom_clamped = min(dom_ct, vec3(dom_n_dot_l + (1.0 - ANTI_SHADOW_CONTROL)));
+            let dom_spec_tint = mix(vec3(1.0), albedo_specular.rgb, ALBEDO_BLEND);
+
+            // Scale by dominant intensity and the 0.281 factor matching diffuse re-add
+            light_color += dom_clamped * dom_spec_tint * dominant_intensity * 0.281
+                         * material_specular_amount * albedo_specular.a
+                         * env_probe.env_diffuse_intensity;
+        }
     }
 
     // Rim fresnel — modulated by SH irradiance (approximates area light at grazing angles)

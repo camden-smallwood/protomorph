@@ -138,6 +138,14 @@ pub struct GpuSHCoefficients {
     pub coefficients: [[f32; 4]; 9], // 9 L2 basis functions, each (R, G, B, pad)
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct GpuSkyParams {
+    pub inverse_view_projection: [[f32; 4]; 4],
+    pub camera_position: [f32; 3],
+    pub _pad: f32,
+}
+
 pub const ENV_PROBE_SIZE: u32 = 128;
 pub const ENV_PROBE_MIP_COUNT: u32 = 6; // 128 -> 4
 

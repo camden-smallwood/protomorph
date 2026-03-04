@@ -125,12 +125,12 @@ impl GodRaysPass {
         let params = GpuGodRayParams {
             sun_screen_pos: sun_screen,
             density: 1.0,
-            weight: 0.005,
-            decay: 0.95,
-            exposure: 1.0,
+            weight: 0.00756,
+            decay: 0.97,
+            exposure: 0.605,
             num_samples: 48.0,
             sun_visible,
-            sun_color: (sun_color * 0.2).into(),
+            sun_color: (sun_color * 1.0).into(),
             _pad: 0.0,
         };
 

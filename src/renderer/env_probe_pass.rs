@@ -1,31 +1,35 @@
 use crate::{
     gpu_types::{
-        CameraUniforms, GpuEnvProbeData, GpuSHCoefficients, QuadVertex, ENV_PROBE_MIP_COUNT,
-        ENV_PROBE_SIZE,
+        CameraUniforms, GpuAtmosphereData, GpuEnvProbeData, GpuSHCoefficients, GpuSkyParams,
+        QuadVertex, ENV_PROBE_MIP_COUNT, ENV_PROBE_SIZE,
     },
     model::{VertexRigid, VertexSkinned, VertexType},
     renderer::{
-        GpuModel,
+        GpuModel, create_fullscreen_pipeline,
         helpers::uniform_entry,
         shared::SharedResources,
     },
 };
 use glam::{Mat4, Vec3};
 
+// Each face renders its matching world direction — no swizzle needed at sample time.
 const FACE_DIRECTIONS: [(Vec3, Vec3); 6] = [
     (Vec3::X, Vec3::new(0.0, -1.0, 0.0)),
     (Vec3::NEG_X, Vec3::new(0.0, -1.0, 0.0)),
     (Vec3::Y, Vec3::new(0.0, 0.0, 1.0)),
     (Vec3::NEG_Y, Vec3::new(0.0, 0.0, -1.0)),
-    (Vec3::Z, Vec3::new(0.0, -1.0, 0.0)),
     (Vec3::NEG_Z, Vec3::new(0.0, -1.0, 0.0)),
+    (Vec3::Z, Vec3::new(0.0, -1.0, 0.0)),
 ];
 
-const UPDATE_INTERVAL: u64 = 60;
+const UPDATE_INTERVAL: u64 = 1;
 
 /// Compute L2 SH coefficients analytically from sun + ambient.
-/// ZH transfer coefficients for cosine-lobe (diffuse irradiance):
-///   A0 = π, A1 = 2π/3, A2 = π/4
+/// Stores raw SH projection: L * Y_lm(d) — no diffuse transfer baked in.
+/// Transfer coefficients (A_l for diffuse, specular kernels, etc.) are
+/// applied at evaluation time in the shader so the same coefficients can
+/// drive both diffuse irradiance and area specular.
+///
 /// SH basis normalization constants:
 ///   Y00 = 0.282095 (1/(2√π))
 ///   Y1x = 0.488603 (√3/(2√π))
@@ -35,13 +39,6 @@ fn compute_analytical_sh(
     sun_color: Vec3,
     ambient_color: Vec3,
 ) -> GpuSHCoefficients {
-    use std::f32::consts::PI;
-
-    // ZH transfer coefficients (cosine-lobe projection)
-    let a0 = PI;
-    let a1 = 2.0 * PI / 3.0;
-    let a2 = PI / 4.0;
-
     // SH basis constants
     let y00: f32 = 0.282095;   // 1/(2√π)
     let y1x: f32 = 0.488603;   // √3/(2√π)
@@ -49,30 +46,28 @@ fn compute_analytical_sh(
     let y21: f32 = 1.092548;   // √15/(2√π)
     let y22: f32 = 0.546274;   // √15/(4√π)
 
-    // Directional light SH projection
-    // Project sun direction onto each basis, scale by transfer coefficient and sun color
+    // Directional light SH projection (raw, no transfer coefficients)
     let d = sun_dir.normalize();
     let mut coeffs = [[0.0f32; 4]; 9];
 
     // L0 band: ambient + directional
-    let l0 = sun_color * a0 * y00 + ambient_color * a0 * y00;
+    let l0 = (sun_color + ambient_color) * y00;
     coeffs[0] = [l0.x, l0.y, l0.z, 0.0];
 
     // L1 band: Y1,-1 = y, Y1,0 = z, Y1,1 = x
-    let l1_scale = a1 * y1x;
-    let l1_m1 = sun_color * l1_scale * d.y;
-    let l1_0 = sun_color * l1_scale * d.z;
-    let l1_1 = sun_color * l1_scale * d.x;
+    let l1_m1 = sun_color * y1x * d.y;
+    let l1_0 = sun_color * y1x * d.z;
+    let l1_1 = sun_color * y1x * d.x;
     coeffs[1] = [l1_m1.x, l1_m1.y, l1_m1.z, 0.0];
     coeffs[2] = [l1_0.x, l1_0.y, l1_0.z, 0.0];
     coeffs[3] = [l1_1.x, l1_1.y, l1_1.z, 0.0];
 
     // L2 band
-    let l2_m2 = sun_color * a2 * y21 * d.x * d.y;
-    let l2_m1 = sun_color * a2 * y21 * d.y * d.z;
-    let l2_0 = sun_color * a2 * y20 * (3.0 * d.z * d.z - 1.0);
-    let l2_1 = sun_color * a2 * y21 * d.x * d.z;
-    let l2_2 = sun_color * a2 * y22 * (d.x * d.x - d.y * d.y);
+    let l2_m2 = sun_color * y21 * d.x * d.y;
+    let l2_m1 = sun_color * y21 * d.y * d.z;
+    let l2_0 = sun_color * y20 * (3.0 * d.z * d.z - 1.0);
+    let l2_1 = sun_color * y21 * d.x * d.z;
+    let l2_2 = sun_color * y22 * (d.x * d.x - d.y * d.y);
     coeffs[4] = [l2_m2.x, l2_m2.y, l2_m2.z, 0.0];
     coeffs[5] = [l2_m1.x, l2_m1.y, l2_m1.z, 0.0];
     coeffs[6] = [l2_0.x, l2_0.y, l2_0.z, 0.0];
@@ -84,6 +79,11 @@ fn compute_analytical_sh(
 
 #[allow(dead_code)]
 pub struct EnvProbePass {
+    // Sky background pipeline for cubemap faces
+    sky_pipeline: wgpu::RenderPipeline,
+    sky_params_buffers: [wgpu::Buffer; 6],
+    sky_bind_groups: [wgpu::BindGroup; 6],
+
     // Forward rendering pipeline (rigid + skinned)
     forward_pipeline: wgpu::RenderPipeline,
     forward_skinned_pipeline: wgpu::RenderPipeline,
@@ -231,6 +231,63 @@ impl EnvProbePass {
             &shared.node_matrices_bgl,
         );
 
+        // --- Sky background pipeline ---
+        let sky_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("env_probe_sky_bgl"),
+            entries: &[
+                uniform_entry(
+                    0,
+                    size_of::<GpuSkyParams>() as u64,
+                    wgpu::ShaderStages::FRAGMENT,
+                    false,
+                ),
+                uniform_entry(
+                    1,
+                    size_of::<GpuAtmosphereData>() as u64,
+                    wgpu::ShaderStages::FRAGMENT,
+                    false,
+                ),
+            ],
+        });
+
+        let sky_pipeline = create_fullscreen_pipeline(
+            device,
+            wgpu::include_wgsl!("../../assets/shaders/env_probe_sky.wgsl"),
+            &[&sky_bgl],
+            &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            "env_probe_sky_pipeline",
+        );
+
+        let sky_params_buffers: [wgpu::Buffer; 6] = std::array::from_fn(|face| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("env_probe_sky_params_{face}")),
+                size: size_of::<GpuSkyParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+
+        let sky_bind_groups: [wgpu::BindGroup; 6] = std::array::from_fn(|face| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("env_probe_sky_bg_{face}")),
+                layout: &sky_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: sky_params_buffers[face].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: shared.atmosphere_buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        });
+
         // --- Mip downsample ---
         let downsample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("env_downsample_bgl"),
@@ -344,6 +401,9 @@ impl EnvProbePass {
         });
 
         Self {
+            sky_pipeline,
+            sky_params_buffers,
+            sky_bind_groups,
             forward_pipeline,
             forward_skinned_pipeline,
             downsample_pipeline,
@@ -367,6 +427,14 @@ impl EnvProbePass {
         }
     }
 
+    pub fn face_view(&self, face: usize) -> &wgpu::TextureView {
+        &self.face_mip_views[face][0]
+    }
+
+    pub fn filtering_sampler(&self) -> &wgpu::Sampler {
+        &self.filtering_sampler
+    }
+
     pub fn should_update(&self) -> bool {
         self.frame_counter % UPDATE_INTERVAL == 0
     }
@@ -381,6 +449,7 @@ impl EnvProbePass {
         sun_direction: Vec3,
         sun_color: Vec3,
         ambient_color: Vec3,
+        debug_face_colors: bool,
     ) {
         // Scale env probe contribution by actual sun presence — the cubemap
         // forward render uses a hardcoded light approximation that only makes
@@ -419,98 +488,172 @@ impl EnvProbePass {
         }
         self.frame_counter += 1;
 
-        // Upload 6 face cameras
-        let probe_pos = camera_position;
-        let mut proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);
-        proj.y_axis.y = -proj.y_axis.y;
+        // Debug: solid color per face to verify cubemap orientation
+        // 0=+X red, 1=-X cyan, 2=+Y dark green, 3=-Y magenta, 4=+Z blue, 5=-Z yellow
+        const DEBUG_COLORS: [wgpu::Color; 6] = [
+            wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }, // +X = red
+            wgpu::Color { r: 0.0, g: 1.0, b: 1.0, a: 1.0 }, // -X = cyan
+            wgpu::Color { r: 0.0, g: 0.5, b: 0.0, a: 1.0 }, // +Y = dark green
+            wgpu::Color { r: 1.0, g: 0.0, b: 1.0, a: 1.0 }, // -Y = magenta
+            wgpu::Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 }, // +Z = blue
+            wgpu::Color { r: 1.0, g: 1.0, b: 0.0, a: 1.0 }, // -Z = yellow
+        ];
 
-        for (face, (dir, up)) in FACE_DIRECTIONS.iter().enumerate() {
-            let view = Mat4::look_at_rh(probe_pos, probe_pos + *dir, *up);
-            let cam = CameraUniforms {
-                view: view.to_cols_array_2d(),
-                projection: proj.to_cols_array_2d(),
-            };
-            let offset = (face * self.camera_stride) as u64;
-            shared
-                .queue
-                .write_buffer(&self.camera_buffer, offset, bytemuck::bytes_of(&cam));
-        }
+        if debug_face_colors {
+            for face in 0..6usize {
+                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("env_probe_debug_color"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.face_mip_views[face][0],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(DEBUG_COLORS[face]),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+            }
+        } else {
+            // Upload 6 face cameras
+            let probe_pos = camera_position;
+            // Flip projection Y so rendered face images match the cubemap hardware's
+            // expected UV layout (look_at_rh with standard up vectors produces vertically
+            // flipped images relative to the cubemap spec).
+            let mut proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);
+            proj.y_axis.y *= -1.0;
 
-        // Render 6 faces at mip 0
-        for face in 0..6usize {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("env_probe_face"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.face_mip_views[face][0],
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
+            for (face, (dir, up)) in FACE_DIRECTIONS.iter().enumerate() {
+                let view = Mat4::look_at_rh(probe_pos, probe_pos + *dir, *up);
+                let cam = CameraUniforms {
+                    view: view.to_cols_array_2d(),
+                    projection: proj.to_cols_array_2d(),
+                };
+                let offset = (face * self.camera_stride) as u64;
+                shared
+                    .queue
+                    .write_buffer(&self.camera_buffer, offset, bytemuck::bytes_of(&cam));
+            }
+
+            // Render 6 faces at mip 0: sky background then geometry on top
+            for face in 0..6usize {
+                // Compute per-face inverse VP for sky ray reconstruction
+                let (dir, up) = FACE_DIRECTIONS[face];
+                let view = Mat4::look_at_rh(probe_pos, probe_pos + dir, up);
+                let inverse_vp = (proj * view).inverse();
+                let sky_params = GpuSkyParams {
+                    inverse_view_projection: inverse_vp.to_cols_array_2d(),
+                    camera_position: probe_pos.into(),
+                    _pad: 0.0,
+                };
+                shared.queue.write_buffer(
+                    &self.sky_params_buffers[face],
+                    0,
+                    bytemuck::bytes_of(&sky_params),
+                );
+
+                // Sky pass: clear to black then draw fullscreen sky quad
+                {
+                    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("env_probe_sky"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &self.face_mip_views[face][0],
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.0,
+                                    g: 0.0,
+                                    b: 0.0,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    rpass.set_pipeline(&self.sky_pipeline);
+                    rpass.set_bind_group(0, &self.sky_bind_groups[face], &[]);
+                    rpass.set_vertex_buffer(0, shared.quad_vertex_buffer.slice(..));
+                    rpass.draw(0..6, 0..1);
+                }
+
+                // Geometry pass: load sky background, clear depth
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("env_probe_face"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.face_mip_views[face][0],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
                         }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                ..Default::default()
-            });
+                    ..Default::default()
+                });
 
-            let camera_dynamic_offset = (face * self.camera_stride) as u32;
-            rpass.set_bind_group(0, &self.camera_bind_group, &[camera_dynamic_offset]);
+                let camera_dynamic_offset = (face * self.camera_stride) as u32;
+                rpass.set_bind_group(0, &self.camera_bind_group, &[camera_dynamic_offset]);
 
-            // Draw models
-            for (obj_slot, &(_obj_idx, model_idx)) in render_list.iter().enumerate() {
-                let model_dynamic_offset = (obj_slot * shared.model_stride) as u32;
-                let nm_dynamic_offset = (obj_slot * shared.node_matrices_stride) as u32;
-                let gpu_model = &models[model_idx];
+                // Draw models
+                for (obj_slot, &(_obj_idx, model_idx)) in render_list.iter().enumerate() {
+                    let model_dynamic_offset = (obj_slot * shared.model_stride) as u32;
+                    let nm_dynamic_offset = (obj_slot * shared.node_matrices_stride) as u32;
+                    let gpu_model = &models[model_idx];
 
-                for mesh in &gpu_model.meshes {
-                    match mesh.vertex_type {
-                        VertexType::Rigid => {
-                            rpass.set_pipeline(&self.forward_pipeline);
-                            rpass.set_bind_group(
-                                1,
-                                &shared.model_bind_group,
-                                &[model_dynamic_offset],
-                            );
+                    for mesh in &gpu_model.meshes {
+                        match mesh.vertex_type {
+                            VertexType::Rigid => {
+                                rpass.set_pipeline(&self.forward_pipeline);
+                                rpass.set_bind_group(
+                                    1,
+                                    &shared.model_bind_group,
+                                    &[model_dynamic_offset],
+                                );
+                            }
+                            VertexType::Skinned => {
+                                rpass.set_pipeline(&self.forward_skinned_pipeline);
+                                rpass.set_bind_group(
+                                    1,
+                                    &shared.model_bind_group,
+                                    &[model_dynamic_offset],
+                                );
+                                rpass.set_bind_group(
+                                    3,
+                                    &shared.node_matrices_bind_group,
+                                    &[nm_dynamic_offset],
+                                );
+                            }
                         }
-                        VertexType::Skinned => {
-                            rpass.set_pipeline(&self.forward_skinned_pipeline);
-                            rpass.set_bind_group(
-                                1,
-                                &shared.model_bind_group,
-                                &[model_dynamic_offset],
-                            );
-                            rpass.set_bind_group(
-                                3,
-                                &shared.node_matrices_bind_group,
-                                &[nm_dynamic_offset],
-                            );
-                        }
-                    }
 
-                    rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    rpass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-
-                    for part in &mesh.parts {
-                        if let Some(material) = gpu_model.materials.get(part.material_index) {
-                            rpass.set_bind_group(2, &material.bind_group, &[]);
-                        }
-                        rpass.draw_indexed(
-                            part.index_start..part.index_start + part.index_count,
-                            0,
-                            0..1,
+                        rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        rpass.set_index_buffer(
+                            mesh.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
                         );
+
+                        for part in &mesh.parts {
+                            if let Some(material) = gpu_model.materials.get(part.material_index) {
+                                rpass.set_bind_group(2, &material.bind_group, &[]);
+                            }
+                            rpass.draw_indexed(
+                                part.index_start..part.index_start + part.index_count,
+                                0,
+                                0..1,
+                            );
+                        }
                     }
                 }
             }
@@ -624,7 +767,7 @@ fn create_env_forward_pipeline(
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
-            front_face: wgpu::FrontFace::Ccw,
+            front_face: wgpu::FrontFace::Cw,
             cull_mode: Some(wgpu::Face::Back),
             ..Default::default()
         },
@@ -679,7 +822,7 @@ fn create_env_forward_skinned_pipeline(
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
-            front_face: wgpu::FrontFace::Ccw,
+            front_face: wgpu::FrontFace::Cw,
             cull_mode: Some(wgpu::Face::Back),
             ..Default::default()
         },

@@ -1,4 +1,5 @@
 mod bloom_pass;
+mod cubemap_debug_pass;
 mod env_probe_pass;
 mod fxaa_pass;
 mod geometry_pass;
@@ -7,6 +8,7 @@ mod helpers;
 mod lighting_pass;
 mod shadow_pass;
 mod shared;
+mod sky_pass;
 mod ssao_blur_pass;
 mod ssao_pass;
 mod text_pass;
@@ -65,9 +67,11 @@ pub struct Renderer {
     ssao_pass: ssao_pass::SsaoPass,
     ssao_blur_pass: ssao_blur_pass::SsaoBlurPass,
     lighting_pass: lighting_pass::LightingPass,
+    sky_pass: sky_pass::SkyPass,
     god_rays_pass: god_rays_pass::GodRaysPass,
     bloom_pass: bloom_pass::BloomPass,
     fxaa_pass: fxaa_pass::FxaaPass,
+    cubemap_debug_pass: cubemap_debug_pass::CubemapDebugPass,
     text_pass: text_pass::TextPass,
 
     models: Vec<GpuModel>,
@@ -147,6 +151,7 @@ impl Renderer {
             &shadow_pass.bgl,
             &env_probe_pass.bgl,
         );
+        let sky_pass = sky_pass::SkyPass::new(&shared, &gbuffer.position_depth_view);
         let god_rays_pass = god_rays_pass::GodRaysPass::new(
             &shared,
             &gbuffer.position_depth_view,
@@ -155,6 +160,12 @@ impl Renderer {
         let bloom_pass = bloom_pass::BloomPass::new(&shared, &intermediates, shared.config.format);
         let fxaa_pass =
             fxaa_pass::FxaaPass::new(&shared, &intermediates, shared.config.format);
+        let cubemap_debug_pass = cubemap_debug_pass::CubemapDebugPass::new(
+            &shared,
+            std::array::from_fn(|i| env_probe_pass.face_view(i)),
+            env_probe_pass.filtering_sampler(),
+            shared.config.format,
+        );
         let text_pass = text_pass::TextPass::new(&shared);
 
         Self {
@@ -168,9 +179,11 @@ impl Renderer {
             ssao_pass,
             ssao_blur_pass,
             lighting_pass,
+            sky_pass,
             god_rays_pass,
             bloom_pass,
             fxaa_pass,
+            cubemap_debug_pass,
             text_pass,
             models: Vec::new(),
             render_list: Vec::with_capacity(MAX_OBJECTS),
@@ -364,6 +377,8 @@ impl Renderer {
             .resize(&self.shared, &self.gbuffer, &self.intermediates);
         self.lighting_pass
             .resize(&self.shared, &self.gbuffer, &self.intermediates);
+        self.sky_pass
+            .resize(&self.shared, &self.gbuffer.position_depth_view);
         self.god_rays_pass.resize(
             &self.shared,
             &self.gbuffer.position_depth_view,
@@ -380,6 +395,7 @@ impl Renderer {
             game.fps_counter.display_fps,
             self.shared.config.width,
             self.shared.config.height,
+            game.debug_cubemap,
         );
 
         // Build sorted render list
@@ -549,6 +565,7 @@ impl Renderer {
             sun_dir_to_sun,
             sun_diffuse,
             sun_ambient,
+            game.debug_cubemap_colors,
         );
 
         // === Geometry pass ===
@@ -580,6 +597,16 @@ impl Renderer {
             &self.env_probe_pass.bind_group,
         );
 
+        // === Sky pass (fills sky pixels in lighting result) ===
+        self.sky_pass.record(
+            &mut encoder,
+            &self.shared,
+            &self.intermediates.lighting_base_view,
+            game.camera.view,
+            game.camera.projection,
+            game.camera.position,
+        );
+
         // === God rays pass (between lighting and bloom) ===
         self.god_rays_pass.record(
             &mut encoder,
@@ -603,6 +630,12 @@ impl Renderer {
         // === FXAA pass (reads intermediate, writes to surface) ===
         self.fxaa_pass
             .record(&mut encoder, &self.shared, &surface_view);
+
+        // === Cubemap debug overlay ===
+        if game.debug_cubemap {
+            self.cubemap_debug_pass
+                .record(&mut encoder, &self.shared, &surface_view);
+        }
 
         // === Text overlay ===
         {

@@ -5,7 +5,7 @@ A real-time 3D rendering engine written in Rust, targeting Halo 3-era graphical 
 ## Features
 
 - **Deferred Rendering** with a 4-target G-buffer (position/depth, normals, albedo/specular, material properties)
-- **Cook-Torrance BRDF** matching Halo 3's microfacet shading model (GGX NDF, Schlick Fresnel, Smith geometry)
+- **Cook-Torrance BRDF** matching Halo 3's microfacet shading model (Beckmann NDF, exact Fresnel, CT geometry) with frequency-decomposed specular (analytical, area specular, env map, SH diffuse)
 - **Cascaded Shadow Mapping** with 3 cascades, rotated Poisson disk PCF, and cascade blending
 - **Point & Spot Light Shadows** via cubemap and 2D depth maps with rotated Poisson disk PCF
 - **Environment Probes** with runtime cubemap capture, L2 spherical harmonics for diffuse IBL, and roughness-based mip selection for specular IBL
@@ -118,14 +118,14 @@ Protomorph targets the rendering techniques documented in Bungie's **"Lighting a
 
 | Technique | Halo 3 | Protomorph | Notes |
 |-----------|--------|------------|-------|
-| Cook-Torrance BRDF | Beckmann NDF, full Fresnel, CT geometry term | GGX NDF, Schlick Fresnel, Smith geometry | Implemented with modern NDF variant |
-| Frequency-decomposed specular | 4 levels: diffuse SH, area specular, env map, analytical | Analytical + env map + SH diffuse | Area specular (SH-convolved BRDF) not yet implemented |
+| Cook-Torrance BRDF | Beckmann NDF, full Fresnel, CT geometry term | Beckmann NDF, exact Fresnel, CT geometry term | Matching Halo 3 implementation |
+| Frequency-decomposed specular | 4 levels: diffuse SH, area specular, env map, analytical | All 4: SH diffuse, area specular, env map, analytical | Full frequency decomposition with SH-convolved BRDF |
 | Multiple material models | cook_torrance, two_lobe_phong, glass, organism, foliage | Cook-Torrance only | Single material model currently |
 | SH lightmaps (baked GI) | L2 SH per lightmap texel via photon mapping | Runtime SH from env probe only | No offline lightmap baking pipeline |
 | Light probes / PRT | Baked PRT with self-shadowing transfer vectors | Runtime env probe with SH | PRT not implemented |
-| Rim Fresnel | Configurable rim term with color/power/blend | Not yet implemented | -- |
-| Anti-shadow control | Specular clamping near shadow terminator | Not yet implemented | -- |
-| Analytical dominant light from SH | Extracts brightest direction from SH for sharp specular | Not yet implemented | -- |
+| Rim Fresnel | Configurable rim term with color/power/blend | Implemented with configurable coefficient, power, color, albedo blend | Modulated by SH irradiance |
+| Anti-shadow control | Specular clamping near shadow terminator | Implemented with tunable control parameter | cook_torrance.fx line 298 |
+| Analytical dominant light from SH | Extracts brightest direction from SH for sharp specular | Implemented with subtract+re-add and Cook-Torrance specular | Luminance-weighted L1 extraction |
 
 ### Shadows
 
@@ -201,7 +201,7 @@ Protomorph targets the rendering techniques documented in Bungie's **"Lighting a
 
 ### Summary
 
-Protomorph implements the core of Halo 3's rendering philosophy — Cook-Torrance shading, environment probes with spherical harmonics, cascaded shadow mapping, atmospheric scattering, and HDR bloom — while substituting modern techniques where appropriate (GGX over Beckmann, ACES tone mapping over dual-buffer HDR, FXAA and SSAO which Halo 3 lacked entirely). The main gaps are in content pipeline features (baked SH lightmaps, PRT), specialized material models (glass, organism, two-lobe phong), and gameplay-facing systems (particles, water, decals, physics, motion blur).
+Protomorph implements the core of Halo 3's rendering philosophy — Cook-Torrance shading with Beckmann NDF and exact Fresnel, all four levels of frequency-decomposed specular (SH diffuse, area specular, environment map, analytical), dominant light extraction from SH with subtract+re-add, rim fresnel, anti-shadow control, environment probes with spherical harmonics, cascaded shadow mapping, atmospheric scattering, and HDR bloom — while adding modern techniques where appropriate (ACES tone mapping over dual-buffer HDR, FXAA and SSAO which Halo 3 lacked entirely). The main gaps are in content pipeline features (baked SH lightmaps, PRT), specialized material models (glass, organism, two-lobe phong), and gameplay-facing systems (particles, water, decals, physics, motion blur).
 
 ## Dependencies
 

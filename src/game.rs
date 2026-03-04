@@ -57,6 +57,8 @@ pub struct GameState {
     weapon_model_index: usize,
     weapon_moving_anim_idx: Option<usize>,
     rotation_towards_grunt: f32,
+    pub debug_cubemap: bool,
+    pub debug_cubemap_colors: bool,
 }
 
 impl GameState {
@@ -99,23 +101,23 @@ impl GameState {
         // More overhead sun angle:
         // let sun_dir = Vec3::new(-0.5, 0.3, -0.866).normalize();
 
-        // // Warm sunset — low sun from front-left
-        // let mut sun = LightData::new_directional();
-        // sun.direction = sun_dir;
-        // sun.diffuse_color = Vec3::new(1.4, 0.7, 0.3);
-        // sun.ambient_color = Vec3::new(0.12, 0.08, 0.06);
-        // sun.specular_color = Vec3::new(1.4, 0.7, 0.3);
-        // sun.casts_shadow = true;
-        // lights.new_light(sun);
-
-        // Noon summer sun
+        // Warm sunset — low sun from front-left
         let mut sun = LightData::new_directional();
         sun.direction = sun_dir;
-        sun.diffuse_color = Vec3::new(1.0, 0.95, 0.8);
-        sun.ambient_color = Vec3::new(0.15, 0.14, 0.12);
-        sun.specular_color = Vec3::new(1.0, 0.95, 0.8);
+        sun.diffuse_color = Vec3::new(1.4, 0.7, 0.3);
+        sun.ambient_color = Vec3::new(0.12, 0.08, 0.06);
+        sun.specular_color = Vec3::new(1.4, 0.7, 0.3);
         sun.casts_shadow = true;
         lights.new_light(sun);
+
+        // // Noon summer sun
+        // let mut sun = LightData::new_directional();
+        // sun.direction = sun_dir;
+        // sun.diffuse_color = Vec3::new(1.0, 0.95, 0.8);
+        // sun.ambient_color = Vec3::new(0.15, 0.14, 0.12);
+        // sun.specular_color = Vec3::new(1.0, 0.95, 0.8);
+        // sun.casts_shadow = true;
+        // lights.new_light(sun);
 
         let atmo_sun = -sun_dir; // direction TO the sun = negation of light travel
         let mut state = Self {
@@ -143,6 +145,8 @@ impl GameState {
             weapon_model_index: 0,
             weapon_moving_anim_idx: None,
             rotation_towards_grunt: 0.0,
+            debug_cubemap: false,
+            debug_cubemap_colors: false,
         };
 
         state.load_scene(renderer);
@@ -217,6 +221,14 @@ impl GameState {
         self.update_weapon_animations();
         self.objects.update(&self.model_data, dt);
         self.fps_counter.update(dt);
+    }
+
+    pub fn toggle_debug_cubemap(&mut self) {
+        self.debug_cubemap = !self.debug_cubemap;
+    }
+
+    pub fn toggle_debug_cubemap_colors(&mut self) {
+        self.debug_cubemap_colors = !self.debug_cubemap_colors;
     }
 
     pub fn toggle_flashlight(&mut self) {
