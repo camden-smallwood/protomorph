@@ -30,5 +30,8 @@ fn vs_main(
         skinned = vec4(position, 1.0);
     }
 
-    return camera.projection * camera.view * model.model * skinned;
+    var out = camera.projection * camera.view * model.model * skinned;
+    // Shadow pancaking: clamp near-plane to avoid clipping casters behind the light
+    out.z = max(out.z, 0.0);
+    return out;
 }

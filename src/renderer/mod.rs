@@ -8,7 +8,6 @@ mod helpers;
 mod lighting_pass;
 mod shadow_pass;
 mod shared;
-mod sky_pass;
 mod ssao_blur_pass;
 mod ssao_pass;
 mod text_pass;
@@ -47,8 +46,6 @@ pub(crate) struct GpuMaterial {
 pub(crate) struct GpuModel {
     pub meshes: Vec<GpuMesh>,
     pub materials: Vec<GpuMaterial>,
-    #[allow(dead_code)]
-    pub node_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -67,7 +64,6 @@ pub struct Renderer {
     ssao_pass: ssao_pass::SsaoPass,
     ssao_blur_pass: ssao_blur_pass::SsaoBlurPass,
     lighting_pass: lighting_pass::LightingPass,
-    sky_pass: sky_pass::SkyPass,
     god_rays_pass: god_rays_pass::GodRaysPass,
     bloom_pass: bloom_pass::BloomPass,
     fxaa_pass: fxaa_pass::FxaaPass,
@@ -103,7 +99,8 @@ impl Renderer {
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("device"),
-            required_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
+            required_features: wgpu::Features::TEXTURE_COMPRESSION_BC
+                | wgpu::Features::RG11B10UFLOAT_RENDERABLE,
             ..Default::default()
         }))
         .expect("Failed to create device");
@@ -151,11 +148,10 @@ impl Renderer {
             &shadow_pass.bgl,
             &env_probe_pass.bgl,
         );
-        let sky_pass = sky_pass::SkyPass::new(&shared, &gbuffer.position_depth_view);
         let god_rays_pass = god_rays_pass::GodRaysPass::new(
             &shared,
-            &gbuffer.position_depth_view,
-            &intermediates.god_rays_view,
+            &gbuffer.depth_view,
+            &intermediates,
         );
         let bloom_pass = bloom_pass::BloomPass::new(&shared, &intermediates, shared.config.format);
         let fxaa_pass =
@@ -179,7 +175,6 @@ impl Renderer {
             ssao_pass,
             ssao_blur_pass,
             lighting_pass,
-            sky_pass,
             god_rays_pass,
             bloom_pass,
             fxaa_pass,
@@ -345,12 +340,10 @@ impl Renderer {
             })
             .collect();
 
-        let node_count = model.nodes.len();
         let index = self.models.len();
         self.models.push(GpuModel {
             meshes,
             materials,
-            node_count,
         });
         (index, model)
     }
@@ -377,13 +370,8 @@ impl Renderer {
             .resize(&self.shared, &self.gbuffer, &self.intermediates);
         self.lighting_pass
             .resize(&self.shared, &self.gbuffer, &self.intermediates);
-        self.sky_pass
-            .resize(&self.shared, &self.gbuffer.position_depth_view);
-        self.god_rays_pass.resize(
-            &self.shared,
-            &self.gbuffer.position_depth_view,
-            &self.intermediates,
-        );
+        self.god_rays_pass
+            .resize(&self.shared, &self.gbuffer.depth_view, &self.intermediates);
         self.bloom_pass.resize(&self.shared, &self.intermediates);
         self.fxaa_pass.resize(&self.shared, &self.intermediates);
     }
@@ -476,6 +464,7 @@ impl Renderer {
             game.camera.forward,
             &game.lights,
             &shadow_assignments,
+            game.enable_specular_occlusion,
         );
         self.shared.queue.write_buffer(
             &self.shared.lighting_buffer,
@@ -568,7 +557,16 @@ impl Renderer {
             game.debug_cubemap_colors,
         );
 
-        // === Geometry pass ===
+        // === Depth pre-pass (populates depth buffer, zero overdraw in G-buffer) ===
+        self.geometry_pass.record_depth_prepass(
+            &mut encoder,
+            &self.shared,
+            &self.gbuffer,
+            &self.models,
+            &render_list,
+        );
+
+        // === Geometry pass (depth Equal, no depth write — only visible fragments shade) ===
         self.geometry_pass.record(
             &mut encoder,
             &self.shared,
@@ -582,13 +580,25 @@ impl Renderer {
             .record(&mut encoder, &self.shared, &self.intermediates.ssao_view);
 
         // === SSAO blur pass ===
-        self.ssao_blur_pass.record(
-            &mut encoder,
-            &self.shared,
-            &self.intermediates.ssao_blur_view,
-        );
+        self.ssao_blur_pass
+            .record(&mut encoder, &self.shared, &self.intermediates.ssao_blur_view);
 
-        // === Lighting pass ===
+        // Upload sky params for merged lighting+sky pass
+        {
+            let inverse_vp = (game.camera.projection * game.camera.view).inverse();
+            let sky_params = GpuSkyParams {
+                inverse_view_projection: inverse_vp.to_cols_array_2d(),
+                camera_position: game.camera.position.into(),
+                _pad: 0.0,
+            };
+            self.shared.queue.write_buffer(
+                &self.shared.sky_params_buffer,
+                0,
+                bytemuck::bytes_of(&sky_params),
+            );
+        }
+
+        // === Lighting + Sky pass (merged — sky fills depth==0 pixels) ===
         self.lighting_pass.record(
             &mut encoder,
             &self.shared,
@@ -597,26 +607,32 @@ impl Renderer {
             &self.env_probe_pass.bind_group,
         );
 
-        // === Sky pass (fills sky pixels in lighting result) ===
-        self.sky_pass.record(
+        // === Forward emissive pass (additive onto lighting buffer) ===
+        self.geometry_pass.record_emissive(
             &mut encoder,
             &self.shared,
+            &self.gbuffer,
             &self.intermediates.lighting_base_view,
-            game.camera.view,
-            game.camera.projection,
-            game.camera.position,
+            &self.models,
+            &render_list,
         );
 
-        // === God rays pass (between lighting and bloom) ===
-        self.god_rays_pass.record(
+        // === God rays trace (writes to god_rays_view) ===
+        self.god_rays_pass.record_trace(
             &mut encoder,
             &self.shared,
             &self.intermediates.god_rays_view,
-            &self.intermediates.lighting_base_view,
             game.camera.view,
             game.camera.projection,
             sun_dir_to_sun,
             sun_diffuse,
+        );
+
+        // === God rays composite (additive onto lighting) ===
+        self.god_rays_pass.record_composite(
+            &mut encoder,
+            &self.shared,
+            &self.intermediates.lighting_base_view,
         );
 
         // === Bloom pass (writes to intermediate, not surface) ===

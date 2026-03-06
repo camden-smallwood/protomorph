@@ -1,13 +1,13 @@
-// Screen-space ambient occlusion
+// Screen-space ambient occlusion with bent normal output
 // Port of C's ssao.fs
-// Reads depth from position_depth.w (packed G-buffer)
+// Reads depth from depth buffer
 
 @group(0) @binding(0) var t_normal: texture_2d<f32>;
-@group(0) @binding(1) var t_position_depth: texture_2d<f32>;
+@group(0) @binding(1) var t_depth: texture_depth_2d;
 @group(0) @binding(2) var t_noise: texture_2d<f32>;
 @group(0) @binding(3) var s_nearest: sampler;
 
-const NUM_KERNEL_SAMPLES: u32 = 32u;
+const NUM_KERNEL_SAMPLES: u32 = 16u;
 
 struct SsaoParams {
     kernel_samples: array<vec4<f32>, 32>,
@@ -40,36 +40,57 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
+// Octahedral decoding: vec2 in [-1,1] -> unit vec3
+fn oct_decode(p: vec2<f32>) -> vec3<f32> {
+    var n = vec3<f32>(p.x, p.y, 1.0 - abs(p.x) - abs(p.y));
+    if (n.z < 0.0) {
+        n = vec3<f32>((1.0 - abs(n.yx)) * sign(n.xy), n.z);
+    }
+    return normalize(n);
+}
+
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) f32 {
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.tex_coords;
 
-    let frag_normal = textureSample(t_normal, s_nearest, uv).xyz;
-    let frag_depth = textureSample(t_position_depth, s_nearest, uv).w;
+    let frag_normal = oct_decode(textureSample(t_normal, s_nearest, uv).rg);
+    let frag_depth = textureSample(t_depth, s_nearest, uv);
 
     let noise_scale = vec2<f32>(params.noise_scale_x, params.noise_scale_y);
 
     let noise_sample = normalize(textureSample(t_noise, s_nearest, uv * noise_scale).xyz * 2.0 - vec3<f32>(1.0));
 
     var occlusion = 0.0;
+    var bent_normal = vec3<f32>(0.0);
 
     for (var i = 0u; i < NUM_KERNEL_SAMPLES; i++) {
         // Reflect kernel sample by noise
         let ray = params.radius * reflect(params.kernel_samples[i].xyz, noise_sample);
 
-        // Get occluder fragment
-        let occluder_uv = uv + sign(dot(ray, frag_normal)) * ray.xy;
-        let occluder_normal = textureSample(t_normal, s_nearest, occluder_uv).xyz;
-        let occluder_depth = textureSample(t_position_depth, s_nearest, occluder_uv).w;
+        // Hemisphere direction (flip if below surface)
+        let sample_dir = sign(dot(ray, frag_normal)) * ray;
 
-        // Depth difference (negative = occluder behind fragment)
-        let depth_diff = frag_depth - occluder_depth;
+        // Get occluder fragment
+        let occluder_uv = uv + sample_dir.xy;
+        let occluder_normal = oct_decode(textureSample(t_normal, s_nearest, occluder_uv).rg);
+        let occluder_depth = textureSample(t_depth, s_nearest, occluder_uv);
+
+        // Depth difference — reverse-Z: closer = larger depth, so flip subtraction
+        let depth_diff = occluder_depth - frag_depth;
 
         // Occlusion calculation (matching C exactly)
-        occlusion += step(params.falloff, depth_diff)
+        let sample_occlusion = step(params.falloff, depth_diff)
             * (1.0 - dot(occluder_normal, frag_normal))
             * (1.0 - smoothstep(params.falloff, params.strength, depth_diff));
+
+        occlusion += sample_occlusion;
+
+        // Accumulate bent normal — unoccluded directions contribute
+        bent_normal += normalize(sample_dir) * (1.0 - sample_occlusion);
     }
 
-    return 1.0 - (occlusion / f32(NUM_KERNEL_SAMPLES));
+    let ao = 1.0 - (occlusion / f32(NUM_KERNEL_SAMPLES));
+    bent_normal = normalize(mix(frag_normal, normalize(bent_normal), 1.0 - ao));
+
+    return vec4<f32>(bent_normal, ao);
 }

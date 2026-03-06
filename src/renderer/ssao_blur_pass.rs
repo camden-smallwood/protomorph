@@ -1,6 +1,6 @@
 use crate::renderer::{
     create_fullscreen_pipeline,
-    helpers::{sampler_entry, tex_entry},
+    helpers::{depth_tex_entry, sampler_entry, tex_entry},
     shared::{GBuffer, IntermediateTargets, SharedResources},
 };
 
@@ -23,7 +23,7 @@ impl SsaoBlurPass {
             &shared.device,
             &bgl,
             &intermediates.ssao_view,
-            &gbuffer.position_depth_view,
+            &gbuffer.depth_view,
             &shared.nearest_sampler,
         );
 
@@ -44,7 +44,7 @@ impl SsaoBlurPass {
             &shared.device,
             &self.bgl,
             &intermediates.ssao_view,
-            &gbuffer.position_depth_view,
+            &gbuffer.depth_view,
             &shared.nearest_sampler,
         );
     }
@@ -83,13 +83,12 @@ impl SsaoBlurPass {
 
 fn create_ssao_blur_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let filterable = wgpu::TextureSampleType::Float { filterable: true };
-    let unfilterable = wgpu::TextureSampleType::Float { filterable: false };
 
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("ssao_blur_bgl"),
         entries: &[
-            tex_entry(0, filterable),     // t_ssao (R8Unorm, filterable)
-            tex_entry(1, unfilterable),   // t_position_depth (Rgba16Float, unfilterable)
+            tex_entry(0, filterable),     // t_ssao (Rgba16Float, filterable)
+            depth_tex_entry(1),           // t_depth (Depth32Float)
             sampler_entry(2, wgpu::SamplerBindingType::NonFiltering),
         ],
     })
@@ -99,7 +98,7 @@ fn create_ssao_blur_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     ssao_view: &wgpu::TextureView,
-    position_depth_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -112,7 +111,7 @@ fn create_ssao_blur_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(position_depth_view),
+                resource: wgpu::BindingResource::TextureView(depth_view),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -135,7 +134,7 @@ fn create_ssao_blur_pipeline(
         wgpu::include_wgsl!("../../assets/shaders/ssao_blur.wgsl"),
         &[bgl],
         &[Some(wgpu::ColorTargetState {
-            format: wgpu::TextureFormat::R8Unorm,
+            format: wgpu::TextureFormat::Rgba16Float,
             blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         })],

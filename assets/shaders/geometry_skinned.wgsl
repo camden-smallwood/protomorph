@@ -53,11 +53,10 @@ struct VertexInput {
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) world_position: vec3<f32>,
-    @location(1) tex_coords: vec2<f32>,
-    @location(2) tbn_col0: vec3<f32>,
-    @location(3) tbn_col1: vec3<f32>,
-    @location(4) tbn_col2: vec3<f32>,
+    @location(0) tex_coords: vec2<f32>,
+    @location(1) tbn_col0: vec3<f32>,
+    @location(2) tbn_col1: vec3<f32>,
+    @location(3) tbn_col2: vec3<f32>,
 };
 
 @vertex
@@ -89,7 +88,6 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
     let skinned_model = model_u.model * skin_matrix;
     let world_pos = skinned_model * vec4<f32>(in.position, 1.0);
-    out.world_position = world_pos.xyz;
     out.clip_position = camera.projection * camera.view * world_pos;
     out.tex_coords = in.tex_coords;
 
@@ -112,11 +110,20 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 // G-buffer outputs (identical to geometry.wgsl)
 struct GBufferOutput {
-    @location(0) position_depth: vec4<f32>,
-    @location(1) normal: vec4<f32>,
-    @location(2) albedo_specular: vec4<f32>,
-    @location(3) material_out: vec4<f32>,
+    @location(0) normal: vec2<f32>,           // Rg16Float: octahedral-encoded world normal
+    @location(1) albedo_specular: vec4<f32>,  // Rgba8UnormSrgb: rgb=albedo, a=specular (baked)
+    @location(2) material_out: vec4<f32>,     // Rgba8Unorm: r=ambient, g=emissive_luma, b=roughness, a=fresnel_f0
 };
+
+// Octahedral encoding: unit vec3 → vec2 in [-1,1]
+fn oct_encode(n: vec3<f32>) -> vec2<f32> {
+    let sum = abs(n.x) + abs(n.y) + abs(n.z);
+    var p = n.xy / sum;
+    if (n.z < 0.0) {
+        p = (1.0 - abs(p.yx)) * sign(p);
+    }
+    return p;
+}
 
 @fragment
 fn fs_main(in: VertexOutput) -> GBufferOutput {
@@ -132,29 +139,24 @@ fn fs_main(in: VertexOutput) -> GBufferOutput {
     // Reconstruct TBN matrix
     let tbn = mat3x3<f32>(in.tbn_col0, in.tbn_col1, in.tbn_col2);
 
-    // G-buffer 0: world position + clip depth
-    out.position_depth = vec4<f32>(in.world_position, in.clip_position.z);
-
-    // G-buffer 1: normal mapping + emissive luminance
+    // G-buffer 0: octahedral-encoded world normal
     let normal_sample = textureSample(t_normal, s_material, uv).rgb * 2.0 - 1.0;
     let scaled = normal_sample * vec3<f32>(1.0, 1.0, 1.0 / max(material.bump_scaling, 0.001));
-    let emissive_tex = textureSample(t_emissive, s_material, uv).rgb;
-    let emissive = emissive_tex * material.emissive_color * material.emissive_intensity;
-    let emissive_luma = dot(emissive, vec3<f32>(0.2126, 0.7152, 0.0722));
-    out.normal = vec4<f32>(normalize(tbn * scaled), emissive_luma);
+    let world_normal = normalize(tbn * scaled);
+    out.normal = oct_encode(world_normal);
 
-    // G-buffer 2: albedo + specular
+    // G-buffer 1: albedo + baked specular (spec_tex * spec_amount)
     let diffuse_tex = textureSample(t_diffuse, s_material, uv);
     let spec_tex = textureSample(t_specular, s_material, uv);
     out.albedo_specular = vec4<f32>(
         material.diffuse_color * diffuse_tex.rgb,
-        spec_tex.r
+        spec_tex.r * material.specular_amount
     );
 
-    // G-buffer 3: material properties
+    // G-buffer 2: material properties (g channel free — emissive handled by forward pass)
     out.material_out = vec4<f32>(
         material.ambient_amount,
-        material.specular_amount,
+        0.0,
         material.roughness,
         material.fresnel_f0
     );

@@ -2,7 +2,7 @@ use crate::{
     gpu_types::SsaoParams,
     renderer::{
         create_fullscreen_pipeline,
-        helpers::{sampler_entry, tex_entry, uniform_entry},
+        helpers::{depth_tex_entry, sampler_entry, tex_entry, uniform_entry},
         shared::{GBuffer, SharedResources},
     },
 };
@@ -173,7 +173,7 @@ fn create_ssao_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         label: Some("ssao_bgl"),
         entries: &[
             tex_entry(0, unfilterable),
-            tex_entry(1, unfilterable),
+            depth_tex_entry(1),
             tex_entry(2, wgpu::TextureSampleType::Float { filterable: true }),
             sampler_entry(3, wgpu::SamplerBindingType::NonFiltering),
             uniform_entry(4, size_of::<SsaoParams>() as u64, wgpu::ShaderStages::FRAGMENT, false),
@@ -191,7 +191,7 @@ fn create_ssao_bind_group(
         layout,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&gbuffer.normal_view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&gbuffer.position_depth_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&gbuffer.depth_view) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(noise_view) },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
             wgpu::BindGroupEntry { binding: 4, resource: params_buffer.as_entire_binding() },
@@ -208,7 +208,7 @@ fn create_ssao_pipeline(device: &wgpu::Device, ssao_bgl: &wgpu::BindGroupLayout)
         device,
         wgpu::include_wgsl!("../../assets/shaders/ssao.wgsl"),
         &[ssao_bgl],
-        &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+        &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL })],
         "ssao_pipeline",
     )
 }

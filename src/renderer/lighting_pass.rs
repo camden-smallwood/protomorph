@@ -1,5 +1,7 @@
 use crate::renderer::{
-    create_fullscreen_pipeline, helpers::{color_clear_attach, sampler_entry, tex_entry}, shared::{GBuffer, IntermediateTargets, SharedResources}
+    create_fullscreen_pipeline,
+    helpers::{color_clear_attach, depth_tex_entry, sampler_entry, tex_entry},
+    shared::{GBuffer, IntermediateTargets, SharedResources},
 };
 
 pub struct LightingPass {
@@ -97,7 +99,7 @@ fn create_lighting_gbuffer_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("lighting_gbuffer_bgl"),
         entries: &[
-            tex_entry(0, unfilterable),
+            depth_tex_entry(0),
             tex_entry(1, unfilterable),
             tex_entry(2, filterable),
             tex_entry(3, filterable),
@@ -120,7 +122,7 @@ fn create_lighting_gbuffer_bind_group(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&gbuffer.position_depth_view),
+                resource: wgpu::BindingResource::TextureView(&gbuffer.depth_view),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -162,7 +164,7 @@ fn create_lighting_pipeline(
         wgpu::include_wgsl!("../../assets/shaders/lighting.wgsl"),
         &[gbuffer_bgl, uniforms_bgl, shadow_bgl, env_probe_bgl],
         &[Some(wgpu::ColorTargetState {
-            format: wgpu::TextureFormat::Rgba16Float,
+            format: wgpu::TextureFormat::Rg11b10Ufloat,
             blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         })],

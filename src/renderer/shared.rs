@@ -15,7 +15,10 @@ use wgpu::util::DeviceExt;
 // ---------------------------------------------------------------------------
 
 pub struct GBuffer {
-    pub position_depth_view: wgpu::TextureView,
+    // NOTE: position_depth MRT was removed — world position is now reconstructed from
+    // the depth buffer + inverse_view_projection in shaders that need it. This frees
+    // one MRT slot (was Rgba16Float, now reconstructed from depth) that can
+    // be used for a velocity buffer or other data in the future.
     pub normal_view: wgpu::TextureView,
     pub albedo_specular_view: wgpu::TextureView,
     pub material_view: wgpu::TextureView,
@@ -39,15 +42,7 @@ pub struct FallbackTextures {
 }
 
 pub fn create_gbuffer(device: &wgpu::Device, w: u32, h: u32) -> GBuffer {
-    let position_depth = create_screen_texture(
-        device,
-        w,
-        h,
-        wgpu::TextureFormat::Rgba16Float,
-        "gb_position_depth",
-    );
-
-    let normal = create_screen_texture(device, w, h, wgpu::TextureFormat::Rgba16Float, "gb_normal");
+    let normal = create_screen_texture(device, w, h, wgpu::TextureFormat::Rg16Float, "gb_normal");
 
     let albedo_specular = create_screen_texture(
         device,
@@ -57,7 +52,7 @@ pub fn create_gbuffer(device: &wgpu::Device, w: u32, h: u32) -> GBuffer {
         "gb_albedo_spec",
     );
 
-    let material = create_screen_texture(device, w, h, wgpu::TextureFormat::Rgba8Unorm, "gb_material");
+    let material = create_screen_texture(device, w, h, wgpu::TextureFormat::Rgba16Float, "gb_material");
 
     let depth = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("gb_depth"),
@@ -70,14 +65,13 @@ pub fn create_gbuffer(device: &wgpu::Device, w: u32, h: u32) -> GBuffer {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
 
     let dv = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
 
     GBuffer {
-        position_depth_view: dv(&position_depth),
         normal_view: dv(&normal),
         albedo_specular_view: dv(&albedo_specular),
         material_view: dv(&material),
@@ -95,7 +89,7 @@ pub fn create_intermediates(
         device,
         (w / 2).max(1),
         (h / 2).max(1),
-        wgpu::TextureFormat::R8Unorm,
+        wgpu::TextureFormat::Rgba16Float,
         "ssao",
     );
 
@@ -103,7 +97,7 @@ pub fn create_intermediates(
         device,
         (w / 2).max(1),
         (h / 2).max(1),
-        wgpu::TextureFormat::R8Unorm,
+        wgpu::TextureFormat::Rgba16Float,
         "ssao_blur",
     );
 
@@ -111,7 +105,7 @@ pub fn create_intermediates(
         device,
         w,
         h,
-        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureFormat::Rg11b10Ufloat,
         "lighting_base",
     );
 
@@ -119,7 +113,7 @@ pub fn create_intermediates(
         device,
         (w / 2).max(1),
         (h / 2).max(1),
-        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureFormat::Rg11b10Ufloat,
         "god_rays",
     );
 
@@ -203,6 +197,7 @@ pub struct SharedResources {
     // Lighting
     pub lighting_buffer: wgpu::Buffer,
     pub atmosphere_buffer: wgpu::Buffer,
+    pub sky_params_buffer: wgpu::Buffer,
     pub lighting_uniforms_bgl: wgpu::BindGroupLayout,
     pub lighting_uniforms_bind_group: wgpu::BindGroup,
 
@@ -338,6 +333,13 @@ impl SharedResources {
             mapped_at_creation: false,
         });
 
+        let sky_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sky_params_buffer"),
+            size: size_of::<GpuSkyParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // --- Bind groups ---
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("camera_bg"),
@@ -383,6 +385,10 @@ impl SharedResources {
                     binding: 1,
                     resource: atmosphere_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: sky_params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -408,6 +414,7 @@ impl SharedResources {
             node_matrices_bind_group,
             lighting_buffer,
             atmosphere_buffer,
+            sky_params_buffer,
             lighting_uniforms_bgl,
             lighting_uniforms_bind_group,
             material_bgl,
@@ -499,6 +506,12 @@ pub fn create_lighting_uniforms_bgl(device: &wgpu::Device) -> wgpu::BindGroupLay
             uniform_entry(
                 1,
                 size_of::<GpuAtmosphereData>() as u64,
+                wgpu::ShaderStages::FRAGMENT,
+                false,
+            ),
+            uniform_entry(
+                2,
+                size_of::<GpuSkyParams>() as u64,
                 wgpu::ShaderStages::FRAGMENT,
                 false,
             ),

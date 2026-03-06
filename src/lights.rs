@@ -170,7 +170,7 @@ pub struct GpuLightingUniforms {
     pub camera_position: [f32; 3],
     pub light_count: u32,
     pub camera_direction: [f32; 3],
-    pub _pad: f32,
+    pub specular_occlusion_enable: f32,
     pub lights: [GpuLightData; MAX_LIGHTS],
 }
 
@@ -180,10 +180,12 @@ impl GpuLightingUniforms {
         camera_direction: Vec3,
         store: &LightStore,
         shadow_assignments: &[(usize, i32)],
+        specular_occlusion: bool,
     ) -> Self {
         let mut uniforms = Self::zeroed();
         uniforms.camera_position = camera_position.into();
         uniforms.camera_direction = camera_direction.into();
+        uniforms.specular_occlusion_enable = if specular_occlusion { 1.0 } else { 0.0 };
 
         let mut count = 0u32;
 

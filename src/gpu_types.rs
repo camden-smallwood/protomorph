@@ -80,12 +80,12 @@ pub struct CompositeParams {
     pub grain_intensity: f32,
 }
 
-pub const BLOOM_MIP_COUNT: usize = 5;
+pub const BLOOM_MIP_COUNT: usize = 4;
 
 pub const SHADOW_MAP_SIZE: u32 = 1024;
-pub const SPOT_SHADOW_MAP_SIZE: u32 = 2048;
-pub const MAX_POINT_SHADOW_CASTERS: usize = 2;
-pub const MAX_SPOT_SHADOW_CASTERS: usize = 2;
+pub const SPOT_SHADOW_MAP_SIZE: u32 = 1024;
+pub const MAX_POINT_SHADOW_CASTERS: usize = 4;
+pub const MAX_SPOT_SHADOW_CASTERS: usize = 4;
 pub const CSM_CASCADE_COUNT: usize = 3;
 pub const CSM_MAP_SIZE: u32 = 2048;
 pub const SHADOW_CAMERA_SLOTS: usize =
@@ -100,6 +100,9 @@ pub struct GpuShadowData {
     pub cascade_view_proj: [[[f32; 4]; 4]; CSM_CASCADE_COUNT],
     pub cascade_splits: [f32; 4],
     pub cascade_texel_sizes: [f32; 4], // world-space texel size per cascade, [3] = pad
+    pub num_point_casters: u32,
+    pub num_spot_casters: u32,
+    pub _shadow_pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -145,6 +148,7 @@ pub struct GpuSkyParams {
     pub camera_position: [f32; 3],
     pub _pad: f32,
 }
+
 
 pub const ENV_PROBE_SIZE: u32 = 128;
 pub const ENV_PROBE_MIP_COUNT: u32 = 6; // 128 -> 4

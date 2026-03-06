@@ -4,7 +4,6 @@ pub struct Camera {
     pub field_of_view: f32, // radians
     pub aspect_ratio: f32,
     pub near_clip: f32,
-    pub far_clip: f32,
     pub position: Vec3,
     pub velocity: Vec3,
     pub rotation: Vec2, // [0]=yaw, [1]=pitch, in degrees
@@ -21,7 +20,6 @@ impl Camera {
             field_of_view: 0.70,
             aspect_ratio: 1.0,
             near_clip: 0.01,
-            far_clip: 1000.0,
             position: Vec3::new(0.0, 0.0, 0.7),
             velocity: Vec3::ZERO,
             rotation: Vec2::ZERO,
@@ -65,9 +63,9 @@ impl Camera {
         let target = self.position + self.forward;
         self.view = Mat4::look_at_rh(self.position, target, self.up);
 
-        // projection = perspective_rh(fov, aspect, near, far)
+        // Reverse-Z infinite far plane: near=1.0, far=0.0 for maximum depth precision
         self.projection =
-            Mat4::perspective_rh(self.field_of_view, self.aspect_ratio, self.near_clip, self.far_clip);
+            Mat4::perspective_infinite_reverse_rh(self.field_of_view, self.aspect_ratio, self.near_clip);
     }
 
     pub fn rotate_towards_point(&mut self, point: Vec3, amount: f32) {

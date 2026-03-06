@@ -2,6 +2,39 @@ use bitflags::bitflags;
 use glam::{Mat4, Quat, Vec3};
 use crate::model::ModelData;
 
+/// Negate `from` if needed so that slerp takes the shortest arc.
+fn ensure_shortest_path(from: Quat, to: Quat) -> Quat {
+    if from.dot(to) < 0.0 { -from } else { from }
+}
+
+/// Binary-search for the keyframe pair bracketing `time`.
+/// Returns `(index, next_index, interpolation_factor)`.
+fn find_keyframe_pair(times: &[f32], time: f32) -> (usize, usize, f32) {
+    let len = times.len();
+    debug_assert!(len >= 2);
+
+    // partition_point returns the first index where t > time
+    let i = match times.partition_point(|&t| t <= time) {
+        0 => 0,
+        n => n - 1,
+    };
+
+    let next_i = if i + 1 < len { i + 1 } else { i };
+
+    let factor = if i == next_i {
+        0.0
+    } else {
+        let denom = times[next_i] - times[i];
+        if denom.abs() > f32::EPSILON {
+            (time - times[i]) / denom
+        } else {
+            0.0
+        }
+    };
+
+    (i, next_i, factor)
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -289,104 +322,41 @@ impl AnimationManager {
 
                 // Position keys
                 if channel.position_keys.len() == 1 {
-                    total_position = total_position + channel.position_keys[0].position;
+                    total_position = channel.position_keys[0].position;
                     animation_count += 1;
                 } else if !channel.position_keys.is_empty() {
-                    for i in 0..channel.position_keys.len() {
-                        let key = &channel.position_keys[i];
-
-                        let next_i = if i + 1 >= channel.position_keys.len() {
-                            0
-                        } else {
-                            i + 1
-                        };
-
-                        let next_key = &channel.position_keys[next_i];
-
-                        if state.time < key.time {
-                            let denom = next_key.time - key.time;
-
-                            let factor = if denom.abs() > f32::EPSILON {
-                                (state.time - key.time) / denom
-                            } else {
-                                0.0
-                            };
-
-                            let interpolated = key.position.lerp(next_key.position, factor);
-                            
-                            total_position = total_position + interpolated;
-                            animation_count += 1;
-                            break;
-                        }
-                    }
+                    let times: Vec<f32> = channel.position_keys.iter().map(|k| k.time).collect();
+                    let (i, next_i, factor) = find_keyframe_pair(&times, state.time);
+                    total_position = channel.position_keys[i].position
+                        .lerp(channel.position_keys[next_i].position, factor);
+                    animation_count += 1;
                 }
 
                 // Rotation keys
                 if channel.rotation_keys.len() == 1 {
-                    total_rotation = total_rotation * channel.rotation_keys[0].rotation;
+                    total_rotation = channel.rotation_keys[0].rotation;
                     animation_count += 1;
                 } else if !channel.rotation_keys.is_empty() {
-                    for i in 0..channel.rotation_keys.len() {
-                        let key = &channel.rotation_keys[i];
-
-                        let next_i = if i + 1 >= channel.rotation_keys.len() {
-                            0
-                        } else {
-                            i + 1
-                        };
-
-                        let next_key = &channel.rotation_keys[next_i];
-
-                        if state.time < key.time {
-                            let denom = next_key.time - key.time;
-
-                            let factor = if denom.abs() > f32::EPSILON {
-                                (state.time - key.time) / denom
-                            } else {
-                                0.0
-                            };
-
-                            let interpolated = key.rotation.slerp(next_key.rotation, factor);
-
-                            total_rotation = total_rotation * interpolated;
-                            animation_count += 1;
-                            break;
-                        }
-                    }
+                    let times: Vec<f32> = channel.rotation_keys.iter().map(|k| k.time).collect();
+                    let (i, next_i, factor) = find_keyframe_pair(&times, state.time);
+                    let from = ensure_shortest_path(
+                        channel.rotation_keys[i].rotation,
+                        channel.rotation_keys[next_i].rotation,
+                    );
+                    total_rotation = from.slerp(channel.rotation_keys[next_i].rotation, factor);
+                    animation_count += 1;
                 }
 
                 // Scaling keys
                 if channel.scaling_keys.len() == 1 {
-                    total_scale = total_scale * channel.scaling_keys[0].scaling;
+                    total_scale = channel.scaling_keys[0].scaling;
                     animation_count += 1;
                 } else if !channel.scaling_keys.is_empty() {
-                    for i in 0..channel.scaling_keys.len() {
-                        let key = &channel.scaling_keys[i];
-
-                        let next_i = if i + 1 >= channel.scaling_keys.len() {
-                            0
-                        } else {
-                            i + 1
-                        };
-
-                        let next_key = &channel.scaling_keys[next_i];
-
-                        if state.time < key.time {
-                            let denom = next_key.time - key.time;
-
-                            let factor = if denom.abs() > f32::EPSILON {
-                                (state.time - key.time) / denom
-                            } else {
-                                0.0
-                            };
-
-                            let interpolated = key.scaling.lerp(next_key.scaling, factor);
-
-                            total_scale = total_scale * interpolated;
-                            animation_count += 1;
-                            break;
-                        }
-                    }
+                    let times: Vec<f32> = channel.scaling_keys.iter().map(|k| k.time).collect();
+                    let (i, next_i, factor) = find_keyframe_pair(&times, state.time);
+                    total_scale = channel.scaling_keys[i].scaling
+                        .lerp(channel.scaling_keys[next_i].scaling, factor);
+                    animation_count += 1;
                 }
             }
 
@@ -413,37 +383,46 @@ impl AnimationManager {
         node_index: usize,
         parent_transform: Mat4,
     ) {
+        // Pass 1: compute total weight of active animations
+        let mut total_weight = 0.0f32;
+        for animation_index in 0..model.animations.len() {
+            if !self.active_animations[animation_index] { continue; }
+            let w = self.states[animation_index].weight;
+            if w > 0.0 { total_weight += w; }
+        }
+
+        // Pass 2: incremental weighted blend with normalized weights
         let mut animation_count = 0;
+        let mut accumulated_weight = 0.0f32;
         let mut total_position = Vec3::ZERO;
         let mut total_rotation = Quat::IDENTITY;
         let mut total_scale = Vec3::ONE;
 
-        for animation_index in 0..model.animations.len() {
-            if !self.active_animations[animation_index] {
-                continue;
+        if total_weight > f32::EPSILON {
+            for animation_index in 0..model.animations.len() {
+                if !self.active_animations[animation_index] { continue; }
+
+                let state = &self.states[animation_index];
+                if state.weight <= 0.0 { continue; }
+
+                let node_state = &state.node_states[node_index];
+                let normalized = state.weight / total_weight;
+
+                if animation_count == 0 {
+                    total_position = node_state.position;
+                    total_rotation = node_state.rotation;
+                    total_scale = node_state.scale;
+                } else {
+                    let t = normalized / (accumulated_weight + normalized);
+                    total_position = total_position.lerp(node_state.position, t);
+                    total_rotation = ensure_shortest_path(total_rotation, node_state.rotation)
+                        .slerp(node_state.rotation, t);
+                    total_scale = total_scale.lerp(node_state.scale, t);
+                }
+
+                accumulated_weight += normalized;
+                animation_count += 1;
             }
-
-            let state = &self.states[animation_index];
-
-            if state.weight <= 0.0 {
-                continue;
-            }
-
-            let node_state = &state.node_states[node_index];
-
-            if animation_count == 0 {
-                total_position = node_state.position;
-                total_rotation = node_state.rotation;
-                total_scale = node_state.scale;
-            } else {
-                let blend = 0.5 * state.weight;
-
-                total_position = node_state.position.lerp(total_position, blend);
-                total_rotation = node_state.rotation.slerp(total_rotation, blend);
-                total_scale = node_state.scale.lerp(total_scale, blend);
-            }
-
-            animation_count += 1;
         }
 
         let local_transform = if animation_count == 0 {

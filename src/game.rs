@@ -59,6 +59,7 @@ pub struct GameState {
     rotation_towards_grunt: f32,
     pub debug_cubemap: bool,
     pub debug_cubemap_colors: bool,
+    pub enable_specular_occlusion: bool,
 }
 
 impl GameState {
@@ -147,6 +148,7 @@ impl GameState {
             rotation_towards_grunt: 0.0,
             debug_cubemap: false,
             debug_cubemap_colors: false,
+            enable_specular_occlusion: true,
         };
 
         state.load_scene(renderer);
@@ -229,6 +231,10 @@ impl GameState {
 
     pub fn toggle_debug_cubemap_colors(&mut self) {
         self.debug_cubemap_colors = !self.debug_cubemap_colors;
+    }
+
+    pub fn toggle_specular_occlusion(&mut self) {
+        self.enable_specular_occlusion = !self.enable_specular_occlusion;
     }
 
     pub fn toggle_flashlight(&mut self) {

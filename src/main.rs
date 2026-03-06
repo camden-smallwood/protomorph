@@ -83,6 +83,7 @@ impl ApplicationHandler for App {
                         if let Some(game) = self.game.as_mut() {
                             match key {
                                 KeyCode::KeyH => game.toggle_flashlight(),
+                                KeyCode::KeyK => game.toggle_specular_occlusion(),
                                 KeyCode::KeyP => game.toggle_debug_cubemap(),
                                 KeyCode::KeyO => game.toggle_debug_cubemap_colors(),
                                 KeyCode::Digit1 => game.trigger_weapon_animation("first_person ready"),

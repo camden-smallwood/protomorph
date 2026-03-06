@@ -1,6 +1,6 @@
 // Deferred lighting pass — reads compact G-buffer, Cook-Torrance (Halo 3), up to 16 lights
 // Port of C's lighting.fs
-// G-buffer layout: position_depth, normal (w=emissive_luma), albedo_specular, material, ssao
+// G-buffer layout: depth, normal (oct Rg16Float), albedo_specular (a=baked spec), material (g=emissive_luma), ssao
 
 const LIGHT_TYPE_DIRECTIONAL: u32 = 0u;
 const LIGHT_TYPE_POINT: u32 = 1u;
@@ -12,7 +12,7 @@ const SHADOW_PCF_SPREAD: f32 = 3.0;
 const SHADOW_NORMAL_BIAS_SCALE: f32 = 3.0;
 
 // Group 0: G-buffer textures (5 textures + sampler)
-@group(0) @binding(0) var t_position_depth: texture_2d<f32>;
+@group(0) @binding(0) var t_depth: texture_depth_2d;
 @group(0) @binding(1) var t_normal: texture_2d<f32>;
 @group(0) @binding(2) var t_albedo_specular: texture_2d<f32>;
 @group(0) @binding(3) var t_material: texture_2d<f32>;
@@ -43,7 +43,7 @@ struct LightingUniforms {
     camera_position: vec3<f32>,
     light_count: u32,
     camera_direction: vec3<f32>,
-    _pad: f32,
+    specular_occlusion_enable: f32,
     lights: array<GpuLightData, 16>,
 };
 @group(1) @binding(0) var<uniform> lighting: LightingUniforms;
@@ -63,23 +63,32 @@ struct AtmosphereData {
 };
 @group(1) @binding(1) var<uniform> atmosphere: AtmosphereData;
 
-// Group 2: Shadow maps
-@group(2) @binding(0) var t_shadow_cube_0: texture_depth_cube;
-@group(2) @binding(1) var t_shadow_cube_1: texture_depth_cube;
-@group(2) @binding(2) var t_shadow_2d_0: texture_depth_2d;
-@group(2) @binding(3) var t_shadow_2d_1: texture_depth_2d;
-@group(2) @binding(4) var s_shadow_compare: sampler_comparison;
+// Sky params (for merged sky rendering on depth==0 pixels)
+struct SkyParams {
+    inverse_view_projection: mat4x4<f32>,
+    camera_position: vec3<f32>,
+    _pad: f32,
+};
+@group(1) @binding(2) var<uniform> sky: SkyParams;
+
+// Group 2: Shadow maps — array textures for scalable shadow caster counts
+@group(2) @binding(0) var t_shadow_cubes: texture_depth_cube_array;  // point light cubemaps
+@group(2) @binding(1) var t_shadow_spots: texture_depth_2d_array;    // spot light maps
+@group(2) @binding(2) var s_shadow_compare: sampler_comparison;
 
 struct ShadowData {
-    point_params: array<vec4<f32>, 2>,
-    spot_view_proj: array<mat4x4<f32>, 2>,
-    spot_params: array<vec4<f32>, 2>,
+    point_params: array<vec4<f32>, 4>,
+    spot_view_proj: array<mat4x4<f32>, 4>,
+    spot_params: array<vec4<f32>, 4>,
     cascade_view_proj: array<mat4x4<f32>, 3>,
     cascade_splits: vec4<f32>,
     cascade_texel_sizes: vec4<f32>,
+    num_point_casters: u32,
+    num_spot_casters: u32,
+    _pad: vec2<f32>,
 };
-@group(2) @binding(5) var<uniform> shadow_data: ShadowData;
-@group(2) @binding(6) var t_shadow_cascade: texture_depth_2d_array;
+@group(2) @binding(3) var<uniform> shadow_data: ShadowData;
+@group(2) @binding(4) var t_shadow_cascade: texture_depth_2d_array;
 
 // Group 3: Environment cubemap
 @group(3) @binding(0) var t_env_cubemap: texture_cube<f32>;
@@ -190,16 +199,12 @@ fn calculate_point_shadow(
     let rotation = random_angle(screen_pos);
 
     var shadow = 0.0;
-    for (var i = 0u; i < 8u; i++) {
+    for (var i = 0u; i < 4u; i++) {
         let p = rotate_offset(POISSON_DISK[i], rotation);
         let sample_d = d + (tangent * p.x + bitangent * p.y) * disk_radius;
-        if (shadow_idx == 0u) {
-            shadow += textureSampleCompareLevel(t_shadow_cube_0, s_shadow_compare, sample_d, reference);
-        } else {
-            shadow += textureSampleCompareLevel(t_shadow_cube_1, s_shadow_compare, sample_d, reference);
-        }
+        shadow += textureSampleCompareLevel(t_shadow_cubes, s_shadow_compare, sample_d, shadow_idx, reference);
     }
-    return shadow / 8.0;
+    return shadow / 4.0;
 }
 
 fn calculate_spot_shadow(
@@ -248,16 +253,12 @@ fn calculate_spot_shadow(
     let rotation = random_angle(screen_pos);
 
     var shadow = 0.0;
-    for (var i = 0u; i < 8u; i++) {
+    for (var i = 0u; i < 4u; i++) {
         let p = rotate_offset(POISSON_DISK[i], rotation);
         let offset_uv = uv + p * SHADOW_PCF_SPREAD * spot_texel_size;
-        if (shadow_idx == 0u) {
-            shadow += textureSampleCompareLevel(t_shadow_2d_0, s_shadow_compare, offset_uv, ref_z);
-        } else {
-            shadow += textureSampleCompareLevel(t_shadow_2d_1, s_shadow_compare, offset_uv, ref_z);
-        }
+        shadow += textureSampleCompareLevel(t_shadow_spots, s_shadow_compare, offset_uv, shadow_idx, ref_z);
     }
-    return shadow / 8.0;
+    return shadow / 4.0;
 }
 
 const CSM_MAP_SIZE_F: f32 = 2048.0;
@@ -288,7 +289,7 @@ fn sample_cascade_pcf(
     let texel_size = 1.0 / CSM_MAP_SIZE_F;
     let rotation = random_angle(screen_pos);
     var shadow = 0.0;
-    for (var i = 0u; i < 8u; i++) {
+    for (var i = 0u; i < 4u; i++) {
         let p = rotate_offset(POISSON_DISK[i], rotation);
         let offset_uv = uv + p * SHADOW_PCF_SPREAD * texel_size;
         shadow += textureSampleCompareLevel(
@@ -296,7 +297,7 @@ fn sample_cascade_pcf(
             offset_uv, cascade_idx, proj.z
         );
     }
-    return shadow / 8.0;
+    return shadow / 4.0;
 }
 
 fn calculate_directional_shadow(
@@ -348,16 +349,12 @@ fn ct_geometry(n_dot_h: f32, n_dot_v: f32, n_dot_l: f32, v_dot_h: f32) -> f32 {
     return 2.0 * n_dot_h * min(n_dot_v, n_dot_l) / (saturate(v_dot_h) + 0.00001);
 }
 
-// Exact Fresnel — cook_torrance.fx lines 273-278
-// Derives IOR from f0, computes full Fresnel (not Schlick)
-fn fresnel_exact(f0: vec3<f32>, v_dot_h: f32) -> vec3<f32> {
-    let sqrt_f0 = sqrt(clamp(f0, vec3(0.0), vec3(0.999)));
-    let n = (vec3(1.0) + sqrt_f0) / (vec3(1.0) - sqrt_f0);
-    let g = sqrt(max(n * n + vec3(v_dot_h * v_dot_h) - vec3(1.0), vec3(0.0)));
-    let gpc = g + vec3(v_dot_h);
-    let gmc = g - vec3(v_dot_h);
-    let r = (vec3(v_dot_h) * gpc - vec3(1.0)) / (vec3(v_dot_h) * gmc + vec3(1.0));
-    return clamp(0.5 * ((gmc * gmc) / (gpc * gpc + vec3(0.00001))) * (vec3(1.0) + r * r), vec3(0.0), vec3(1.0));
+// Schlick Fresnel approximation — replaces exact Fresnel for performance
+fn fresnel_schlick(f0: vec3<f32>, v_dot_h: f32) -> vec3<f32> {
+    let one_minus = 1.0 - v_dot_h;
+    let one_minus2 = one_minus * one_minus;
+    let one_minus5 = one_minus2 * one_minus2 * one_minus;
+    return f0 + (vec3(1.0) - f0) * one_minus5;
 }
 
 // Halo 3 lighting constants
@@ -384,22 +381,24 @@ const SH_Y20: f32 = 0.315392;   // √5/(4√π) * (1/2)
 const SH_Y21: f32 = 1.092548;   // √15/(2√π)
 const SH_Y22: f32 = 0.546274;   // √15/(4√π)
 
+// Pre-multiplied SH basis * transfer constants (avoids per-pixel multiply)
+const SH_L0: f32 = SH_Y00 * A0_TRANSFER;     // 0.282095 * π
+const SH_L1: f32 = SH_Y1X * A1_TRANSFER;     // 0.488603 * 2π/3
+const SH_L2_21: f32 = SH_Y21 * A2_TRANSFER;  // 1.092548 * π/4
+const SH_L2_20: f32 = SH_Y20 * A2_TRANSFER;  // 0.315392 * π/4
+const SH_L2_22: f32 = SH_Y22 * A2_TRANSFER;  // 0.546274 * π/4
+
 // Evaluate L2 SH irradiance at a given normal direction.
-// Applies diffuse cosine-lobe transfer (A_l) at evaluation time.
 fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
-    var result = vec3<f32>(0.0);
-    // L0
-    result += sh_data.coefficients[0].rgb * SH_Y00 * A0_TRANSFER;
-    // L1
-    result += sh_data.coefficients[1].rgb * SH_Y1X * n.y * A1_TRANSFER;
-    result += sh_data.coefficients[2].rgb * SH_Y1X * n.z * A1_TRANSFER;
-    result += sh_data.coefficients[3].rgb * SH_Y1X * n.x * A1_TRANSFER;
-    // L2
-    result += sh_data.coefficients[4].rgb * SH_Y21 * n.x * n.y * A2_TRANSFER;
-    result += sh_data.coefficients[5].rgb * SH_Y21 * n.y * n.z * A2_TRANSFER;
-    result += sh_data.coefficients[6].rgb * SH_Y20 * (3.0 * n.z * n.z - 1.0) * A2_TRANSFER;
-    result += sh_data.coefficients[7].rgb * SH_Y21 * n.x * n.z * A2_TRANSFER;
-    result += sh_data.coefficients[8].rgb * SH_Y22 * (n.x * n.x - n.y * n.y) * A2_TRANSFER;
+    var result = sh_data.coefficients[0].rgb * SH_L0;
+    result += (sh_data.coefficients[1].rgb * n.y
+             + sh_data.coefficients[2].rgb * n.z
+             + sh_data.coefficients[3].rgb * n.x) * SH_L1;
+    result += (sh_data.coefficients[4].rgb * (n.x * n.y)
+             + sh_data.coefficients[5].rgb * (n.y * n.z)
+             + sh_data.coefficients[7].rgb * (n.x * n.z)) * SH_L2_21;
+    result += sh_data.coefficients[6].rgb * (3.0 * n.z * n.z - 1.0) * SH_L2_20;
+    result += sh_data.coefficients[8].rgb * (n.x * n.x - n.y * n.y) * SH_L2_22;
 
     return max(result, vec3(0.0));
 }
@@ -421,60 +420,28 @@ fn evaluate_sh_area_specular(reflection_dir: vec3<f32>, roughness: f32) -> vec3<
     // L0: x0 = coefficients[0].rgb (per-basis, already RGB)
     let x0 = sh_data.coefficients[0].rgb;
 
-    // L1: Halo does dot(reflection_dir, per_channel_L1[ch].xyz)
-    // Our layout: [1]=(R,G,B) for Y1,-1(y), [2] for Y1,0(z), [3] for Y1,1(x)
-    // Per-channel linear: x1.r = r.y*coeff[1].r + r.z*coeff[2].r + r.x*coeff[3].r
-    let x1 = vec3<f32>(
-        reflection_dir.y * sh_data.coefficients[1].r + reflection_dir.z * sh_data.coefficients[2].r + reflection_dir.x * sh_data.coefficients[3].r,
-        reflection_dir.y * sh_data.coefficients[1].g + reflection_dir.z * sh_data.coefficients[2].g + reflection_dir.x * sh_data.coefficients[3].g,
-        reflection_dir.y * sh_data.coefficients[1].b + reflection_dir.z * sh_data.coefficients[2].b + reflection_dir.x * sh_data.coefficients[3].b,
-    );
+    // L1: vectorized — each coefficient is already (R,G,B), scale by direction component
+    let x1 = sh_data.coefficients[1].rgb * reflection_dir.y
+           + sh_data.coefficients[2].rgb * reflection_dir.z
+           + sh_data.coefficients[3].rgb * reflection_dir.x;
 
-    // L2 quadratic: cross-component products for Y2,-2, Y2,-1, Y2,1
-    let quadratic_a = reflection_dir.xyz * reflection_dir.yzx;
-    // Per-channel: x2.r = dot(quadratic_a, (coeff[4].r, coeff[5].r, coeff[7].r))
-    // Basis indices: [4]=Y2,-2(xy), [5]=Y2,-1(yz), [7]=Y2,1(xz)
-    let x2 = vec3<f32>(
-        quadratic_a.x * sh_data.coefficients[4].r + quadratic_a.y * sh_data.coefficients[5].r + quadratic_a.z * sh_data.coefficients[7].r,
-        quadratic_a.x * sh_data.coefficients[4].g + quadratic_a.y * sh_data.coefficients[5].g + quadratic_a.z * sh_data.coefficients[7].g,
-        quadratic_a.x * sh_data.coefficients[4].b + quadratic_a.y * sh_data.coefficients[5].b + quadratic_a.z * sh_data.coefficients[7].b,
-    );
+    // L2 quadratic: cross-component products — vectorized
+    let x2 = sh_data.coefficients[4].rgb * (reflection_dir.x * reflection_dir.y)
+           + sh_data.coefficients[5].rgb * (reflection_dir.y * reflection_dir.z)
+           + sh_data.coefficients[7].rgb * (reflection_dir.x * reflection_dir.z);
 
-    // Squared terms for Y2,0 and Y2,2
-    let quadratic_b = vec4<f32>(
-        reflection_dir.x * reflection_dir.x,
-        reflection_dir.y * reflection_dir.y,
-        reflection_dir.z * reflection_dir.z,
-        1.0 / 3.0,
-    );
-    // Basis indices: [8]=Y2,2(x²-y²), [6]=Y2,0(3z²-1)
-    // Halo packs these as (x², y², -z²*sqrt3, z²*sqrt3) — but in the new_phong_3 path
-    // it's simpler: just dot(quadratic_b, per_channel_constants[7..9])
-    // For our layout: x3.r = r.x²*coeff[8].r + r.y²*(-coeff[8].r) + stuff for coeff[6]
-    // Actually, Halo's pack_constants_texture_array maps:
-    //   constants[7] = (-sh[8].r, sh[8].r, -sh[6].r*sqrt3, sh[6].r*sqrt3)
-    //   etc. for g, b channels
-    // But calculate_area_specular_new_phong_3 uses a DIFFERENT layout than sh_glossy_ct.
-    // It directly dots quadratic_b=(x²,y²,z²,1/3) against constants[7..9].
-    // In Halo's pack_constants_texture_array:
-    //   constants[7].rgba = (-sh8.r, sh8.r, -sh6.r*√3, sh6.r*√3)
-    // So: dot(quadratic_b, constants[7]) = -sh8.r*x² + sh8.r*y² - sh6.r*√3*z² + sh6.r*√3/3
-    //   = sh8.r*(y²-x²) + sh6.r*√3*(1/3 - z²)
-    //   = -sh8.r*(x²-y²) - sh6.r*√3*(z² - 1/3)
-    // Our basis: coeff[8] stores Y22 = 0.546274*(x²-y²), coeff[6] stores Y20 = 0.315392*(3z²-1)
-    // The raw SH coefficient for Y22 basis is coeff[8]/Y22_norm, similarly for Y20.
-    // But since we store L*Y_lm, the coefficients already include the basis function.
-    // Let me just directly compute the L2 quadratic contribution using our basis:
-    let x3 = vec3<f32>(
-        sh_data.coefficients[6].r * (3.0 * reflection_dir.z * reflection_dir.z - 1.0)
-            + sh_data.coefficients[8].r * (reflection_dir.x * reflection_dir.x - reflection_dir.y * reflection_dir.y),
-        sh_data.coefficients[6].g * (3.0 * reflection_dir.z * reflection_dir.z - 1.0)
-            + sh_data.coefficients[8].g * (reflection_dir.x * reflection_dir.x - reflection_dir.y * reflection_dir.y),
-        sh_data.coefficients[6].b * (3.0 * reflection_dir.z * reflection_dir.z - 1.0)
-            + sh_data.coefficients[8].b * (reflection_dir.x * reflection_dir.x - reflection_dir.y * reflection_dir.y),
-    );
+    // Squared terms for Y2,0 and Y2,2 — hoist shared sub-expressions
+    let y20_term = 3.0 * reflection_dir.z * reflection_dir.z - 1.0;
+    let y22_term = reflection_dir.x * reflection_dir.x - reflection_dir.y * reflection_dir.y;
+    let x3 = sh_data.coefficients[6].rgb * y20_term + sh_data.coefficients[8].rgb * y22_term;
 
     return max(x0 * c_dc + x1 * c_linear + x2 * c_quadratic + x3 * c_quadratic, vec3(0.0));
+}
+
+// GTSO specular occlusion — cone-cone intersection between
+// specular lobe (reflection + roughness) and visibility cone (bent normal + AO)
+fn specular_occlusion(n_dot_v: f32, ao: f32, roughness: f32) -> f32 {
+    return saturate(pow(n_dot_v + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
 }
 
 // Environment cubemap sampling — environment_mapping.fx
@@ -488,8 +455,8 @@ fn sample_environment(
     let lod = roughness * env_probe.env_roughness_scale * (env_probe.env_mip_count - 1.0);
     let env_color = textureSampleLevel(t_env_cubemap, s_env_filtering, R, lod).rgb;
 
-    // Schlick approximation for environment fresnel
     let n_dot_v = max(dot(normal, view_dir), 0.0);
+
     let fresnel = fresnel_f0 + (1.0 - fresnel_f0) * pow(1.0 - n_dot_v, 5.0);
 
     return env_color * fresnel * env_probe.env_specular_contribution * env_probe.env_intensity;
@@ -553,24 +520,108 @@ fn compute_scattering(camera_pos: vec3<f32>, world_pos: vec3<f32>) -> array<vec3
     return array<vec3<f32>, 2>(extinction, inscatter);
 }
 
+// ---------------------------------------------------------------------------
+// Sky rendering (merged — replaces separate sky pass)
+// ---------------------------------------------------------------------------
+
+const SKY_PI: f32 = 3.14159265;
+const SUN_ANGULAR_RADIUS: f32 = 0.04;
+const SUN_EDGE_SOFTNESS: f32 = 0.001;
+const SUN_INTENSITY: f32 = 15.0;
+
+fn compute_sky(uv: vec2<f32>) -> vec4<f32> {
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, -(uv.y * 2.0 - 1.0), 1.0, 1.0);
+    let world_pos = sky.inverse_view_projection * ndc;
+    let ray_dir = normalize(world_pos.xyz / world_pos.w - sky.camera_position);
+
+    let sun_dir = normalize(atmosphere.sun_direction);
+
+    let h_cam = max(sky.camera_position.z - atmosphere.reference_height, 0.0);
+    let sin_elev = max(ray_dir.z, 0.02);
+    let air_mass = 1.0 / sin_elev;
+
+    let rayleigh_density_at_cam = exp(-h_cam / atmosphere.rayleigh_height_scale);
+    let mie_density_at_cam = exp(-h_cam / atmosphere.mie_height_scale);
+    let rayleigh_depth = rayleigh_density_at_cam * atmosphere.rayleigh_height_scale * air_mass;
+    let mie_depth = mie_density_at_cam * atmosphere.mie_height_scale * air_mass;
+
+    let extinction = exp(-(atmosphere.rayleigh_coefficients * rayleigh_depth
+                         + vec3(atmosphere.mie_coefficient) * mie_depth));
+
+    let cos_theta = dot(ray_dir, sun_dir);
+    let rayleigh_phase = 0.05968 * (1.0 + cos_theta * cos_theta);
+
+    let g = atmosphere.mie_g;
+    let g2 = g * g;
+    let mie_phase = 0.07958 * (1.0 - g2) / pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5);
+
+    let scatter = vec3(1.0) - extinction;
+    let sun_luminance = 20.0;
+    var sky_color = (atmosphere.rayleigh_coefficients * rayleigh_phase
+                   + vec3(atmosphere.mie_coefficient) * mie_phase)
+                   * scatter * atmosphere.inscatter_scale * sun_luminance;
+
+    let sun_cos_angle = dot(ray_dir, sun_dir);
+    let sun_edge = smoothstep(cos(SUN_ANGULAR_RADIUS + SUN_EDGE_SOFTNESS),
+                              cos(SUN_ANGULAR_RADIUS - SUN_EDGE_SOFTNESS),
+                              sun_cos_angle);
+    sky_color += vec3<f32>(SUN_INTENSITY) * sun_edge;
+
+    let horizon_fade = smoothstep(-0.05, 0.0, ray_dir.z);
+    sky_color *= horizon_fade;
+
+    return vec4<f32>(sky_color, 1.0);
+}
+
+// Reconstruct world position from depth buffer + inverse view-projection matrix
+fn reconstruct_world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, -(uv.y * 2.0 - 1.0), depth, 1.0);
+    let world_pos = sky.inverse_view_projection * ndc;
+    return world_pos.xyz / world_pos.w;
+}
+
+// Octahedral decoding: vec2 in [-1,1] → unit vec3
+fn oct_decode(p: vec2<f32>) -> vec3<f32> {
+    var n = vec3<f32>(p.x, p.y, 1.0 - abs(p.x) - abs(p.y));
+    if (n.z < 0.0) {
+        n = vec3<f32>((1.0 - abs(n.yx)) * sign(n.xy), n.z);
+    }
+    return normalize(n);
+}
+
+// ---------------------------------------------------------------------------
 // Single HDR output — bloom prefilter handles brightness extraction
+// ---------------------------------------------------------------------------
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.tex_coords;
 
-    let frag_position = textureSample(t_position_depth, s_nearest, uv).rgb;
-    let normal_sample = textureSample(t_normal, s_nearest, uv);
-    let frag_normal = normal_sample.rgb;
-    let emissive_luma = normal_sample.w;  // emissive luminance stored in normal.w (f16, HDR range)
+    // Sky pixel detection: reverse-Z clears depth to 0.0, geometry is > 0.0
+    let depth = textureSample(t_depth, s_nearest, uv);
+    if (depth <= 0.0) {
+        return compute_sky(uv);
+    }
+
+    let frag_position = reconstruct_world_pos(uv, depth);
+    let frag_normal = oct_decode(textureSample(t_normal, s_nearest, uv).rg);
     let albedo_specular = textureSample(t_albedo_specular, s_nearest, uv);
 
     let mat_sample = textureSample(t_material, s_nearest, uv);
     let material_ambient_amount = mat_sample.r;
-    let material_specular_amount = mat_sample.g;
-    let roughness = max(mat_sample.b, 0.05);  // Halo 3: max(roughness, 0.05)
+    // mat_sample.g is free (emissive handled by forward pass)
+    let material_roughness = max(mat_sample.b, 0.05);  // Halo 3: max(roughness, 0.05)
     let fresnel_f0 = mat_sample.a;
 
-    let ambient_occlusion = textureSample(t_ssao, s_nearest, uv).r;
+    // Geometric specular anti-aliasing: broaden roughness where the normal varies
+    // across the pixel, preventing specular flicker at distance / on detailed normal maps
+    let dn_dx = dpdx(frag_normal);
+    let dn_dy = dpdy(frag_normal);
+    let normal_variance = dot(dn_dx, dn_dx) + dot(dn_dy, dn_dy);
+    let roughness = sqrt(material_roughness * material_roughness + normal_variance);
+
+    let ssao_sample = textureSample(t_ssao, s_nearest, uv);
+    let bent_normal = normalize(ssao_sample.xyz);
+    let ambient_occlusion = ssao_sample.w;
 
     // Standard per-fragment view direction (correct for all light types)
     let view_direction = normalize(lighting.camera_position - frag_position);
@@ -582,10 +633,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let light = lighting.lights[i];
 
         var light_direction: vec3<f32>;
+        var light_vec = light.position - frag_position;
+        var light_distance = length(light_vec);
         if (light.light_type == LIGHT_TYPE_DIRECTIONAL) {
             light_direction = normalize(-light.direction);
         } else {
-            light_direction = normalize(light.position - frag_position);
+            light_direction = light_vec / max(light_distance, 0.00001);
         }
 
         let halfway_direction = normalize(light_direction + view_direction);
@@ -607,7 +660,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
             let D = beckmann_ndf(n_dot_h, roughness);
             let G = ct_geometry(n_dot_h, n_dot_v, n_dot_l, v_dot_h);
-            let F = fresnel_exact(vec3(fresnel_f0), v_dot_h);
+            let F = fresnel_schlick(vec3(fresnel_f0), v_dot_h);
 
             // Standard Cook-Torrance denominator: 4 * NdotV (post NdotL cancellation)
             let ct = D * saturate(G) / (4.0 * n_dot_v + 0.00001) * F;
@@ -618,12 +671,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // Albedo blend: interpolate specular tint between white and surface albedo
             let spec_tint = mix(vec3(1.0), albedo_specular.rgb, ALBEDO_BLEND);
 
-            specular_color = ANALYTICAL_SPECULAR_CONTRIBUTION * material_specular_amount * albedo_specular.a * (clamped * spec_tint) * light.specular_color;
+            specular_color = ANALYTICAL_SPECULAR_CONTRIBUTION * albedo_specular.a * (clamped * spec_tint) * light.specular_color;
         }
 
         // Attenuation for non-directional lights
         if (light.light_type != LIGHT_TYPE_DIRECTIONAL) {
-            let light_distance = length(light.position - frag_position);
             var light_attenuation = 1.0 / (light.constant_atten + light.linear_atten * light_distance + light.quadratic_atten * (light_distance * light_distance));
 
             // Spot light cone falloff
@@ -660,19 +712,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         light_color += ambient_color + diffuse_color + specular_color;
     }
 
+    // Specular occlusion (GTSO) — toggleable via K key
+    let n_dot_v_so = max(dot(frag_normal, view_direction), 0.0);
+    var spec_occ = 1.0;
+    if (lighting.specular_occlusion_enable > 0.5) {
+        spec_occ = specular_occlusion(n_dot_v_so, ambient_occlusion, roughness);
+    }
+
     // Environment cubemap specular
     if (env_probe.env_specular_contribution > 0.0) {
         let envmap = sample_environment(frag_normal, view_direction, roughness, fresnel_f0);
-        light_color += envmap * material_specular_amount * albedo_specular.a;
+        light_color += envmap * albedo_specular.a * spec_occ;
     }
 
     // Area specular — SH-convolved BRDF (the other half of frequency-decomposed specular)
-    if (env_probe.env_intensity > 0.0) {
+    if (env_probe.env_intensity > 0.0 && albedo_specular.a > 0.01) {
         let reflection = reflect(-view_direction, frag_normal);
         let area_spec = evaluate_sh_area_specular(reflection, roughness);
         let spec_tint = mix(vec3(1.0), albedo_specular.rgb, ALBEDO_BLEND);
-        light_color += area_spec * AREA_SPECULAR_CONTRIBUTION * material_specular_amount
-                     * albedo_specular.a * spec_tint;
+        light_color += area_spec * AREA_SPECULAR_CONTRIBUTION
+                     * albedo_specular.a * spec_tint * spec_occ;
     }
 
     // Diffuse indirect — plain SH irradiance (L2)
@@ -687,18 +746,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let n_dot_v_rim = max(dot(frag_normal, view_direction), 0.0);
     let rim_factor = pow(1.0 - n_dot_v_rim, RIM_FRESNEL_POWER);
     let rim_color = mix(RIM_FRESNEL_COLOR, albedo_specular.rgb, RIM_FRESNEL_ALBEDO_BLEND);
-    let rim_fresnel = RIM_FRESNEL_COEFFICIENT * material_specular_amount * albedo_specular.a * rim_color * rim_factor;
+    let rim_fresnel = RIM_FRESNEL_COEFFICIENT * albedo_specular.a * rim_color * rim_factor;
     light_color += rim_fresnel * sh_irradiance;
 
-    // Emissive: luminance from normal.w, tinted by albedo color (added once)
-    // HDR boost so emissive exceeds bloom threshold and produces visible glow
-    let emissive_color = albedo_specular.rgb * emissive_luma * 5.0;
-    light_color += emissive_color;
+    // Emissive is handled by forward emissive pass (additive blend after deferred lighting)
 
     // Atmospheric scattering — atmosphere.fx + entry_points.fx
     if (atmosphere.atmosphere_enable > 0.5) {
-        let scattering = compute_scattering(lighting.camera_position, frag_position);
-        light_color = light_color * scattering[0] + scattering[1];
+        let dist_to_frag = length(frag_position - lighting.camera_position);
+        let atmo_fade = smoothstep(2.0, 10.0, dist_to_frag);
+        if (atmo_fade > 0.001) {
+            let scattering = compute_scattering(lighting.camera_position, frag_position);
+            light_color = mix(light_color, light_color * scattering[0] + scattering[1], atmo_fade);
+        }
     }
 
     return vec4<f32>(light_color, 1.0);

@@ -1,4 +1,4 @@
-// God rays composite — additive blend half-res god rays onto lighting buffer
+// God rays composite — additively blends god rays onto the lighting buffer
 // Pipeline uses additive blend state (src: One, dst: One)
 
 @group(0) @binding(0) var t_god_rays: texture_2d<f32>;
@@ -24,6 +24,6 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let color = textureSample(t_god_rays, s_filtering, in.tex_coords).rgb;
-    return vec4(color, 1.0);
+    let god_rays = textureSample(t_god_rays, s_filtering, in.tex_coords).rgb;
+    return vec4(god_rays, 0.0);
 }

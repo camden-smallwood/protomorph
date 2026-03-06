@@ -1,5 +1,5 @@
 // God rays — radial blur from sun screen position
-// Reads position_depth (sky = depth 0), outputs light shaft intensity
+// Reads depth buffer (sky = depth 1.0), outputs light shaft intensity
 
 struct GodRayParams {
     sun_screen_pos: vec2<f32>,
@@ -13,7 +13,7 @@ struct GodRayParams {
     _pad: f32,
 };
 
-@group(0) @binding(0) var t_position_depth: texture_2d<f32>;
+@group(0) @binding(0) var t_depth: texture_depth_2d;
 @group(0) @binding(1) var s_nearest: sampler;
 @group(0) @binding(2) var<uniform> params: GodRayParams;
 
@@ -62,17 +62,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Clamp to [0,1] to avoid wrapping artifacts
         let clamped_uv = clamp(uv, vec2(0.001), vec2(0.999));
 
-        // Sample position_depth — sky pixels have depth ~0 (G-buffer clears to zeros)
-        let sample_val = textureSample(t_position_depth, s_nearest, clamped_uv);
-        let depth = length(sample_val.rgb); // sky = (0,0,0), geometry = world position
+        // Sample depth buffer — sky pixels have depth==0.0 (reverse-Z clears to 0.0)
+        let sample_depth = textureSample(t_depth, s_nearest, clamped_uv);
 
-        // Sky contributes light, geometry occludes
-        var sky_mask = 0.0;
-        if (depth < 0.001) {
-            sky_mask = 1.0;
-        }
-
-        color += sky_mask * params.weight * illumination_decay;
+        // Sky (depth<=0.0) contributes light, geometry occludes — branchless
+        color += step(sample_depth, 0.001) * params.weight * illumination_decay;
         illumination_decay *= params.decay;
     }
 
