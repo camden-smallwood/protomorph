@@ -1,16 +1,58 @@
 use crate::{
-    gpu_types::{
-        CameraUniforms, GpuAtmosphereData, GpuEnvProbeData, GpuSHCoefficients, GpuSkyParams,
-        QuadVertex, ENV_PROBE_MIP_COUNT, ENV_PROBE_SIZE,
-    },
-    model::{VertexRigid, VertexSkinned, VertexType},
+    camera::CameraUniforms,
+    models::{VertexRigid, VertexSkinned, VertexType},
     renderer::{
         GpuModel, create_fullscreen_pipeline,
         helpers::uniform_entry,
-        shared::SharedResources,
+        shared::{QuadVertex, SharedResources},
     },
 };
+use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
+
+pub const ENV_PROBE_SIZE: u32 = 128;
+pub const ENV_PROBE_MIP_COUNT: u32 = 6; // 128 -> 4
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct GpuEnvProbeData {
+    pub probe_position: [f32; 3],
+    pub env_roughness_scale: f32,
+    pub env_specular_contribution: f32,
+    pub env_mip_count: f32,
+    pub env_intensity: f32,
+    pub env_diffuse_intensity: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct GpuAtmosphereData {
+    pub sun_direction: [f32; 3],
+    pub atmosphere_enable: f32,
+    pub rayleigh_coefficients: [f32; 3],
+    pub rayleigh_height_scale: f32,
+    pub mie_coefficient: f32,
+    pub mie_height_scale: f32,
+    pub mie_g: f32,
+    pub max_fog_thickness: f32,
+    pub inscatter_scale: f32,
+    pub reference_height: f32,
+    pub _pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct GpuSHCoefficients {
+    pub coefficients: [[f32; 4]; 9], // 9 L2 basis functions, each (R, G, B, pad)
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct GpuSkyParams {
+    pub inverse_view_projection: [[f32; 4]; 4],
+    pub camera_position: [f32; 3],
+    pub _pad: f32,
+}
 
 // Each face renders its matching world direction — no swizzle needed at sample time.
 const FACE_DIRECTIONS: [(Vec3, Vec3); 6] = [

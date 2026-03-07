@@ -1,19 +1,37 @@
 use crate::{
-    gpu_types::{
-        CameraUniforms, GpuShadowData, CSM_CASCADE_COUNT, CSM_MAP_SIZE,
-        MAX_POINT_SHADOW_CASTERS, MAX_SPOT_SHADOW_CASTERS,
-        SHADOW_CAMERA_SLOTS, SHADOW_MAP_SIZE, SPOT_SHADOW_MAP_SIZE,
-    },
+    camera::CameraUniforms,
     lights::LightType,
-    model::{VertexRigid, VertexSkinned, VertexType},
+    models::{VertexRigid, VertexSkinned, VertexType},
     renderer::{
         GpuModel,
         helpers::{sampler_entry, uniform_entry},
         shared::SharedResources,
     },
 };
-use bytemuck::Zeroable;
+use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
+
+pub const SHADOW_MAP_SIZE: u32 = 1024;
+pub const SPOT_SHADOW_MAP_SIZE: u32 = 1024;
+pub const MAX_POINT_SHADOW_CASTERS: usize = 4;
+pub const MAX_SPOT_SHADOW_CASTERS: usize = 4;
+pub const CSM_CASCADE_COUNT: usize = 3;
+pub const CSM_MAP_SIZE: u32 = 2048;
+pub const SHADOW_CAMERA_SLOTS: usize = MAX_POINT_SHADOW_CASTERS * 6 + MAX_SPOT_SHADOW_CASTERS + CSM_CASCADE_COUNT;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct GpuShadowData {
+    pub point_params: [[f32; 4]; MAX_POINT_SHADOW_CASTERS],
+    pub spot_view_proj: [[[f32; 4]; 4]; MAX_SPOT_SHADOW_CASTERS],
+    pub spot_params: [[f32; 4]; MAX_SPOT_SHADOW_CASTERS],
+    pub cascade_view_proj: [[[f32; 4]; 4]; CSM_CASCADE_COUNT],
+    pub cascade_splits: [f32; 4],
+    pub cascade_texel_sizes: [f32; 4], // world-space texel size per cascade, [3] = pad
+    pub num_point_casters: u32,
+    pub num_spot_casters: u32,
+    pub _shadow_pad: [f32; 2],
+}
 
 #[allow(dead_code)]
 pub struct ShadowPass {

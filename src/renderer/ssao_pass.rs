@@ -1,14 +1,26 @@
 use crate::{
-    gpu_types::SsaoParams,
     renderer::{
         create_fullscreen_pipeline,
         helpers::{depth_tex_entry, sampler_entry, tex_entry, uniform_entry},
         shared::{GBuffer, SharedResources},
     },
 };
+use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use rand::Rng;
 use wgpu::util::DeviceExt;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct SsaoParams {
+    pub kernel_samples: [[f32; 4]; 32],
+    pub strength: f32,
+    pub falloff: f32,
+    pub radius: f32,
+    pub noise_scale_x: f32,
+    pub noise_scale_y: f32,
+    pub _pad: [f32; 3],
+}
 
 pub struct SsaoPass {
     pipeline: wgpu::RenderPipeline,

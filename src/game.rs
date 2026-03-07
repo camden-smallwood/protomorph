@@ -1,11 +1,10 @@
 use crate::{
     animation::AnimationManager,
     camera::Camera,
-    gpu_types::GpuAtmosphereData,
     lights::{LightData, LightIndex, LightStore},
-    model::ModelData,
+    models::ModelData,
     objects::{ObjectIndex, ObjectStore},
-    renderer::Renderer
+    renderer::{Renderer, env_probe_pass::GpuAtmosphereData},
 };
 use glam::Vec3;
 use std::collections::HashSet;

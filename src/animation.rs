@@ -1,6 +1,6 @@
 use bitflags::bitflags;
 use glam::{Mat4, Quat, Vec3};
-use crate::model::ModelData;
+use crate::models::ModelData;
 
 /// Negate `from` if needed so that slerp takes the shortest arc.
 fn ensure_shortest_path(from: Quat, to: Quat) -> Quat {

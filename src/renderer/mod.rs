@@ -1,6 +1,6 @@
 mod bloom_pass;
 mod cubemap_debug_pass;
-mod env_probe_pass;
+pub mod env_probe_pass;
 mod fxaa_pass;
 mod geometry_pass;
 mod god_rays_pass;
@@ -14,13 +14,17 @@ mod text_pass;
 
 use crate::{
     animation::MAXIMUM_NUMBER_OF_MODEL_NODES,
+    camera::CameraUniforms,
     dds::{create_dds_texture, load_dds_from_file},
     game::GameState,
-    gpu_types::*,
     lights::GpuLightingUniforms,
     materials::{GpuMaterialProps, MaterialTextureUsage},
-    model::{ModelData, VertexType},
+    models::{ModelData, ModelUniforms, VertexType},
     objects::ObjectIndex,
+    renderer::{
+        env_probe_pass::GpuSkyParams,
+        shadow_pass::{MAX_POINT_SHADOW_CASTERS, MAX_SPOT_SHADOW_CASTERS},
+    },
 };
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -35,7 +39,7 @@ use shared::*;
 pub(crate) struct GpuMesh {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
-    pub parts: Vec<crate::model::ModelMeshPart>,
+    pub parts: Vec<crate::models::ModelMeshPart>,
     pub vertex_type: VertexType,
 }
 

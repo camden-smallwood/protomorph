@@ -1,4 +1,4 @@
-use crate::{animation::AnimationManager, model::ModelData};
+use crate::{animation::AnimationManager, models::ModelData};
 use glam::{EulerRot, Mat4, Vec3};
 
 // ---------------------------------------------------------------------------

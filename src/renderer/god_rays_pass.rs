@@ -1,12 +1,26 @@
 use crate::{
-    gpu_types::GpuGodRayParams,
     renderer::{
         create_fullscreen_pipeline,
         helpers::{color_clear_attach, depth_tex_entry, sampler_entry, tex_entry, uniform_entry},
         shared::{IntermediateTargets, SharedResources},
     },
 };
+use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct GpuGodRayParams {
+    pub sun_screen_pos: [f32; 2],
+    pub density: f32,
+    pub weight: f32,
+    pub decay: f32,
+    pub exposure: f32,
+    pub num_samples: f32,
+    pub sun_visible: f32,
+    pub sun_color: [f32; 3],
+    pub _pad: f32,
+}
 
 pub struct GodRaysPass {
     // Radial blur pass

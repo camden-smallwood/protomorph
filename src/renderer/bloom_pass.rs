@@ -1,13 +1,35 @@
-use crate::{
-    gpu_types::{
-        BLOOM_MIP_COUNT, BloomDownsampleParams, CompositeParams, QuadVertex, UpsampleParams,
-    },
-    renderer::{
-        helpers::{color_clear_attach, sampler_entry, tex_entry, uniform_entry},
-        shared::{IntermediateTargets, SharedResources},
-    },
+use crate::renderer::{
+    helpers::{color_clear_attach, sampler_entry, tex_entry, uniform_entry},
+    shared::{IntermediateTargets, QuadVertex, SharedResources},
 };
+use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
+
+pub const BLOOM_MIP_COUNT: usize = 4;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct BloomDownsampleParams {
+    pub threshold: f32,
+    pub knee: f32,
+    pub texel_size: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct BloomUpsampleParams {
+    pub filter_radius: f32,
+    pub _pad: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct BloomCompositeParams {
+    pub bloom_strength: f32,
+    pub exposure: f32,
+    pub saturation: f32,
+    pub grain_intensity: f32,
+}
 
 pub struct BloomPass {
     prefilter_pipeline: wgpu::RenderPipeline,
@@ -65,7 +87,7 @@ impl BloomPass {
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("upsample_params"),
-                    contents: bytemuck::bytes_of(&UpsampleParams {
+                    contents: bytemuck::bytes_of(&BloomUpsampleParams {
                         filter_radius: 0.008,
                         _pad: [0.0; 3],
                     }),
@@ -77,7 +99,7 @@ impl BloomPass {
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("composite_params"),
-                    contents: bytemuck::bytes_of(&CompositeParams {
+                    contents: bytemuck::bytes_of(&BloomCompositeParams {
                         bloom_strength: 0.15,
                         exposure: 2.0,
                         saturation: 0.85,
@@ -327,7 +349,7 @@ fn create_bloom_upsample_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             sampler_entry(1, wgpu::SamplerBindingType::Filtering),
             uniform_entry(
                 2,
-                size_of::<UpsampleParams>() as u64,
+                size_of::<BloomUpsampleParams>() as u64,
                 wgpu::ShaderStages::FRAGMENT,
                 false,
             ),
@@ -348,7 +370,7 @@ fn create_bloom_composite_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             sampler_entry(2, wgpu::SamplerBindingType::Filtering),
             uniform_entry(
                 3,
-                size_of::<CompositeParams>() as u64,
+                size_of::<BloomCompositeParams>() as u64,
                 wgpu::ShaderStages::FRAGMENT,
                 false,
             ),

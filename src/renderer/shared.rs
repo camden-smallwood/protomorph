@@ -1,14 +1,53 @@
 use crate::{
     animation::MAXIMUM_NUMBER_OF_MODEL_NODES,
+    camera::CameraUniforms,
     dds::create_fallback_texture,
-    gpu_types::*,
     lights::GpuLightingUniforms,
     materials::GpuMaterialProps,
-    renderer::{MAX_OBJECTS, helpers::{
-        create_1x1_texture, create_screen_texture, sampler_entry, tex_entry, uniform_entry,
-    }},
+    models::ModelUniforms,
+    renderer::{
+        MAX_OBJECTS, bloom_pass::BLOOM_MIP_COUNT, env_probe_pass::{GpuAtmosphereData, GpuSkyParams}, helpers::{
+            create_1x1_texture, create_screen_texture, sampler_entry, tex_entry, uniform_entry,
+        }
+    },
 };
+use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
+
+// ---------------------------------------------------------------------------
+// Fullscreen Quad
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct QuadVertex {
+    pub position: [f32; 2],
+    pub texcoord: [f32; 2],
+}
+
+impl QuadVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
+        0 => Float32x2,
+        1 => Float32x2,
+    ];
+
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<QuadVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
+pub const QUAD_VERTICES: [QuadVertex; 6] = [
+    QuadVertex { position: [-1.0,  1.0], texcoord: [0.0, 0.0] },
+    QuadVertex { position: [-1.0, -1.0], texcoord: [0.0, 1.0] },
+    QuadVertex { position: [ 1.0, -1.0], texcoord: [1.0, 1.0] },
+    QuadVertex { position: [-1.0,  1.0], texcoord: [0.0, 0.0] },
+    QuadVertex { position: [ 1.0, -1.0], texcoord: [1.0, 1.0] },
+    QuadVertex { position: [ 1.0,  1.0], texcoord: [1.0, 0.0] },
+];
 
 // ---------------------------------------------------------------------------
 // G-Buffer + intermediate render targets

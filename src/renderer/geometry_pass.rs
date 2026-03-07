@@ -1,5 +1,5 @@
 use crate::{
-    model::{VertexRigid, VertexSkinned, VertexType},
+    models::{VertexRigid, VertexSkinned, VertexType},
     renderer::{
         GpuModel, helpers::color_clear_attach, shared::{GBuffer, SharedResources}
     },

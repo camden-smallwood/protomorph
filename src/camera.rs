@@ -1,4 +1,12 @@
+use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct CameraUniforms {
+    pub view: [[f32; 4]; 4],
+    pub projection: [[f32; 4]; 4],
+}
 
 pub struct Camera {
     pub field_of_view: f32, // radians

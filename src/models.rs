@@ -10,6 +10,12 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use std::{collections::HashMap, path::Path};
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct ModelUniforms {
+    pub model: [[f32; 4]; 4],
+}
+
 // ---------------------------------------------------------------------------
 // Vertex types
 // ---------------------------------------------------------------------------

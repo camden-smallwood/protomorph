@@ -11,10 +11,9 @@ mod animation;
 mod camera;
 mod dds;
 mod game;
-mod gpu_types;
 mod lights;
 mod materials;
-mod model;
+mod models;
 mod objects;
 mod renderer;
 
