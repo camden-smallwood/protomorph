@@ -1,9 +1,7 @@
-use crate::{
-    renderer::{
-        create_fullscreen_pipeline,
-        helpers::{color_clear_attach, depth_tex_entry, sampler_entry, tex_entry, uniform_entry},
-        shared::{IntermediateTargets, SharedResources},
-    },
+use crate::renderer::{
+    color_clear_attach, create_fullscreen_pipeline, depth_tex_entry, sampler_entry,
+    shared::{IntermediateTargets, SharedResources},
+    tex_entry, uniform_entry,
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};

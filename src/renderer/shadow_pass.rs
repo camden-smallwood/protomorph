@@ -2,11 +2,7 @@ use crate::{
     camera::CameraUniforms,
     lights::LightType,
     models::{VertexRigid, VertexSkinned, VertexType},
-    renderer::{
-        GpuModel,
-        helpers::{sampler_entry, uniform_entry},
-        shared::SharedResources,
-    },
+    renderer::{GpuModel, sampler_entry, shared::SharedResources, uniform_entry},
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};

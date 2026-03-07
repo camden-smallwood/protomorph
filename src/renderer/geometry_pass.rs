@@ -1,7 +1,8 @@
 use crate::{
     models::{VertexRigid, VertexSkinned, VertexType},
     renderer::{
-        GpuModel, helpers::color_clear_attach, shared::{GBuffer, SharedResources}
+        GpuModel, color_clear_attach,
+        shared::{GBuffer, SharedResources},
     },
 };
 

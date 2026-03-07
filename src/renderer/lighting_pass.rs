@@ -1,7 +1,7 @@
 use crate::renderer::{
-    create_fullscreen_pipeline,
-    helpers::{color_clear_attach, depth_tex_entry, sampler_entry, tex_entry},
+    color_clear_attach, create_fullscreen_pipeline, depth_tex_entry, sampler_entry,
     shared::{GBuffer, IntermediateTargets, SharedResources},
+    tex_entry,
 };
 
 pub struct LightingPass {

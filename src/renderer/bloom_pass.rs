@@ -1,6 +1,7 @@
 use crate::renderer::{
-    helpers::{color_clear_attach, sampler_entry, tex_entry, uniform_entry},
+    color_clear_attach, sampler_entry,
     shared::{IntermediateTargets, QuadVertex, SharedResources},
+    tex_entry, uniform_entry,
 };
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;

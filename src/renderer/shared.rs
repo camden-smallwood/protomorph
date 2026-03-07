@@ -6,9 +6,11 @@ use crate::{
     materials::GpuMaterialProps,
     models::ModelUniforms,
     renderer::{
-        MAX_OBJECTS, bloom_pass::BLOOM_MIP_COUNT, env_probe_pass::{GpuAtmosphereData, GpuSkyParams}, helpers::{
-            create_1x1_texture, create_screen_texture, sampler_entry, tex_entry, uniform_entry,
-        }
+        MAX_OBJECTS,
+        bloom_pass::BLOOM_MIP_COUNT,
+        create_1x1_texture, create_screen_texture,
+        env_probe_pass::{GpuAtmosphereData, GpuSkyParams},
+        sampler_entry, tex_entry, uniform_entry,
     },
 };
 use bytemuck::{Pod, Zeroable};

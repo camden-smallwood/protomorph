@@ -1,7 +1,7 @@
 use crate::renderer::{
-    create_fullscreen_pipeline,
-    helpers::{sampler_entry, tex_entry},
+    create_fullscreen_pipeline, sampler_entry,
     shared::{IntermediateTargets, SharedResources},
+    tex_entry,
 };
 
 pub struct FxaaPass {

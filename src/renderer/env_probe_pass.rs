@@ -3,8 +3,8 @@ use crate::{
     models::{VertexRigid, VertexSkinned, VertexType},
     renderer::{
         GpuModel, create_fullscreen_pipeline,
-        helpers::uniform_entry,
         shared::{QuadVertex, SharedResources},
+        uniform_entry,
     },
 };
 use bytemuck::{Pod, Zeroable};

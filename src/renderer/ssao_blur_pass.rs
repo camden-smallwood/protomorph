@@ -1,7 +1,7 @@
 use crate::renderer::{
-    create_fullscreen_pipeline,
-    helpers::{depth_tex_entry, sampler_entry, tex_entry},
+    create_fullscreen_pipeline, depth_tex_entry, sampler_entry,
     shared::{GBuffer, IntermediateTargets, SharedResources},
+    tex_entry,
 };
 
 pub struct SsaoBlurPass {

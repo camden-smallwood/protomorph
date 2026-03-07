@@ -1,7 +1,5 @@
 use crate::renderer::{
-    create_fullscreen_pipeline,
-    helpers::{sampler_entry, tex_entry, uniform_entry},
-    shared::SharedResources,
+    create_fullscreen_pipeline, sampler_entry, shared::SharedResources, tex_entry, uniform_entry,
 };
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;

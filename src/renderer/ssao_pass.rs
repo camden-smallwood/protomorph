@@ -1,9 +1,7 @@
-use crate::{
-    renderer::{
-        create_fullscreen_pipeline,
-        helpers::{depth_tex_entry, sampler_entry, tex_entry, uniform_entry},
-        shared::{GBuffer, SharedResources},
-    },
+use crate::renderer::{
+    create_fullscreen_pipeline, depth_tex_entry, sampler_entry,
+    shared::{GBuffer, SharedResources},
+    tex_entry, uniform_entry,
 };
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;

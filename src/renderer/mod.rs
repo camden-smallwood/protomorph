@@ -4,7 +4,6 @@ pub mod env_probe_pass;
 mod fxaa_pass;
 mod geometry_pass;
 mod god_rays_pass;
-mod helpers;
 mod lighting_pass;
 mod shadow_pass;
 mod shared;
@@ -17,9 +16,9 @@ use crate::{
     camera::CameraUniforms,
     dds::{create_dds_texture, load_dds_from_file},
     game::GameState,
-    lights::GpuLightingUniforms,
+    lights::{GpuLightingUniforms, LightType},
     materials::{GpuMaterialProps, MaterialTextureUsage},
-    models::{ModelData, ModelUniforms, VertexType},
+    models::{ModelData, ModelMeshPart, ModelUniforms, VertexType},
     objects::ObjectIndex,
     renderer::{
         env_probe_pass::GpuSkyParams,
@@ -39,7 +38,7 @@ use shared::*;
 pub(crate) struct GpuMesh {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
-    pub parts: Vec<crate::models::ModelMeshPart>,
+    pub parts: Vec<ModelMeshPart>,
     pub vertex_type: VertexType,
 }
 
@@ -356,10 +355,10 @@ impl Renderer {
         if width == 0 || height == 0 {
             return;
         }
+
         self.shared.config.width = width;
         self.shared.config.height = height;
-        self.surface
-            .configure(&self.shared.device, &self.shared.config);
+        self.surface.configure(&self.shared.device, &self.shared.config);
 
         self.gbuffer = create_gbuffer(&self.shared.device, width, height);
         self.intermediates = create_intermediates(
@@ -370,12 +369,9 @@ impl Renderer {
         );
 
         self.ssao_pass.resize(&self.shared, &self.gbuffer);
-        self.ssao_blur_pass
-            .resize(&self.shared, &self.gbuffer, &self.intermediates);
-        self.lighting_pass
-            .resize(&self.shared, &self.gbuffer, &self.intermediates);
-        self.god_rays_pass
-            .resize(&self.shared, &self.gbuffer.depth_view, &self.intermediates);
+        self.ssao_blur_pass.resize(&self.shared, &self.gbuffer, &self.intermediates);
+        self.lighting_pass.resize(&self.shared, &self.gbuffer, &self.intermediates);
+        self.god_rays_pass.resize(&self.shared, &self.gbuffer.depth_view, &self.intermediates);
         self.bloom_pass.resize(&self.shared, &self.intermediates);
         self.fxaa_pass.resize(&self.shared, &self.intermediates);
     }
@@ -521,7 +517,7 @@ impl Renderer {
             .any(|(_, l)| {
                 !l.hidden
                     && l.casts_shadow
-                    && l.light_type == crate::lights::LightType::Directional
+                    && l.light_type == LightType::Directional
             });
         self.shadow_pass.record(
             &mut encoder,
@@ -540,7 +536,7 @@ impl Renderer {
             let mut sc = glam::Vec3::ZERO;
             let mut sa = glam::Vec3::ZERO;
             for (_idx, light) in game.lights.iter() {
-                if !light.hidden && light.light_type == crate::lights::LightType::Directional {
+                if !light.hidden && light.light_type == LightType::Directional {
                     sd = -light.direction.normalize(); // direction TO the sun
                     sc = light.diffuse_color;
                     sa = light.ambient_color;
@@ -734,4 +730,101 @@ fn create_fullscreen_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Helper Functions
+// ---------------------------------------------------------------------------
+
+pub fn color_clear_attach(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
+    wgpu::RenderPassColorAttachment {
+        view,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+            store: wgpu::StoreOp::Store,
+        },
+        depth_slice: None,
+    }
+}
+
+pub fn create_1x1_texture(device: &wgpu::Device, queue: &wgpu::Queue, rgba: [u8; 4], label: &str, format: wgpu::TextureFormat) -> wgpu::Texture {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        &rgba,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+        wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+    );
+    texture
+}
+
+pub fn create_screen_texture(device: &wgpu::Device, w: u32, h: u32, format: wgpu::TextureFormat, label: &str) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+pub fn tex_entry(binding: u32, sample_type: wgpu::TextureSampleType) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+pub fn depth_tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+pub fn sampler_entry(binding: u32, sampler_type: wgpu::SamplerBindingType) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(sampler_type),
+        count: None,
+    }
+}
+
+pub fn uniform_entry(binding: u32, size: u64, visibility: wgpu::ShaderStages, has_dynamic_offset: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset,
+            min_binding_size: wgpu::BufferSize::new(size),
+        },
+        count: None,
+    }
 }
