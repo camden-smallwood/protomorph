@@ -176,7 +176,7 @@ impl GameState {
         // Grunt
         let grunt = self.objects.new_object();
         self.objects.get_mut(grunt).position = Vec3::new(-5.0, 0.0, 0.0);
-        self.objects.get_mut(grunt).scale = Vec3::splat(0.1);
+        self.objects.get_mut(grunt).scale = Vec3::splat(0.01);
         self.objects.get_mut(grunt).model_index = Some(grunt_model);
         self.init_animations(grunt, grunt_model);
         if let Some(anim) = self.objects.get_mut(grunt).animations.as_mut() {
