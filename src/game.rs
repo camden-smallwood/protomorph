@@ -56,6 +56,7 @@ pub struct GameState {
     weapon_model_index: usize,
     weapon_moving_anim_idx: Option<usize>,
     rotation_towards_grunt: f32,
+    pub weapon_detached: bool,
     pub debug_cubemap: bool,
     pub debug_cubemap_colors: bool,
     pub enable_specular_occlusion: bool,
@@ -145,6 +146,7 @@ impl GameState {
             weapon_model_index: 0,
             weapon_moving_anim_idx: None,
             rotation_towards_grunt: 0.0,
+            weapon_detached: false,
             debug_cubemap: false,
             debug_cubemap_colors: false,
             enable_specular_occlusion: true,
@@ -236,6 +238,22 @@ impl GameState {
         self.enable_specular_occlusion = !self.enable_specular_occlusion;
     }
 
+    pub fn is_grunt_animation_paused(&self) -> bool {
+        self.objects.get(self.grunt_index).animations.as_ref()
+            .map_or(false, |a| a.is_paused(0))
+    }
+
+    pub fn toggle_grunt_animation_pause(&mut self) {
+        if let Some(anim) = self.objects.get_mut(self.grunt_index).animations.as_mut() {
+            let paused = anim.is_paused(0);
+            anim.set_paused(0, !paused);
+        }
+    }
+
+    pub fn toggle_weapon_detach(&mut self) {
+        self.weapon_detached = !self.weapon_detached;
+    }
+
     pub fn toggle_flashlight(&mut self) {
         let light = self.lights.get_mut(self.flashlight_index);
         light.hidden = !light.hidden;
@@ -285,6 +303,9 @@ impl GameState {
     }
 
     fn update_weapon_viewmodel(&mut self) {
+        if self.weapon_detached {
+            return;
+        }
         let weapon = self.objects.get_mut(self.weapon_index);
         weapon.position = self.camera.position + Vec3::new(0.0, 0.0, -0.015);
         weapon.rotation = Vec3::new(0.0, -self.camera.rotation.y, self.camera.rotation.x);

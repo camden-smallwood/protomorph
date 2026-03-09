@@ -88,6 +88,8 @@ impl ApplicationHandler for App {
                                 KeyCode::Digit1 => game.trigger_weapon_animation("first_person ready"),
                                 KeyCode::Digit2 => game.trigger_weapon_animation("first_person reload_empty"),
                                 KeyCode::Digit3 => game.trigger_weapon_animation("first_person melee_strike_1"),
+                                KeyCode::KeyG => game.toggle_grunt_animation_pause(),
+                                KeyCode::KeyT => game.toggle_weapon_detach(),
                                 _ => {}
                             }
                         }

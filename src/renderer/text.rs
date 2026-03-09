@@ -93,6 +93,8 @@ impl RenderPass for TextPass {
         let on_off = |b: bool| if b { "ON" } else { "OFF" };
         self.shortcuts_string.clear();
         let _ = write!(self.shortcuts_string, "\
+[G] Grunt Animation {}\n\
+[T] Weapon Attached {}\n\
 [H] Flashlight {}\n\
 [K] Specular Occlusion {}\n\
 [P] Debug Cubemap {}\n\
@@ -103,6 +105,8 @@ impl RenderPass for TextPass {
 [WASD] Move  [RF] Up/Down\n\
 [Shift] Sprint\n\
 [ESC] Release Cursor",
+            if game.is_grunt_animation_paused() { "PAUSED" } else { "PLAYING" },
+            on_off(!game.weapon_detached),
             on_off(game.is_flashlight_on()),
             on_off(game.enable_specular_occlusion),
             on_off(game.debug_cubemap),

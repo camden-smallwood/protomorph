@@ -278,8 +278,8 @@ impl AnimationManager {
             state.weight = 1.0;
         }
 
-        // Advance time if active
-        if self.active_animations[animation_index] {
+        // Advance time if active and not paused
+        if self.active_animations[animation_index] && !state.flags.contains(AnimationStateFlags::PAUSED) {
             let state = &mut self.states[animation_index];
             state.time += (animation.ticks_per_second * state.speed) * delta_seconds;
 
