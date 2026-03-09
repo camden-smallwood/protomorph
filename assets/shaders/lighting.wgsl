@@ -183,7 +183,7 @@ fn calculate_point_shadow(
     let d = biased_pos - light_pos;
 
     let max_comp = max(max(abs(d.x), abs(d.y)), abs(d.z));
-    let reference = far * (max_comp - near) / (max_comp * (far - near));
+    let reference = far * (max_comp - near) / max(max_comp * (far - near), 0.00001);
 
     // Build tangent frame perpendicular to the cubemap lookup direction
     let d_norm = normalize(d);
@@ -620,7 +620,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let roughness = sqrt(material_roughness * material_roughness + normal_variance);
 
     let ssao_sample = textureSample(t_ssao, s_nearest, uv);
-    let bent_normal = normalize(ssao_sample.xyz);
+    let ssao_len = length(ssao_sample.xyz);
+    let bent_normal = select(frag_normal, ssao_sample.xyz / ssao_len, ssao_len > 0.0001);
     let ambient_occlusion = ssao_sample.w;
 
     // Standard per-fragment view direction (correct for all light types)
@@ -676,13 +677,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // Attenuation for non-directional lights
         if (light.light_type != LIGHT_TYPE_DIRECTIONAL) {
-            var light_attenuation = 1.0 / (light.constant_atten + light.linear_atten * light_distance + light.quadratic_atten * (light_distance * light_distance));
+            var light_attenuation = 1.0 / max(light.constant_atten + light.linear_atten * light_distance + light.quadratic_atten * (light_distance * light_distance), 0.00001);
 
             // Spot light cone falloff
             if (light.light_type == LIGHT_TYPE_SPOT) {
                 let light_theta = dot(light_direction, normalize(-light.direction));
                 let light_epsilon = light.inner_cutoff - light.outer_cutoff;
-                let light_intensity = clamp((light_theta - light.outer_cutoff) / light_epsilon, 0.0, 1.0);
+                let light_intensity = clamp((light_theta - light.outer_cutoff) / max(light_epsilon, 0.00001), 0.0, 1.0);
                 light_attenuation *= light_intensity;
             }
 
@@ -761,5 +762,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    return vec4<f32>(light_color, 1.0);
+    // Clamp to Rg11b10Ufloat safe range — prevents NaN/Inf from reaching bloom
+    return vec4<f32>(clamp(light_color, vec3(0.0), vec3(500.0)), 1.0);
 }

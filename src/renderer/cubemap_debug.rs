@@ -1,5 +1,7 @@
 use crate::renderer::{
-    create_fullscreen_pipeline, sampler_entry, shared::SharedResources, tex_entry, uniform_entry,
+    create_fullscreen_pipeline, sampler_entry,
+    shared::{FrameContext, RenderPass, SharedResources},
+    tex_entry, uniform_entry,
 };
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -95,17 +97,18 @@ impl CubemapDebugPass {
             bind_groups,
         }
     }
+}
 
-    pub fn record(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        shared: &SharedResources,
-        surface_view: &wgpu::TextureView,
-    ) {
+impl RenderPass for CubemapDebugPass {
+    fn is_enabled(&self, ctx: &FrameContext) -> bool {
+        ctx.game.debug_cubemap
+    }
+
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, ctx: &FrameContext) {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("cubemap_debug_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: surface_view,
+                view: ctx.surface_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
@@ -118,7 +121,7 @@ impl CubemapDebugPass {
         });
 
         rpass.set_pipeline(&self.pipeline);
-        rpass.set_vertex_buffer(0, shared.quad_vertex_buffer.slice(..));
+        rpass.set_vertex_buffer(0, ctx.shared.quad_vertex_buffer.slice(..));
 
         for face in 0..6 {
             rpass.set_bind_group(0, &self.bind_groups[face], &[]);

@@ -1,4 +1,4 @@
-use crate::renderer::shared::SharedResources;
+use crate::renderer::shared::{FrameContext, RenderPass, SharedResources};
 use glyphon::{
     Attrs, Buffer as TextBuffer, Cache, Color as TextColor, Family, FontSystem, Metrics,
     Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
@@ -13,8 +13,10 @@ pub struct TextPass {
     text_renderer: TextRenderer,
     viewport: Viewport,
     text_buffer: TextBuffer,
+    shortcuts_buffer: TextBuffer,
     face_label_buffers: [TextBuffer; 6],
     fps_string: String,
+    shortcuts_string: String,
     debug_cubemap: bool,
 }
 
@@ -30,6 +32,11 @@ impl TextPass {
         text_buffer.set_size(&mut font_system, Some(300.0), Some(30.0));
         text_buffer.set_text(&mut font_system, "FPS: --", &Attrs::new().family(Family::Monospace), Shaping::Basic, None);
         text_buffer.shape_until_scroll(&mut font_system, false);
+
+        let mut shortcuts_buffer = TextBuffer::new(&mut font_system, Metrics::new(20.0, 24.0));
+        shortcuts_buffer.set_size(&mut font_system, Some(400.0), Some(300.0));
+        shortcuts_buffer.set_text(&mut font_system, "", &Attrs::new().family(Family::Monospace), Shaping::Basic, None);
+        shortcuts_buffer.shape_until_scroll(&mut font_system, false);
 
         let face_label_buffers = std::array::from_fn(|i| {
             let mut buf = TextBuffer::new(&mut font_system, Metrics::new(14.0, 16.0));
@@ -52,18 +59,28 @@ impl TextPass {
             text_renderer,
             viewport,
             text_buffer,
+            shortcuts_buffer,
             face_label_buffers,
             fps_string: String::with_capacity(32),
+            shortcuts_string: String::with_capacity(512),
             debug_cubemap: false,
         }
     }
+}
 
-    pub fn prepare(&mut self, shared: &SharedResources, fps: f32, width: u32, height: u32, debug_cubemap: bool) {
+impl RenderPass for TextPass {
+    fn prepare(&mut self, ctx: &FrameContext) {
         use std::fmt::Write;
-        self.debug_cubemap = debug_cubemap;
+
+        let shared = ctx.shared;
+        let game = ctx.game;
+        let width = shared.config.width;
+        let height = shared.config.height;
+
+        self.debug_cubemap = game.debug_cubemap;
 
         self.fps_string.clear();
-        let _ = write!(self.fps_string, "FPS: {:.0}\n{}x{}", fps, width, height);
+        let _ = write!(self.fps_string, "FPS: {:.0}\n{}x{}", game.fps_counter.display_fps, width, height);
         self.text_buffer.set_text(
             &mut self.font_system,
             &self.fps_string,
@@ -73,9 +90,35 @@ impl TextPass {
         );
         self.text_buffer.shape_until_scroll(&mut self.font_system, false);
 
+        let on_off = |b: bool| if b { "ON" } else { "OFF" };
+        self.shortcuts_string.clear();
+        let _ = write!(self.shortcuts_string, "\
+[H] Flashlight {}\n\
+[K] Specular Occlusion {}\n\
+[P] Debug Cubemap {}\n\
+[O] Cubemap Colors {}\n\
+[1] Ready Anim\n\
+[2] Reload Anim\n\
+[3] Melee Anim\n\
+[WASD] Move  [RF] Up/Down\n\
+[Shift] Sprint\n\
+[ESC] Release Cursor",
+            on_off(game.is_flashlight_on()),
+            on_off(game.enable_specular_occlusion),
+            on_off(game.debug_cubemap),
+            on_off(game.debug_cubemap_colors),
+        );
+        self.shortcuts_buffer.set_text(
+            &mut self.font_system,
+            &self.shortcuts_string,
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Basic,
+            None,
+        );
+        self.shortcuts_buffer.shape_until_scroll(&mut self.font_system, false);
+
         self.viewport.update(&shared.queue, Resolution { width, height });
 
-        // Build text areas
         let mut areas: Vec<TextArea> = vec![TextArea {
             buffer: &self.text_buffer,
             left: 10.0,
@@ -91,18 +134,10 @@ impl TextPass {
             custom_glyphs: &[],
         }];
 
-        if debug_cubemap {
-            // Match the debug overlay quad positions from cubemap_debug_pass:
-            // NDC: x = -0.75 + face * 0.27, y = -0.75, scale = 0.12
-            // Convert NDC to pixel coords: px = (ndc + 1) / 2 * dimension
+        if self.debug_cubemap {
             let scale = 0.12_f32;
             for face in 0..6 {
                 let ndc_x = -0.75 + face as f32 * 0.27;
-                // Top-left of quad in NDC: (ndc_x - scale, -(ndc_y + scale))
-                // The quad spans [ndc_x - scale, ndc_x + scale] in X
-                //                [ndc_y - scale, ndc_y + scale] in Y
-                // NDC y = -0.75, quad top in NDC Y = -0.75 + scale = -0.63
-                // In pixel space (Y flipped): top = (1 - (-0.63)) / 2 * height
                 let ndc_y = -0.75;
                 let px_left = ((ndc_x - scale + 1.0) / 2.0 * width as f32) + 2.0;
                 let px_top = ((1.0 - (ndc_y + scale)) / 2.0 * height as f32) + 2.0;
@@ -124,6 +159,21 @@ impl TextPass {
             }
         }
 
+        areas.push(TextArea {
+            buffer: &self.shortcuts_buffer,
+            left: 10.0,
+            top: 58.0,
+            scale: 1.0,
+            bounds: TextBounds {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            },
+            default_color: TextColor::rgb(255, 255, 255),
+            custom_glyphs: &[],
+        });
+
         self.text_renderer
             .prepare(
                 &shared.device,
@@ -137,13 +187,28 @@ impl TextPass {
             .unwrap();
     }
 
-    pub fn record<'a>(&'a self, rpass: &mut wgpu::RenderPass<'a>) {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, ctx: &FrameContext) {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("text_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: ctx.surface_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+
         self.text_renderer
-            .render(&self.text_atlas, &self.viewport, rpass)
+            .render(&self.text_atlas, &self.viewport, &mut rpass)
             .unwrap();
     }
 
-    pub fn post_submit(&mut self) {
+    fn post_submit(&mut self) {
         self.text_atlas.trim();
     }
 }

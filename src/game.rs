@@ -4,7 +4,7 @@ use crate::{
     lights::{LightData, LightIndex, LightStore},
     models::ModelData,
     objects::{ObjectIndex, ObjectStore},
-    renderer::{Renderer, env_probe_pass::GpuAtmosphereData},
+    renderer::{Renderer, env_probe::GpuAtmosphereData},
 };
 use glam::Vec3;
 use std::collections::HashSet;
@@ -239,6 +239,10 @@ impl GameState {
     pub fn toggle_flashlight(&mut self) {
         let light = self.lights.get_mut(self.flashlight_index);
         light.hidden = !light.hidden;
+    }
+
+    pub fn is_flashlight_on(&self) -> bool {
+        !self.lights.get(self.flashlight_index).hidden
     }
 
     pub fn trigger_weapon_animation(&mut self, name: &str) {

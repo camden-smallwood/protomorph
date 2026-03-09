@@ -1,11 +1,13 @@
 use crate::{
     camera::CameraUniforms,
-    lights::LightType,
+    lights::{GpuLightingUniforms, LightType},
     models::{VertexRigid, VertexSkinned, VertexType},
-    renderer::{GpuModel, sampler_entry, shared::SharedResources, uniform_entry},
+    renderer::{GpuModel, sampler_entry, shared::{FrameContext, RenderPass, SharedBindGroup, SharedResources}, uniform_entry},
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 pub const SHADOW_MAP_SIZE: u32 = 1024;
 pub const SPOT_SHADOW_MAP_SIZE: u32 = 1024;
@@ -44,7 +46,7 @@ pub struct ShadowPass {
     uniform_buffer: wgpu::Buffer,
 
     pub bgl: wgpu::BindGroupLayout,
-    pub bind_group: wgpu::BindGroup,
+    pub bind_group: SharedBindGroup,
 
     // Point light cubemap array (one cube per shadow caster)
     point_cubemap_array: wgpu::Texture,
@@ -59,12 +61,72 @@ pub struct ShadowPass {
     cascade_texture: wgpu::Texture,
     cascade_array_view: wgpu::TextureView,
     cascade_layer_views: [wgpu::TextureView; CSM_CASCADE_COUNT],
+
+    // Per-frame scratch buffers (internalized from Renderer)
+    point_shadow_casters: Vec<(usize, usize)>,
+    spot_shadow_casters: Vec<(usize, usize)>,
+    shadow_assignments: Vec<(usize, i32)>,
+    has_directional_shadow: bool,
 }
 
 impl ShadowPass {
     pub fn new(shared: &SharedResources) -> Self {
-        let camera_bgl = create_shadow_camera_bgl(&shared.device);
-        let bgl = create_shadow_bgl(&shared.device);
+        let camera_bgl = shared.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow_camera_bgl"),
+            entries: &[uniform_entry(
+                0,
+                size_of::<CameraUniforms>() as u64,
+                wgpu::ShaderStages::VERTEX,
+                true,
+            )],
+        });
+        let bgl = shared.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow_bgl"),
+            entries: &[
+                // binding 0: point light cubemap array
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::CubeArray,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // binding 1: spot light 2D array
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // binding 2: comparison sampler
+                sampler_entry(2, wgpu::SamplerBindingType::Comparison),
+                // binding 3: shadow uniforms
+                uniform_entry(
+                    3,
+                    size_of::<GpuShadowData>() as u64,
+                    wgpu::ShaderStages::FRAGMENT,
+                    false,
+                ),
+                // binding 4: CSM cascade array
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
 
         let point_spot_bias = wgpu::DepthBiasState {
             constant: 2,
@@ -77,16 +139,16 @@ impl ShadowPass {
             clamp: 0.0,
         };
 
-        let pipeline = create_shadow_pipeline(&shared.device, &camera_bgl, &shared.model_bgl, point_spot_bias);
-        let skinned_pipeline = create_shadow_skinned_pipeline(
+        let pipeline = Self::create_pipeline(&shared.device, &camera_bgl, &shared.model_bgl, point_spot_bias);
+        let skinned_pipeline = Self::create_skinned_pipeline(
             &shared.device,
             &camera_bgl,
             &shared.model_bgl,
             &shared.node_matrices_bgl,
             point_spot_bias,
         );
-        let cascade_pipeline = create_shadow_pipeline(&shared.device, &camera_bgl, &shared.model_bgl, cascade_bias);
-        let cascade_skinned_pipeline = create_shadow_skinned_pipeline(
+        let cascade_pipeline = Self::create_pipeline(&shared.device, &camera_bgl, &shared.model_bgl, cascade_bias);
+        let cascade_skinned_pipeline = Self::create_skinned_pipeline(
             &shared.device,
             &camera_bgl,
             &shared.model_bgl,
@@ -224,15 +286,32 @@ impl ShadowPass {
                 })
             });
 
-        let bind_group = create_shadow_bind_group(
-            &shared.device,
-            &bgl,
-            &point_cubemap_array_view,
-            &spot_array_view,
-            &shared.shadow_comparison_sampler,
-            &uniform_buffer,
-            &cascade_array_view,
-        );
+        let bind_group = Rc::new(RefCell::new(shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_bg"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&point_cubemap_array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&spot_array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&shared.shadow_comparison_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&cascade_array_view),
+                },
+            ],
+        })));
 
         Self {
             pipeline,
@@ -255,24 +334,26 @@ impl ShadowPass {
             cascade_texture,
             cascade_array_view,
             cascade_layer_views,
+            point_shadow_casters: Vec::with_capacity(MAX_POINT_SHADOW_CASTERS),
+            spot_shadow_casters: Vec::with_capacity(MAX_SPOT_SHADOW_CASTERS),
+            shadow_assignments: Vec::with_capacity(MAX_POINT_SHADOW_CASTERS + MAX_SPOT_SHADOW_CASTERS),
+            has_directional_shadow: false,
         }
     }
 
-    /// Upload shadow camera matrices and shadow uniform data.
-    /// Returns (point_shadow_casters, spot_shadow_casters, shadow_assignments).
-    pub fn prepare(
-        &self,
-        shared: &SharedResources,
-        game_lights: &crate::lights::LightStore,
-        camera_view: Mat4,
-        camera_proj: Mat4,
-        point_shadow_casters: &mut Vec<(usize, usize)>,
-        spot_shadow_casters: &mut Vec<(usize, usize)>,
-        shadow_assignments: &mut Vec<(usize, i32)>,
-    ) {
-        point_shadow_casters.clear();
-        spot_shadow_casters.clear();
-        shadow_assignments.clear();
+}
+
+impl RenderPass for ShadowPass {
+    fn prepare(&mut self, ctx: &FrameContext) {
+        let shared = ctx.shared;
+        let game = ctx.game;
+        let game_lights = &game.lights;
+        let camera_view = game.camera.view;
+        let camera_proj = game.camera.projection;
+
+        self.point_shadow_casters.clear();
+        self.spot_shadow_casters.clear();
+        self.shadow_assignments.clear();
 
         {
             let mut gpu_slot = 0usize;
@@ -287,20 +368,20 @@ impl ShadowPass {
 
                 if light.casts_shadow {
                     match light.light_type {
-                        LightType::Point if point_shadow_casters.len() < MAX_POINT_SHADOW_CASTERS => {
-                            let si = point_shadow_casters.len() as i32;
-                            shadow_assignments.push((gpu_slot, si));
-                            point_shadow_casters.push((gpu_slot, light_idx.0));
+                        LightType::Point if self.point_shadow_casters.len() < MAX_POINT_SHADOW_CASTERS => {
+                            let si = self.point_shadow_casters.len() as i32;
+                            self.shadow_assignments.push((gpu_slot, si));
+                            self.point_shadow_casters.push((gpu_slot, light_idx.0));
                         }
 
-                        LightType::Spot if spot_shadow_casters.len() < MAX_SPOT_SHADOW_CASTERS => {
-                            let si = spot_shadow_casters.len() as i32;
-                            shadow_assignments.push((gpu_slot, si));
-                            spot_shadow_casters.push((gpu_slot, light_idx.0));
+                        LightType::Spot if self.spot_shadow_casters.len() < MAX_SPOT_SHADOW_CASTERS => {
+                            let si = self.spot_shadow_casters.len() as i32;
+                            self.shadow_assignments.push((gpu_slot, si));
+                            self.spot_shadow_casters.push((gpu_slot, light_idx.0));
                         }
 
                         LightType::Directional => {
-                            shadow_assignments.push((gpu_slot, 0));
+                            self.shadow_assignments.push((gpu_slot, 0));
                         }
 
                         _ => {}
@@ -311,12 +392,16 @@ impl ShadowPass {
             }
         }
 
+        self.has_directional_shadow = game_lights
+            .iter()
+            .any(|(_, l)| !l.hidden && l.casts_shadow && l.light_type == LightType::Directional);
+
         let shadow_near = 0.5f32;
         let shadow_far = 50.0f32;
         let shadow_bias = 0.005f32;
         let mut shadow_data = GpuShadowData::zeroed();
-        shadow_data.num_point_casters = point_shadow_casters.len() as u32;
-        shadow_data.num_spot_casters = spot_shadow_casters.len() as u32;
+        shadow_data.num_point_casters = self.point_shadow_casters.len() as u32;
+        shadow_data.num_spot_casters = self.spot_shadow_casters.len() as u32;
 
         let face_directions: [(Vec3, Vec3); 6] = [
             (Vec3::X, Vec3::new(0.0, -1.0, 0.0)),
@@ -330,7 +415,7 @@ impl ShadowPass {
         let mut point_proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, shadow_near, shadow_far);
         point_proj.y_axis.y = -point_proj.y_axis.y;
 
-        for (pi, &(_gpu_slot, store_idx)) in point_shadow_casters.iter().enumerate() {
+        for (pi, &(_gpu_slot, store_idx)) in self.point_shadow_casters.iter().enumerate() {
             let light = game_lights.get(crate::lights::LightIndex(store_idx));
             let pos = light.position;
 
@@ -351,7 +436,7 @@ impl ShadowPass {
             }
         }
 
-        for (si, &(_gpu_slot, store_idx)) in spot_shadow_casters.iter().enumerate() {
+        for (si, &(_gpu_slot, store_idx)) in self.spot_shadow_casters.iter().enumerate() {
             let light = game_lights.get(crate::lights::LightIndex(store_idx));
             let pos = light.position;
             let dir = light.direction.normalize();
@@ -506,20 +591,29 @@ impl ShadowPass {
         }
 
         shared.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&shadow_data));
+
+        // Upload lighting uniforms (depends on shadow_assignments computed above)
+        let light_uniforms = GpuLightingUniforms::from_scene(
+            game.camera.position,
+            game.camera.forward,
+            game_lights,
+            &self.shadow_assignments,
+            game.enable_specular_occlusion,
+        );
+        shared.queue.write_buffer(
+            &shared.lighting_buffer,
+            0,
+            bytemuck::bytes_of(&light_uniforms),
+        );
     }
 
-    pub fn record(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        shared: &SharedResources,
-        models: &[GpuModel],
-        render_list: &[(crate::objects::ObjectIndex, usize)],
-        point_shadow_casters: &[(usize, usize)],
-        spot_shadow_casters: &[(usize, usize)],
-        has_directional_shadow: bool,
-    ) {
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, ctx: &FrameContext) {
+        let shared = ctx.shared;
+        let models = ctx.models;
+        let render_list = ctx.render_list;
+
         // Point light shadow passes (6 faces per caster)
-        for (pi, &(_gpu_slot, _store_idx)) in point_shadow_casters.iter().enumerate() {
+        for (pi, &(_gpu_slot, _store_idx)) in self.point_shadow_casters.iter().enumerate() {
             for face in 0..6 {
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("shadow_point_pass"),
@@ -544,7 +638,7 @@ impl ShadowPass {
         }
 
         // Spot light shadow passes (1 per caster)
-        for (si, &(_gpu_slot, _store_idx)) in spot_shadow_casters.iter().enumerate() {
+        for (si, &(_gpu_slot, _store_idx)) in self.spot_shadow_casters.iter().enumerate() {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow_spot_pass"),
                 color_attachments: &[],
@@ -567,7 +661,7 @@ impl ShadowPass {
         }
 
         // Cascade shadow passes (one per cascade layer)
-        if has_directional_shadow {
+        if self.has_directional_shadow {
             for cascade in 0..CSM_CASCADE_COUNT {
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("shadow_cascade_pass"),
@@ -593,6 +687,9 @@ impl ShadowPass {
         }
     }
 
+}
+
+impl ShadowPass {
     fn draw_models<'a>(
         rpass: &mut wgpu::RenderPass<'a>,
         shared: &'a SharedResources,
@@ -637,226 +734,119 @@ impl ShadowPass {
             }
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Bind group layouts + creation
-// ---------------------------------------------------------------------------
+    fn create_pipeline(
+        device: &wgpu::Device,
+        shadow_camera_bgl: &wgpu::BindGroupLayout,
+        model_bgl: &wgpu::BindGroupLayout,
+        bias: wgpu::DepthBiasState,
+    ) -> wgpu::RenderPipeline {
+        let shader = device.create_shader_module(wgpu::include_wgsl!(
+            "../../assets/shaders/shadow.wgsl"
+        ));
 
-fn create_shadow_camera_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("shadow_camera_bgl"),
-        entries: &[uniform_entry(
-            0,
-            size_of::<CameraUniforms>() as u64,
-            wgpu::ShaderStages::VERTEX,
-            true,
-        )],
-    })
-}
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow_layout"),
+            bind_group_layouts: &[shadow_camera_bgl, model_bgl],
+            immediate_size: 0,
+        });
 
-fn create_shadow_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("shadow_bgl"),
-        entries: &[
-            // binding 0: point light cubemap array
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
-                    view_dimension: wgpu::TextureViewDimension::CubeArray,
-                    multisampled: false,
-                },
-                count: None,
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: size_of::<VertexRigid>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                }],
+                compilation_options: Default::default(),
             },
-            // binding 1: spot light 2D array
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
-                    view_dimension: wgpu::TextureViewDimension::D2Array,
-                    multisampled: false,
-                },
-                count: None,
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
             },
-            // binding 2: comparison sampler
-            sampler_entry(2, wgpu::SamplerBindingType::Comparison),
-            // binding 3: shadow uniforms
-            uniform_entry(
-                3,
-                size_of::<GpuShadowData>() as u64,
-                wgpu::ShaderStages::FRAGMENT,
-                false,
-            ),
-            // binding 4: CSM cascade array
-            wgpu::BindGroupLayoutEntry {
-                binding: 4,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
-                    view_dimension: wgpu::TextureViewDimension::D2Array,
-                    multisampled: false,
-                },
-                count: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias,
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
+    fn create_skinned_pipeline(
+        device: &wgpu::Device,
+        shadow_camera_bgl: &wgpu::BindGroupLayout,
+        model_bgl: &wgpu::BindGroupLayout,
+        node_matrices_bgl: &wgpu::BindGroupLayout,
+        bias: wgpu::DepthBiasState,
+    ) -> wgpu::RenderPipeline {
+        let shader = device.create_shader_module(wgpu::include_wgsl!(
+            "../../assets/shaders/shadow_skinned.wgsl"
+        ));
+
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow_skinned_layout"),
+            bind_group_layouts: &[shadow_camera_bgl, model_bgl, node_matrices_bgl],
+            immediate_size: 0,
+        });
+
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow_skinned_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: size_of::<VertexSkinned>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32x4,
+                            offset: 56,
+                            shader_location: 1,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 72,
+                            shader_location: 2,
+                        },
+                    ],
+                }],
+                compilation_options: Default::default(),
             },
-        ],
-    })
-}
-
-fn create_shadow_bind_group(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    point_cubemap_array_view: &wgpu::TextureView,
-    spot_array_view: &wgpu::TextureView,
-    comparison_sampler: &wgpu::Sampler,
-    uniform_buffer: &wgpu::Buffer,
-    cascade_array_view: &wgpu::TextureView,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("shadow_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(point_cubemap_array_view),
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
             },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(spot_array_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::Sampler(comparison_sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: uniform_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(cascade_array_view),
-            },
-        ],
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Pipeline creation
-// ---------------------------------------------------------------------------
-
-fn create_shadow_pipeline(
-    device: &wgpu::Device,
-    shadow_camera_bgl: &wgpu::BindGroupLayout,
-    model_bgl: &wgpu::BindGroupLayout,
-    bias: wgpu::DepthBiasState,
-) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::include_wgsl!(
-        "../../assets/shaders/shadow.wgsl"
-    ));
-
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("shadow_layout"),
-        bind_group_layouts: &[shadow_camera_bgl, model_bgl],
-        immediate_size: 0,
-    });
-
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("shadow_pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: size_of::<VertexRigid>() as wgpu::BufferAddress,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-            }],
-            compilation_options: Default::default(),
-        },
-        fragment: None,
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            ..Default::default()
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: Default::default(),
-            bias,
-        }),
-        multisample: Default::default(),
-        multiview_mask: None,
-        cache: None,
-    })
-}
-
-fn create_shadow_skinned_pipeline(
-    device: &wgpu::Device,
-    shadow_camera_bgl: &wgpu::BindGroupLayout,
-    model_bgl: &wgpu::BindGroupLayout,
-    node_matrices_bgl: &wgpu::BindGroupLayout,
-    bias: wgpu::DepthBiasState,
-) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::include_wgsl!(
-        "../../assets/shaders/shadow_skinned.wgsl"
-    ));
-
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("shadow_skinned_layout"),
-        bind_group_layouts: &[shadow_camera_bgl, model_bgl, node_matrices_bgl],
-        immediate_size: 0,
-    });
-
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("shadow_skinned_pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: size_of::<VertexSkinned>() as wgpu::BufferAddress,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &[
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x3,
-                        offset: 0,
-                        shader_location: 0,
-                    },
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Uint32x4,
-                        offset: 56,
-                        shader_location: 1,
-                    },
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: 72,
-                        shader_location: 2,
-                    },
-                ],
-            }],
-            compilation_options: Default::default(),
-        },
-        fragment: None,
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            ..Default::default()
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: Default::default(),
-            bias,
-        }),
-        multisample: Default::default(),
-        multiview_mask: None,
-        cache: None,
-    })
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias,
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
 }

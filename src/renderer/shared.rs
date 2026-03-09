@@ -2,18 +2,22 @@ use crate::{
     animation::MAXIMUM_NUMBER_OF_MODEL_NODES,
     camera::CameraUniforms,
     dds::create_fallback_texture,
+    game::GameState,
     lights::GpuLightingUniforms,
     materials::GpuMaterialProps,
     models::ModelUniforms,
+    objects::ObjectIndex,
     renderer::{
-        MAX_OBJECTS,
-        bloom_pass::BLOOM_MIP_COUNT,
+        GpuModel, MAX_OBJECTS,
+        bloom::BLOOM_MIP_COUNT,
         create_1x1_texture, create_screen_texture,
-        env_probe_pass::{GpuAtmosphereData, GpuSkyParams},
+        env_probe::{GpuAtmosphereData, GpuSkyParams},
         sampler_entry, tex_entry, uniform_entry,
     },
 };
 use bytemuck::{Pod, Zeroable};
+use std::cell::RefCell;
+use std::rc::Rc;
 use wgpu::util::DeviceExt;
 
 // ---------------------------------------------------------------------------
@@ -52,7 +56,7 @@ pub const QUAD_VERTICES: [QuadVertex; 6] = [
 ];
 
 // ---------------------------------------------------------------------------
-// G-Buffer + intermediate render targets
+// G-Buffer
 // ---------------------------------------------------------------------------
 
 pub struct GBuffer {
@@ -66,6 +70,50 @@ pub struct GBuffer {
     pub depth_view: wgpu::TextureView,
 }
 
+impl GBuffer {
+    pub fn new(device: &wgpu::Device, w: u32, h: u32) -> Self {
+        let normal = create_screen_texture(device, w, h, wgpu::TextureFormat::Rg16Float, "gb_normal");
+
+        let albedo_specular = create_screen_texture(
+            device,
+            w,
+            h,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "gb_albedo_spec",
+        );
+
+        let material = create_screen_texture(device, w, h, wgpu::TextureFormat::Rgba16Float, "gb_material");
+
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gb_depth"),
+            size: wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
+        let dv = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+
+        Self {
+            normal_view: dv(&normal),
+            albedo_specular_view: dv(&albedo_specular),
+            material_view: dv(&material),
+            depth_view: dv(&depth),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Intermediate targets
+// ---------------------------------------------------------------------------
+
 pub struct IntermediateTargets {
     pub ssao_view: wgpu::TextureView,
     pub ssao_blur_view: wgpu::TextureView,
@@ -76,132 +124,131 @@ pub struct IntermediateTargets {
     pub post_composite_view: wgpu::TextureView,
 }
 
+impl IntermediateTargets {
+    pub fn new(
+        device: &wgpu::Device,
+        w: u32,
+        h: u32,
+        surface_format: wgpu::TextureFormat,
+    ) -> Self {
+        let ssao = create_screen_texture(
+            device,
+            (w / 2).max(1),
+            (h / 2).max(1),
+            wgpu::TextureFormat::Rgba16Float,
+            "ssao",
+        );
+
+        let ssao_blur = create_screen_texture(
+            device,
+            (w / 2).max(1),
+            (h / 2).max(1),
+            wgpu::TextureFormat::Rgba16Float,
+            "ssao_blur",
+        );
+
+        let lighting_base = create_screen_texture(
+            device,
+            w,
+            h,
+            wgpu::TextureFormat::Rg11b10Ufloat,
+            "lighting_base",
+        );
+
+        let god_rays = create_screen_texture(
+            device,
+            (w / 2).max(1),
+            (h / 2).max(1),
+            wgpu::TextureFormat::Rg11b10Ufloat,
+            "god_rays",
+        );
+
+        let post_composite = create_screen_texture(
+            device,
+            w,
+            h,
+            surface_format,
+            "post_composite",
+        );
+
+        let mut bloom_mip_views = Vec::with_capacity(BLOOM_MIP_COUNT);
+        let mut bloom_mip_sizes = Vec::with_capacity(BLOOM_MIP_COUNT);
+        let mut mip_w = (w / 2).max(1);
+        let mut mip_h = (h / 2).max(1);
+
+        for i in 0..BLOOM_MIP_COUNT {
+            let tex = create_screen_texture(
+                device,
+                mip_w,
+                mip_h,
+                wgpu::TextureFormat::Rgba16Float,
+                &format!("bloom_mip_{i}"),
+            );
+
+            bloom_mip_views.push(tex.create_view(&wgpu::TextureViewDescriptor::default()));
+            bloom_mip_sizes.push((mip_w, mip_h));
+
+            mip_w = (mip_w / 2).max(1);
+            mip_h = (mip_h / 2).max(1);
+        }
+
+        let dv = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+
+        Self {
+            ssao_view: dv(&ssao),
+            ssao_blur_view: dv(&ssao_blur),
+            lighting_base_view: dv(&lighting_base),
+            god_rays_view: dv(&god_rays),
+            bloom_mip_views,
+            bloom_mip_sizes,
+            post_composite_view: dv(&post_composite),
+        }
+    }
+}
+
 pub struct FallbackTextures {
     pub white_view: wgpu::TextureView,
     pub default_normal_view: wgpu::TextureView,
     pub black_view: wgpu::TextureView,
 }
 
-pub fn create_gbuffer(device: &wgpu::Device, w: u32, h: u32) -> GBuffer {
-    let normal = create_screen_texture(device, w, h, wgpu::TextureFormat::Rg16Float, "gb_normal");
+// ---------------------------------------------------------------------------
+// RenderPass trait + FrameContext
+// ---------------------------------------------------------------------------
 
-    let albedo_specular = create_screen_texture(
-        device,
-        w,
-        h,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        "gb_albedo_spec",
-    );
+pub type SharedBindGroup = Rc<RefCell<wgpu::BindGroup>>;
 
-    let material = create_screen_texture(device, w, h, wgpu::TextureFormat::Rgba16Float, "gb_material");
-
-    let depth = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("gb_depth"),
-        size: wgpu::Extent3d {
-            width: w.max(1),
-            height: h.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-
-    let dv = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
-
-    GBuffer {
-        normal_view: dv(&normal),
-        albedo_specular_view: dv(&albedo_specular),
-        material_view: dv(&material),
-        depth_view: dv(&depth),
-    }
+pub struct FrameContext<'a> {
+    pub shared: &'a SharedResources,
+    pub gbuffer: &'a GBuffer,
+    pub intermediates: &'a IntermediateTargets,
+    pub surface_view: &'a wgpu::TextureView,
+    pub models: &'a [GpuModel],
+    pub render_list: &'a [(ObjectIndex, usize)],
+    pub game: &'a GameState,
 }
 
-pub fn create_intermediates(
-    device: &wgpu::Device,
-    w: u32,
-    h: u32,
-    surface_format: wgpu::TextureFormat,
-) -> IntermediateTargets {
-    let ssao = create_screen_texture(
-        device,
-        (w / 2).max(1),
-        (h / 2).max(1),
-        wgpu::TextureFormat::Rgba16Float,
-        "ssao",
-    );
+pub trait RenderPass {
+    fn prepare(&mut self, _ctx: &FrameContext) {}
 
-    let ssao_blur = create_screen_texture(
-        device,
-        (w / 2).max(1),
-        (h / 2).max(1),
-        wgpu::TextureFormat::Rgba16Float,
-        "ssao_blur",
-    );
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, ctx: &FrameContext);
 
-    let lighting_base = create_screen_texture(
-        device,
-        w,
-        h,
-        wgpu::TextureFormat::Rg11b10Ufloat,
-        "lighting_base",
-    );
+    fn resize(
+        &mut self,
+        _shared: &SharedResources,
+        _gbuffer: &GBuffer,
+        _intermediates: &IntermediateTargets,
+    ) {}
 
-    let god_rays = create_screen_texture(
-        device,
-        (w / 2).max(1),
-        (h / 2).max(1),
-        wgpu::TextureFormat::Rg11b10Ufloat,
-        "god_rays",
-    );
+    fn post_submit(&mut self) {}
 
-    let post_composite = create_screen_texture(
-        device,
-        w,
-        h,
-        surface_format,
-        "post_composite",
-    );
-
-    let mut bloom_mip_views = Vec::with_capacity(BLOOM_MIP_COUNT);
-    let mut bloom_mip_sizes = Vec::with_capacity(BLOOM_MIP_COUNT);
-    let mut mip_w = (w / 2).max(1);
-    let mut mip_h = (h / 2).max(1);
-
-    for i in 0..BLOOM_MIP_COUNT {
-        let tex = create_screen_texture(
-            device,
-            mip_w,
-            mip_h,
-            wgpu::TextureFormat::Rgba16Float,
-            &format!("bloom_mip_{i}"),
-        );
-
-        bloom_mip_views.push(tex.create_view(&wgpu::TextureViewDescriptor::default()));
-        bloom_mip_sizes.push((mip_w, mip_h));
-
-        mip_w = (mip_w / 2).max(1);
-        mip_h = (mip_h / 2).max(1);
-    }
-
-    let dv = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
-
-    IntermediateTargets {
-        ssao_view: dv(&ssao),
-        ssao_blur_view: dv(&ssao_blur),
-        lighting_base_view: dv(&lighting_base),
-        god_rays_view: dv(&god_rays),
-        bloom_mip_views,
-        bloom_mip_sizes,
-        post_composite_view: dv(&post_composite),
+    fn is_enabled(&self, _ctx: &FrameContext) -> bool {
+        true
     }
 }
 
 // ---------------------------------------------------------------------------
-// SharedResources
+// Shared resources
 // ---------------------------------------------------------------------------
 
 pub struct SharedResources {
@@ -322,11 +369,11 @@ impl SharedResources {
         });
 
         // --- Bind group layouts ---
-        let camera_bgl = create_camera_bgl(&device);
-        let model_bgl = create_model_bgl(&device);
-        let material_bgl = create_material_bgl(&device);
-        let node_matrices_bgl = create_node_matrices_bgl(&device);
-        let lighting_uniforms_bgl = create_lighting_uniforms_bgl(&device);
+        let camera_bgl = Self::create_camera_bgl(&device);
+        let model_bgl = Self::create_model_bgl(&device);
+        let material_bgl = Self::create_material_bgl(&device);
+        let node_matrices_bgl = Self::create_node_matrices_bgl(&device);
+        let lighting_uniforms_bgl = Self::create_lighting_uniforms_bgl(&device);
 
         // --- Uniform buffers ---
         let min_alignment = device.limits().min_uniform_buffer_offset_alignment as usize;
@@ -462,100 +509,96 @@ impl SharedResources {
             fallback_textures,
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Bind group layout creation functions
-// ---------------------------------------------------------------------------
-
-pub fn create_camera_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("camera_bgl"),
-        entries: &[uniform_entry(
-            0,
-            size_of::<CameraUniforms>() as u64,
-            wgpu::ShaderStages::VERTEX,
-            false,
-        )],
-    })
-}
-
-pub fn create_model_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("model_bgl"),
-        entries: &[uniform_entry(
-            0,
-            size_of::<ModelUniforms>() as u64,
-            wgpu::ShaderStages::VERTEX,
-            true,
-        )],
-    })
-}
-
-pub fn create_material_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let filterable = wgpu::TextureSampleType::Float {
-        filterable: true,
-    };
-
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("material_bgl"),
-        entries: &[
-            tex_entry(0, filterable),
-            tex_entry(1, filterable),
-            tex_entry(2, filterable),
-            tex_entry(3, filterable),
-            tex_entry(4, filterable),
-            sampler_entry(5, wgpu::SamplerBindingType::Filtering),
-            uniform_entry(
-                6,
-                size_of::<GpuMaterialProps>() as u64,
-                wgpu::ShaderStages::FRAGMENT,
-                false,
-            ),
-        ],
-    })
-}
-
-pub fn create_node_matrices_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("node_matrices_bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: true,
-                min_binding_size: wgpu::BufferSize::new(
-                    (MAXIMUM_NUMBER_OF_MODEL_NODES * size_of::<[[f32; 4]; 4]>()) as u64,
-                ),
-            },
-            count: None,
-        }],
-    })
-}
-
-pub fn create_lighting_uniforms_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("lighting_uniforms_bgl"),
-        entries: &[
-            uniform_entry(
+    fn create_camera_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("camera_bgl"),
+            entries: &[uniform_entry(
                 0,
-                size_of::<GpuLightingUniforms>() as u64,
-                wgpu::ShaderStages::FRAGMENT,
+                size_of::<CameraUniforms>() as u64,
+                wgpu::ShaderStages::VERTEX,
                 false,
-            ),
-            uniform_entry(
-                1,
-                size_of::<GpuAtmosphereData>() as u64,
-                wgpu::ShaderStages::FRAGMENT,
-                false,
-            ),
-            uniform_entry(
-                2,
-                size_of::<GpuSkyParams>() as u64,
-                wgpu::ShaderStages::FRAGMENT,
-                false,
-            ),
-        ],
-    })
+            )],
+        })
+    }
+
+    fn create_model_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("model_bgl"),
+            entries: &[uniform_entry(
+                0,
+                size_of::<ModelUniforms>() as u64,
+                wgpu::ShaderStages::VERTEX,
+                true,
+            )],
+        })
+    }
+
+    fn create_material_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        let filterable = wgpu::TextureSampleType::Float {
+            filterable: true,
+        };
+
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("material_bgl"),
+            entries: &[
+                tex_entry(0, filterable),
+                tex_entry(1, filterable),
+                tex_entry(2, filterable),
+                tex_entry(3, filterable),
+                tex_entry(4, filterable),
+                sampler_entry(5, wgpu::SamplerBindingType::Filtering),
+                uniform_entry(
+                    6,
+                    size_of::<GpuMaterialProps>() as u64,
+                    wgpu::ShaderStages::FRAGMENT,
+                    false,
+                ),
+            ],
+        })
+    }
+
+    fn create_node_matrices_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("node_matrices_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(
+                        (MAXIMUM_NUMBER_OF_MODEL_NODES * size_of::<[[f32; 4]; 4]>()) as u64,
+                    ),
+                },
+                count: None,
+            }],
+        })
+    }
+
+    fn create_lighting_uniforms_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lighting_uniforms_bgl"),
+            entries: &[
+                uniform_entry(
+                    0,
+                    size_of::<GpuLightingUniforms>() as u64,
+                    wgpu::ShaderStages::FRAGMENT,
+                    false,
+                ),
+                uniform_entry(
+                    1,
+                    size_of::<GpuAtmosphereData>() as u64,
+                    wgpu::ShaderStages::FRAGMENT,
+                    false,
+                ),
+                uniform_entry(
+                    2,
+                    size_of::<GpuSkyParams>() as u64,
+                    wgpu::ShaderStages::FRAGMENT,
+                    false,
+                ),
+            ],
+        })
+    }
 }

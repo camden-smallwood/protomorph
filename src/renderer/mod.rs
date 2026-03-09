@@ -1,35 +1,37 @@
-mod bloom_pass;
-mod cubemap_debug_pass;
-pub mod env_probe_pass;
-mod fxaa_pass;
-mod geometry_pass;
-mod god_rays_pass;
-mod lighting_pass;
-mod shadow_pass;
+mod bloom;
+mod cubemap_debug;
+pub mod env_probe;
+mod fxaa;
+mod geometry;
+mod god_rays;
+mod lighting;
+mod shadow;
 mod shared;
-mod ssao_blur_pass;
-mod ssao_pass;
-mod text_pass;
+mod ssao_blur;
+mod ssao;
+mod text;
 
 use crate::{
     animation::MAXIMUM_NUMBER_OF_MODEL_NODES,
     camera::CameraUniforms,
     dds::{create_dds_texture, load_dds_from_file},
     game::GameState,
-    lights::{GpuLightingUniforms, LightType},
     materials::{GpuMaterialProps, MaterialTextureUsage},
     models::{ModelData, ModelMeshPart, ModelUniforms, VertexType},
     objects::ObjectIndex,
-    renderer::{
-        env_probe_pass::GpuSkyParams,
-        shadow_pass::{MAX_POINT_SHADOW_CASTERS, MAX_SPOT_SHADOW_CASTERS},
-    },
+    renderer::env_probe::GpuSkyParams,
 };
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use shared::*;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+pub const MAX_OBJECTS: usize = 256;
 
 // ---------------------------------------------------------------------------
 // GPU-side model types (visible to pass modules)
@@ -61,29 +63,14 @@ pub struct Renderer {
     gbuffer: GBuffer,
     intermediates: IntermediateTargets,
 
-    shadow_pass: shadow_pass::ShadowPass,
-    env_probe_pass: env_probe_pass::EnvProbePass,
-    geometry_pass: geometry_pass::GeometryPass,
-    ssao_pass: ssao_pass::SsaoPass,
-    ssao_blur_pass: ssao_blur_pass::SsaoBlurPass,
-    lighting_pass: lighting_pass::LightingPass,
-    god_rays_pass: god_rays_pass::GodRaysPass,
-    bloom_pass: bloom_pass::BloomPass,
-    fxaa_pass: fxaa_pass::FxaaPass,
-    cubemap_debug_pass: cubemap_debug_pass::CubemapDebugPass,
-    text_pass: text_pass::TextPass,
+    passes: Vec<Box<dyn RenderPass>>,
 
     models: Vec<GpuModel>,
 
     // Preallocated per-frame scratch buffers
     render_list: Vec<(ObjectIndex, usize)>,
-    point_shadow_casters: Vec<(usize, usize)>,
-    spot_shadow_casters: Vec<(usize, usize)>,
-    shadow_assignments: Vec<(usize, i32)>,
     node_matrix_staging: Vec<u8>,
 }
-
-pub const MAX_OBJECTS: usize = 256;
 
 impl Renderer {
     pub fn new(window: Arc<Window>) -> Self {
@@ -130,66 +117,61 @@ impl Renderer {
 
         let shared = SharedResources::new(device, queue, config);
 
-        let gbuffer = create_gbuffer(&shared.device, shared.config.width, shared.config.height);
-        let intermediates = create_intermediates(
+        let gbuffer = GBuffer::new(&shared.device, shared.config.width, shared.config.height);
+        let intermediates = IntermediateTargets::new(
             &shared.device,
             shared.config.width,
             shared.config.height,
             shared.config.format,
         );
 
-        let shadow_pass = shadow_pass::ShadowPass::new(&shared);
-        let env_probe_pass = env_probe_pass::EnvProbePass::new(&shared);
-        let geometry_pass = geometry_pass::GeometryPass::new(&shared);
-        let ssao_pass = ssao_pass::SsaoPass::new(&shared, &gbuffer);
-        let ssao_blur_pass =
-            ssao_blur_pass::SsaoBlurPass::new(&shared, &gbuffer, &intermediates);
-        let lighting_pass = lighting_pass::LightingPass::new(
+        // Construct producer passes first for cross-pass wiring
+        let shadow_pass = shadow::ShadowPass::new(&shared);
+        let env_probe_pass = env_probe::EnvProbePass::new(&shared);
+
+        // Wire dependent passes using Rc::clone of shared bind groups
+        let lighting_pass = lighting::LightingPass::new(
             &shared,
             &gbuffer,
             &intermediates,
             &shadow_pass.bgl,
             &env_probe_pass.bgl,
+            shadow_pass.bind_group.clone(),
+            env_probe_pass.bind_group.clone(),
         );
-        let god_rays_pass = god_rays_pass::GodRaysPass::new(
-            &shared,
-            &gbuffer.depth_view,
-            &intermediates,
-        );
-        let bloom_pass = bloom_pass::BloomPass::new(&shared, &intermediates, shared.config.format);
-        let fxaa_pass =
-            fxaa_pass::FxaaPass::new(&shared, &intermediates, shared.config.format);
-        let cubemap_debug_pass = cubemap_debug_pass::CubemapDebugPass::new(
+        let cubemap_debug_pass = cubemap_debug::CubemapDebugPass::new(
             &shared,
             std::array::from_fn(|i| env_probe_pass.face_view(i)),
             env_probe_pass.filtering_sampler(),
             shared.config.format,
         );
-        let text_pass = text_pass::TextPass::new(&shared);
+
+        // Build passes vec in execution order
+        let passes: Vec<Box<dyn RenderPass>> = vec![
+            Box::new(shadow_pass),
+            Box::new(env_probe_pass),
+            Box::new(geometry::DepthPrepass::new(&shared)),
+            Box::new(geometry::GBufferPass::new(&shared)),
+            Box::new(ssao::SsaoPass::new(&shared, &gbuffer)),
+            Box::new(ssao_blur::SsaoBlurPass::new(&shared, &gbuffer, &intermediates)),
+            Box::new(lighting_pass),
+            Box::new(geometry::EmissiveForwardPass::new(&shared)),
+            Box::new(god_rays::GodRaysTracePass::new(&shared, &gbuffer.depth_view)),
+            Box::new(god_rays::GodRaysCompositePass::new(&shared, &intermediates)),
+            Box::new(bloom::BloomPass::new(&shared, &intermediates, shared.config.format)),
+            Box::new(fxaa::FxaaPass::new(&shared, &intermediates, shared.config.format)),
+            Box::new(cubemap_debug_pass),
+            Box::new(text::TextPass::new(&shared)),
+        ];
 
         Self {
             surface,
             shared,
             gbuffer,
             intermediates,
-            shadow_pass,
-            env_probe_pass,
-            geometry_pass,
-            ssao_pass,
-            ssao_blur_pass,
-            lighting_pass,
-            god_rays_pass,
-            bloom_pass,
-            fxaa_pass,
-            cubemap_debug_pass,
-            text_pass,
+            passes,
             models: Vec::new(),
             render_list: Vec::with_capacity(MAX_OBJECTS),
-            point_shadow_casters: Vec::with_capacity(MAX_POINT_SHADOW_CASTERS),
-            spot_shadow_casters: Vec::with_capacity(MAX_SPOT_SHADOW_CASTERS),
-            shadow_assignments: Vec::with_capacity(
-                MAX_POINT_SHADOW_CASTERS + MAX_SPOT_SHADOW_CASTERS,
-            ),
             node_matrix_staging: vec![
                 0u8;
                 MAXIMUM_NUMBER_OF_MODEL_NODES
@@ -360,31 +342,21 @@ impl Renderer {
         self.shared.config.height = height;
         self.surface.configure(&self.shared.device, &self.shared.config);
 
-        self.gbuffer = create_gbuffer(&self.shared.device, width, height);
-        self.intermediates = create_intermediates(
+        self.gbuffer = GBuffer::new(&self.shared.device, width, height);
+        self.intermediates = IntermediateTargets::new(
             &self.shared.device,
             width,
             height,
             self.shared.config.format,
         );
 
-        self.ssao_pass.resize(&self.shared, &self.gbuffer);
-        self.ssao_blur_pass.resize(&self.shared, &self.gbuffer, &self.intermediates);
-        self.lighting_pass.resize(&self.shared, &self.gbuffer, &self.intermediates);
-        self.god_rays_pass.resize(&self.shared, &self.gbuffer.depth_view, &self.intermediates);
-        self.bloom_pass.resize(&self.shared, &self.intermediates);
-        self.fxaa_pass.resize(&self.shared, &self.intermediates);
+        for pass in &mut self.passes {
+            pass.resize(&self.shared, &self.gbuffer, &self.intermediates);
+        }
     }
 
     pub fn render(&mut self, game: &GameState) {
-        // Prepare text
-        self.text_pass.prepare(
-            &self.shared,
-            game.fps_counter.display_fps,
-            self.shared.config.width,
-            self.shared.config.height,
-            game.debug_cubemap,
-        );
+        // Text prepare happens later with frame_ctx
 
         // Build sorted render list
         self.render_list.clear();
@@ -444,144 +416,11 @@ impl Renderer {
             }
         }
 
-        // Shadow preparation
-        let mut point_shadow_casters = std::mem::take(&mut self.point_shadow_casters);
-        let mut spot_shadow_casters = std::mem::take(&mut self.spot_shadow_casters);
-        let mut shadow_assignments = std::mem::take(&mut self.shadow_assignments);
-        self.shadow_pass.prepare(
-            &self.shared,
-            &game.lights,
-            game.camera.view,
-            game.camera.projection,
-            &mut point_shadow_casters,
-            &mut spot_shadow_casters,
-            &mut shadow_assignments,
-        );
-
-        // Upload lighting uniforms (with shadow assignments)
-        let light_uniforms = GpuLightingUniforms::from_scene(
-            game.camera.position,
-            game.camera.forward,
-            &game.lights,
-            &shadow_assignments,
-            game.enable_specular_occlusion,
-        );
-        self.shared.queue.write_buffer(
-            &self.shared.lighting_buffer,
-            0,
-            bytemuck::bytes_of(&light_uniforms),
-        );
-
         self.shared.queue.write_buffer(
             &self.shared.atmosphere_buffer,
             0,
             bytemuck::bytes_of(&game.atmosphere),
         );
-
-        // Acquire surface
-        let output = match self.surface.get_current_texture() {
-            Ok(tex) => tex,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.surface
-                    .configure(&self.shared.device, &self.shared.config);
-                self.render_list = render_list;
-                self.point_shadow_casters = point_shadow_casters;
-                self.spot_shadow_casters = spot_shadow_casters;
-                self.shadow_assignments = shadow_assignments;
-                return;
-            }
-            Err(e) => {
-                eprintln!("Surface error: {e}");
-                self.render_list = render_list;
-                self.point_shadow_casters = point_shadow_casters;
-                self.spot_shadow_casters = spot_shadow_casters;
-                self.shadow_assignments = shadow_assignments;
-                return;
-            }
-        };
-        let surface_view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder =
-            self.shared
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("encoder"),
-                });
-
-        // === Shadow depth passes ===
-        let has_directional_shadow = game
-            .lights
-            .iter()
-            .any(|(_, l)| {
-                !l.hidden
-                    && l.casts_shadow
-                    && l.light_type == LightType::Directional
-            });
-        self.shadow_pass.record(
-            &mut encoder,
-            &self.shared,
-            &self.models,
-            &render_list,
-            &point_shadow_casters,
-            &spot_shadow_casters,
-            has_directional_shadow,
-        );
-
-        // === Env probe cubemap pass ===
-        // Extract sun parameters for SH computation
-        let (sun_dir_to_sun, sun_diffuse, sun_ambient) = {
-            let mut sd = glam::Vec3::new(0.0, 0.0, 1.0);
-            let mut sc = glam::Vec3::ZERO;
-            let mut sa = glam::Vec3::ZERO;
-            for (_idx, light) in game.lights.iter() {
-                if !light.hidden && light.light_type == LightType::Directional {
-                    sd = -light.direction.normalize(); // direction TO the sun
-                    sc = light.diffuse_color;
-                    sa = light.ambient_color;
-                    break;
-                }
-            }
-            (sd, sc, sa)
-        };
-        self.env_probe_pass.record(
-            &mut encoder,
-            &self.shared,
-            &self.models,
-            &render_list,
-            game.camera.position,
-            sun_dir_to_sun,
-            sun_diffuse,
-            sun_ambient,
-            game.debug_cubemap_colors,
-        );
-
-        // === Depth pre-pass (populates depth buffer, zero overdraw in G-buffer) ===
-        self.geometry_pass.record_depth_prepass(
-            &mut encoder,
-            &self.shared,
-            &self.gbuffer,
-            &self.models,
-            &render_list,
-        );
-
-        // === Geometry pass (depth Equal, no depth write — only visible fragments shade) ===
-        self.geometry_pass.record(
-            &mut encoder,
-            &self.shared,
-            &self.gbuffer,
-            &self.models,
-            &render_list,
-        );
-
-        // === SSAO pass ===
-        self.ssao_pass
-            .record(&mut encoder, &self.shared, &self.intermediates.ssao_view);
-
-        // === SSAO blur pass ===
-        self.ssao_blur_pass
-            .record(&mut encoder, &self.shared, &self.intermediates.ssao_blur_view);
 
         // Upload sky params for merged lighting+sky pass
         {
@@ -598,93 +437,67 @@ impl Renderer {
             );
         }
 
-        // === Lighting + Sky pass (merged — sky fills depth==0 pixels) ===
-        self.lighting_pass.record(
-            &mut encoder,
-            &self.shared,
-            &self.intermediates.lighting_base_view,
-            &self.shadow_pass.bind_group,
-            &self.env_probe_pass.bind_group,
-        );
+        // Acquire surface
+        let output = match self.surface.get_current_texture() {
+            Ok(tex) => tex,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.surface
+                    .configure(&self.shared.device, &self.shared.config);
+                self.render_list = render_list;
+                return;
+            }
+            Err(e) => {
+                eprintln!("Surface error: {e}");
+                self.render_list = render_list;
+                return;
+            }
+        };
+        let surface_view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // === Forward emissive pass (additive onto lighting buffer) ===
-        self.geometry_pass.record_emissive(
-            &mut encoder,
-            &self.shared,
-            &self.gbuffer,
-            &self.intermediates.lighting_base_view,
-            &self.models,
-            &render_list,
-        );
+        let frame_ctx = shared::FrameContext {
+            shared: &self.shared,
+            gbuffer: &self.gbuffer,
+            intermediates: &self.intermediates,
+            surface_view: &surface_view,
+            models: &self.models,
+            render_list: &render_list,
+            game,
+        };
 
-        // === God rays trace (writes to god_rays_view) ===
-        self.god_rays_pass.record_trace(
-            &mut encoder,
-            &self.shared,
-            &self.intermediates.god_rays_view,
-            game.camera.view,
-            game.camera.projection,
-            sun_dir_to_sun,
-            sun_diffuse,
-        );
-
-        // === God rays composite (additive onto lighting) ===
-        self.god_rays_pass.record_composite(
-            &mut encoder,
-            &self.shared,
-            &self.intermediates.lighting_base_view,
-        );
-
-        // === Bloom pass (writes to intermediate, not surface) ===
-        self.bloom_pass.record(
-            &mut encoder,
-            &self.shared,
-            &self.intermediates,
-            &self.intermediates.post_composite_view,
-        );
-
-        // === FXAA pass (reads intermediate, writes to surface) ===
-        self.fxaa_pass
-            .record(&mut encoder, &self.shared, &surface_view);
-
-        // === Cubemap debug overlay ===
-        if game.debug_cubemap {
-            self.cubemap_debug_pass
-                .record(&mut encoder, &self.shared, &surface_view);
+        // Prepare phase — mutable pass access for uniform uploads
+        for pass in &mut self.passes {
+            if pass.is_enabled(&frame_ctx) {
+                pass.prepare(&frame_ctx);
+            }
         }
 
-        // === Text overlay ===
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("text_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surface_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-            self.text_pass.record(&mut rpass);
+        // Record phase — encode GPU commands
+        let mut encoder =
+            self.shared
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("encoder"),
+                });
+
+        for pass in self.passes.iter() {
+            if pass.is_enabled(&frame_ctx) {
+                pass.record(&mut encoder, &frame_ctx);
+            }
         }
 
         self.shared.queue.submit(std::iter::once(encoder.finish()));
         output.present();
-        self.text_pass.post_submit();
+
+        // Post-submit phase — cleanup
+        for pass in &mut self.passes {
+            pass.post_submit();
+        }
 
         // Return preallocated buffers
         render_list.clear();
         self.render_list = render_list;
-        point_shadow_casters.clear();
-        self.point_shadow_casters = point_shadow_casters;
-        spot_shadow_casters.clear();
-        self.spot_shadow_casters = spot_shadow_casters;
-        shadow_assignments.clear();
-        self.shadow_assignments = shadow_assignments;
     }
 }
 

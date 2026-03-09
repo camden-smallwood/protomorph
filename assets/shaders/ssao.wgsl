@@ -90,7 +90,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let ao = 1.0 - (occlusion / f32(NUM_KERNEL_SAMPLES));
-    bent_normal = normalize(mix(frag_normal, normalize(bent_normal), 1.0 - ao));
+    let bent_len = length(bent_normal);
+    let safe_bent = select(frag_normal, bent_normal / bent_len, bent_len > 0.0001);
+    bent_normal = normalize(mix(frag_normal, safe_bent, 1.0 - ao));
 
     return vec4<f32>(bent_normal, ao);
 }
