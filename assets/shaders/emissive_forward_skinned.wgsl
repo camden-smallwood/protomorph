@@ -98,5 +98,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let emissive_tex = textureSample(t_emissive, s_material, uv).rgb;
     let emissive = emissive_tex * material.emissive_color * material.emissive_intensity;
 
-    return vec4<f32>(emissive, 1.0);
+    // Clamp to Rg11b10Ufloat safe range
+    return vec4<f32>(min(emissive, vec3(500.0)), 1.0);
 }

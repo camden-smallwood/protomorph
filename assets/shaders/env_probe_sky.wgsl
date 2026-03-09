@@ -56,7 +56,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let world_pos = sky.inverse_view_projection * ndc;
     let ray_dir = normalize(world_pos.xyz / world_pos.w - sky.camera_position);
 
-    let sun_dir = normalize(atmosphere.sun_direction);
+    let sun_dir_len = length(atmosphere.sun_direction);
+    let sun_dir = select(vec3<f32>(0.0, 0.0, 1.0), atmosphere.sun_direction / sun_dir_len, sun_dir_len > 0.0001);
 
     let h_cam = max(sky.camera_position.z - atmosphere.reference_height, 0.0);
     let sin_elev = max(ray_dir.z, 0.02);
@@ -80,7 +81,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Mie: Henyey-Greenstein
     let g = atmosphere.mie_g;
     let g2 = g * g;
-    let mie_phase = 0.07958 * (1.0 - g2) / pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5);
+    let mie_base = max(1.0 + g2 - 2.0 * g * cos_theta, 0.00001);
+    let mie_phase = 0.07958 * (1.0 - g2) / pow(mie_base, 1.5);
 
     // Inscatter
     let scatter = vec3(1.0) - extinction;
@@ -100,5 +102,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let horizon_fade = smoothstep(-0.05, 0.0, ray_dir.z);
     sky_color *= horizon_fade;
 
+    // Sanitize output — env probe writes to Rgba16Float
+    sky_color = max(sky_color, vec3(0.0));
+    sky_color = min(sky_color, vec3(500.0));
     return vec4<f32>(sky_color, 1.0);
 }

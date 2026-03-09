@@ -58,7 +58,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let noise_scale = vec2<f32>(params.noise_scale_x, params.noise_scale_y);
 
-    let noise_sample = normalize(textureSample(t_noise, s_nearest, uv * noise_scale).xyz * 2.0 - vec3<f32>(1.0));
+    let raw_noise = textureSample(t_noise, s_nearest, uv * noise_scale).xyz * 2.0 - vec3<f32>(1.0);
+    let noise_len = length(raw_noise);
+    let noise_sample = select(vec3<f32>(0.0, 0.0, 1.0), raw_noise / noise_len, noise_len > 0.0001);
 
     var occlusion = 0.0;
     var bent_normal = vec3<f32>(0.0);

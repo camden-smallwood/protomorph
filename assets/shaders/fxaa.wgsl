@@ -173,7 +173,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(textureSample(t_input, s_linear, uv).rgb, 1.0);
     }
 
-    let spanLength = distPos + distNeg;
+    let spanLength = max(distPos + distNeg, 0.00001);
     let edgeBlend = 0.5 - min(distPos, distNeg) / spanLength;
 
     let finalBlend = max(edgeBlend, subpixBlend);

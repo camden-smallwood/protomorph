@@ -501,7 +501,9 @@ fn compute_scattering(camera_pos: vec3<f32>, world_pos: vec3<f32>) -> array<vec3
                          + vec3(atmosphere.mie_coefficient) * mie_depth));
 
     // Phase functions
-    let cos_theta = dot(ray_dir, normalize(atmosphere.sun_direction));
+    let fog_sun_len = length(atmosphere.sun_direction);
+    let fog_sun_dir = select(vec3<f32>(0.0, 0.0, 1.0), atmosphere.sun_direction / fog_sun_len, fog_sun_len > 0.0001);
+    let cos_theta = dot(ray_dir, fog_sun_dir);
 
     // Rayleigh: (3/16π)(1 + cos²θ)
     let rayleigh_phase = 0.05968 * (1.0 + cos_theta * cos_theta);
@@ -509,7 +511,8 @@ fn compute_scattering(camera_pos: vec3<f32>, world_pos: vec3<f32>) -> array<vec3
     // Mie: Henyey-Greenstein
     let g = atmosphere.mie_g;
     let g2 = g * g;
-    let mie_phase = 0.07958 * (1.0 - g2) / pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5);
+    let mie_base = max(1.0 + g2 - 2.0 * g * cos_theta, 0.00001);
+    let mie_phase = 0.07958 * (1.0 - g2) / pow(mie_base, 1.5);
 
     // Inscatter
     let scatter = vec3(1.0) - extinction;
@@ -534,7 +537,8 @@ fn compute_sky(uv: vec2<f32>) -> vec4<f32> {
     let world_pos = sky.inverse_view_projection * ndc;
     let ray_dir = normalize(world_pos.xyz / world_pos.w - sky.camera_position);
 
-    let sun_dir = normalize(atmosphere.sun_direction);
+    let sun_dir_len = length(atmosphere.sun_direction);
+    let sun_dir = select(vec3<f32>(0.0, 0.0, 1.0), atmosphere.sun_direction / sun_dir_len, sun_dir_len > 0.0001);
 
     let h_cam = max(sky.camera_position.z - atmosphere.reference_height, 0.0);
     let sin_elev = max(ray_dir.z, 0.02);
@@ -553,7 +557,8 @@ fn compute_sky(uv: vec2<f32>) -> vec4<f32> {
 
     let g = atmosphere.mie_g;
     let g2 = g * g;
-    let mie_phase = 0.07958 * (1.0 - g2) / pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5);
+    let mie_base_sky = max(1.0 + g2 - 2.0 * g * cos_theta, 0.00001);
+    let mie_phase = 0.07958 * (1.0 - g2) / pow(mie_base_sky, 1.5);
 
     let scatter = vec3(1.0) - extinction;
     let sun_luminance = 20.0;
@@ -598,12 +603,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Sky pixel detection: reverse-Z clears depth to 0.0, geometry is > 0.0
     let depth = textureSample(t_depth, s_nearest, uv);
+
+    // Read normal early so dpdx/dpdy run before any non-uniform early return
+    let raw_normal = textureSample(t_normal, s_nearest, uv).rg;
+    let frag_normal = oct_decode(raw_normal);
+    let dn_dx = dpdx(frag_normal);
+    let dn_dy = dpdy(frag_normal);
+
     if (depth <= 0.0) {
         return compute_sky(uv);
     }
 
     let frag_position = reconstruct_world_pos(uv, depth);
-    let frag_normal = oct_decode(textureSample(t_normal, s_nearest, uv).rg);
     let albedo_specular = textureSample(t_albedo_specular, s_nearest, uv);
 
     let mat_sample = textureSample(t_material, s_nearest, uv);
@@ -614,8 +625,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Geometric specular anti-aliasing: broaden roughness where the normal varies
     // across the pixel, preventing specular flicker at distance / on detailed normal maps
-    let dn_dx = dpdx(frag_normal);
-    let dn_dy = dpdy(frag_normal);
     let normal_variance = dot(dn_dx, dn_dx) + dot(dn_dy, dn_dy);
     let roughness = sqrt(material_roughness * material_roughness + normal_variance);
 
@@ -637,7 +646,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         var light_vec = light.position - frag_position;
         var light_distance = length(light_vec);
         if (light.light_type == LIGHT_TYPE_DIRECTIONAL) {
-            light_direction = normalize(-light.direction);
+            let dir_len = length(light.direction);
+            light_direction = select(vec3<f32>(0.0, 0.0, -1.0), -light.direction / dir_len, dir_len > 0.0001);
         } else {
             light_direction = light_vec / max(light_distance, 0.00001);
         }
@@ -681,7 +691,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
             // Spot light cone falloff
             if (light.light_type == LIGHT_TYPE_SPOT) {
-                let light_theta = dot(light_direction, normalize(-light.direction));
+                let spot_dir_len = length(light.direction);
+                let spot_dir = select(vec3<f32>(0.0, 0.0, -1.0), -light.direction / spot_dir_len, spot_dir_len > 0.0001);
+                let light_theta = dot(light_direction, spot_dir);
                 let light_epsilon = light.inner_cutoff - light.outer_cutoff;
                 let light_intensity = clamp((light_theta - light.outer_cutoff) / max(light_epsilon, 0.00001), 0.0, 1.0);
                 light_attenuation *= light_intensity;
@@ -762,6 +774,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Clamp to Rg11b10Ufloat safe range — prevents NaN/Inf from reaching bloom
-    return vec4<f32>(clamp(light_color, vec3(0.0), vec3(500.0)), 1.0);
+    // Sanitize to Rg11b10Ufloat safe range — clamp doesn't catch NaN, so use min/max
+    light_color = max(light_color, vec3(0.0));
+    light_color = min(light_color, vec3(500.0));
+    return vec4<f32>(light_color, 1.0);
 }
