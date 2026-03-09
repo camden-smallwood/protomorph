@@ -289,7 +289,7 @@ fn sample_cascade_pcf(
     let texel_size = 1.0 / CSM_MAP_SIZE_F;
     let rotation = random_angle(screen_pos);
     var shadow = 0.0;
-    for (var i = 0u; i < 4u; i++) {
+    for (var i = 0u; i < 8u; i++) {
         let p = rotate_offset(POISSON_DISK[i], rotation);
         let offset_uv = uv + p * SHADOW_PCF_SPREAD * texel_size;
         shadow += textureSampleCompareLevel(
@@ -297,7 +297,7 @@ fn sample_cascade_pcf(
             offset_uv, cascade_idx, proj.z
         );
     }
-    return shadow / 4.0;
+    return shadow / 8.0;
 }
 
 fn calculate_directional_shadow(

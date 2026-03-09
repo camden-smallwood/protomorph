@@ -7,7 +7,7 @@
 @group(0) @binding(2) var t_noise: texture_2d<f32>;
 @group(0) @binding(3) var s_nearest: sampler;
 
-const NUM_KERNEL_SAMPLES: u32 = 16u;
+const NUM_KERNEL_SAMPLES: u32 = 32u;
 
 struct SsaoParams {
     kernel_samples: array<vec4<f32>, 32>,

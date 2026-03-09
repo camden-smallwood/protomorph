@@ -25,7 +25,8 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 }
 
 const SIGMA_DEPTH: f32 = 0.05;
-const KERNEL_RADIUS: i32 = 1;
+const KERNEL_RADIUS: i32 = 2;
+const SIGMA_SPATIAL: f32 = 2.0;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -38,16 +39,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var total_weight = 0.0;
     var total_value = vec4<f32>(0.0);
 
-    for (var y = -KERNEL_RADIUS; y < KERNEL_RADIUS; y++) {
-        for (var x = -KERNEL_RADIUS; x < KERNEL_RADIUS; x++) {
-            let offset = vec2<f32>(f32(x), f32(y)) + 0.5;
+    for (var y = -KERNEL_RADIUS; y <= KERNEL_RADIUS; y++) {
+        for (var x = -KERNEL_RADIUS; x <= KERNEL_RADIUS; x++) {
+            let offset = vec2<f32>(f32(x), f32(y));
             let sample_uv = uv + offset * texel_size;
 
             let sample_value = textureSample(t_ssao, s_nearest, sample_uv);
             let depth = textureSample(t_depth, s_nearest, sample_uv);
 
             let depth_diff = center_depth - depth;
-            let weight = exp(-(depth_diff * depth_diff) / (SIGMA_DEPTH * SIGMA_DEPTH));
+            let spatial_dist = f32(x * x + y * y);
+            let weight = exp(-spatial_dist / (2.0 * SIGMA_SPATIAL * SIGMA_SPATIAL)
+                             - (depth_diff * depth_diff) / (SIGMA_DEPTH * SIGMA_DEPTH));
 
             total_value += sample_value * weight;
             total_weight += weight;
