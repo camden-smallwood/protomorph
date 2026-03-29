@@ -1,15 +1,17 @@
 mod bloom;
-mod cubemap_debug;
+mod cloud_composite;
+mod cloud_noise;
+mod cloud_raymarch;
+mod final_composite;
 pub mod env_probe;
-mod fxaa;
-mod geometry;
 mod god_rays;
 mod lighting;
+mod geometry;
 mod shadow;
 mod shared;
-mod ssao_blur;
 mod ssao;
-mod text;
+
+mod water;
 
 use crate::{
     animation::MAXIMUM_NUMBER_OF_MODEL_NODES,
@@ -17,7 +19,7 @@ use crate::{
     dds::{create_dds_texture, load_dds_from_file},
     game::GameState,
     materials::{GpuMaterialProps, MaterialTextureUsage},
-    models::{ModelData, ModelMeshPart, ModelUniforms, VertexType},
+    models::{ModelData, ModelMeshPart, ModelUniforms},
     objects::ObjectIndex,
     renderer::env_probe::GpuSkyParams,
 };
@@ -41,7 +43,6 @@ pub(crate) struct GpuMesh {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub parts: Vec<ModelMeshPart>,
-    pub vertex_type: VertexType,
 }
 
 pub(crate) struct GpuMaterial {
@@ -70,6 +71,10 @@ pub struct Renderer {
     // Preallocated per-frame scratch buffers
     render_list: Vec<(ObjectIndex, usize)>,
     node_matrix_staging: Vec<u8>,
+
+    // Temporal reprojection state
+    prev_vp: glam::Mat4,
+    frame_counter: u32,
 }
 
 impl Renderer {
@@ -125,43 +130,67 @@ impl Renderer {
             shared.config.format,
         );
 
+        // Generate cloud noise textures (one-shot compute dispatch)
+        let cloud_textures = cloud_noise::generate(&shared);
+
         // Construct producer passes first for cross-pass wiring
         let shadow_pass = shadow::ShadowPass::new(&shared);
         let env_probe_pass = env_probe::EnvProbePass::new(&shared);
 
-        // Wire dependent passes using Rc::clone of shared bind groups
-        let lighting_pass = lighting::LightingPass::new(
+        // Wire deferred lighting pass
+        let deferred_lighting_pass = lighting::DeferredLightingPass::new(
             &shared,
             &gbuffer,
             &intermediates,
             &shadow_pass.bgl,
-            &env_probe_pass.bgl,
             shadow_pass.bind_group.clone(),
-            env_probe_pass.bind_group.clone(),
+            env_probe_pass.create_cube_view(),
+            env_probe_pass.filtering_sampler(),
         );
-        let cubemap_debug_pass = cubemap_debug::CubemapDebugPass::new(
+        let water_pass = water::WaterPass::new(
             &shared,
+            &gbuffer,
+            &intermediates,
+            env_probe_pass.create_cube_view(),
+            &shadow_pass.bgl,
+            shadow_pass.bind_group.clone(),
+        );
+
+        // Build final composite BEFORE env_probe_pass is moved (needs face views by reference)
+        let final_composite_pass = final_composite::FinalCompositePass::new(
+            &shared,
+            &intermediates,
+            shared.config.format,
             std::array::from_fn(|i| env_probe_pass.face_view(i)),
             env_probe_pass.filtering_sampler(),
-            shared.config.format,
+        );
+
+        // Build cloud passes (raymarch takes ownership of noise textures)
+        let cloud_raymarch_pass = cloud_raymarch::CloudRaymarchPass::new(
+            &shared,
+            &gbuffer,
+            &intermediates,
+            cloud_textures,
+        );
+        let cloud_composite_pass = cloud_composite::CloudCompositePass::new(
+            &shared,
+            &gbuffer,
+            &intermediates,
         );
 
         // Build passes vec in execution order
         let passes: Vec<Box<dyn RenderPass>> = vec![
             Box::new(shadow_pass),
             Box::new(env_probe_pass),
-            Box::new(geometry::DepthPrepass::new(&shared)),
             Box::new(geometry::GBufferPass::new(&shared)),
+            Box::new(cloud_raymarch_pass),
             Box::new(ssao::SsaoPass::new(&shared, &gbuffer)),
-            Box::new(ssao_blur::SsaoBlurPass::new(&shared, &gbuffer, &intermediates)),
-            Box::new(lighting_pass),
-            Box::new(geometry::EmissiveForwardPass::new(&shared)),
-            Box::new(god_rays::GodRaysTracePass::new(&shared, &gbuffer.depth_view)),
-            Box::new(god_rays::GodRaysCompositePass::new(&shared, &intermediates)),
-            Box::new(bloom::BloomPass::new(&shared, &intermediates, shared.config.format)),
-            Box::new(fxaa::FxaaPass::new(&shared, &intermediates, shared.config.format)),
-            Box::new(cubemap_debug_pass),
-            Box::new(text::TextPass::new(&shared)),
+            Box::new(god_rays::GodRaysTracePass::new(&shared, &gbuffer.depth_view, &intermediates.cloud_raymarch_view)),
+            Box::new(deferred_lighting_pass),
+            Box::new(cloud_composite_pass),
+            Box::new(water_pass),
+            Box::new(bloom::BloomPass::new(&shared, &gbuffer, &intermediates, shared.config.format)),
+            Box::new(final_composite_pass),
         ];
 
         Self {
@@ -177,11 +206,21 @@ impl Renderer {
                 MAXIMUM_NUMBER_OF_MODEL_NODES
                     * std::mem::size_of::<[[f32; 4]; 4]>()
             ],
+            prev_vp: glam::Mat4::IDENTITY,
+            frame_counter: 0,
         }
     }
 
     pub fn load_model(&mut self, path: &str) -> (usize, ModelData) {
-        let model = ModelData::from_file(path);
+        self.load_model_with_uv_scale(path, 1.0)
+    }
+
+    pub fn load_model_with_uv_scale(
+        &mut self,
+        path: &str,
+        uv_scale: f32,
+    ) -> (usize, ModelData) {
+        let model = ModelData::from_file_with_uv_scale(path, uv_scale);
 
         let materials: Vec<GpuMaterial> = model
             .materials
@@ -191,7 +230,6 @@ impl Renderer {
                                 fallback: &wgpu::TextureView|
                  -> wgpu::TextureView {
                     if let Some(path) = mat.find_texture(usage) {
-                        println!("Loading texture ({:?}): {}", usage, path);
                         let dds = load_dds_from_file(path);
                         let linear = matches!(
                             usage,
@@ -291,23 +329,14 @@ impl Renderer {
             .meshes
             .iter()
             .map(|mesh| {
-                let vertex_buffer =
-                    match mesh.vertex_type {
-                        VertexType::Rigid => self.shared.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("vertex_buffer_rigid"),
-                                contents: bytemuck::cast_slice(&mesh.rigid_vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            },
-                        ),
-                        VertexType::Skinned => self.shared.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("vertex_buffer_skinned"),
-                                contents: bytemuck::cast_slice(&mesh.skinned_vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            },
-                        ),
-                    };
+                let verts = &mesh.vertices;
+                let vertex_buffer = self.shared.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("vertex_buffer"),
+                        contents: bytemuck::cast_slice(&verts),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    },
+                );
                 let index_buffer =
                     self.shared
                         .device
@@ -320,7 +349,6 @@ impl Renderer {
                     vertex_buffer,
                     index_buffer,
                     parts: mesh.parts.clone(),
-                    vertex_type: mesh.vertex_type,
                 }
             })
             .collect();
@@ -365,13 +393,6 @@ impl Renderer {
                 .iter()
                 .filter_map(|(idx, obj)| obj.model_index.map(|m| (idx, m))),
         );
-        self.render_list.sort_by_key(|&(_, model_idx)| {
-            let gpu_model = &self.models[model_idx];
-            gpu_model
-                .meshes
-                .iter()
-                .any(|m| m.vertex_type == VertexType::Skinned) as u8
-        });
         let mut render_list = std::mem::take(&mut self.render_list);
 
         // Upload camera uniforms
@@ -399,27 +420,29 @@ impl Renderer {
             );
 
             if let Some(anim_mgr) = &obj.animations {
-                let mat_count = anim_mgr.node_matrices.len();
-                let byte_len = mat_count * std::mem::size_of::<[[f32; 4]; 4]>();
-                for (j, mat) in anim_mgr.node_matrices.iter().enumerate() {
-                    let offset = j * 64;
-                    let cols = mat.to_cols_array();
-                    self.node_matrix_staging[offset..offset + 64]
-                        .copy_from_slice(bytemuck::cast_slice(&cols));
+                if anim_mgr.matrices_dirty {
+                    let mat_count = anim_mgr.node_matrices.len();
+                    let byte_len = mat_count * std::mem::size_of::<[[f32; 4]; 4]>();
+                    for (j, mat) in anim_mgr.node_matrices.iter().enumerate() {
+                        let offset = j * 64;
+                        let cols = mat.to_cols_array();
+                        self.node_matrix_staging[offset..offset + 64]
+                            .copy_from_slice(bytemuck::cast_slice(&cols));
+                    }
+                    let nm_offset = (i * self.shared.node_matrices_stride) as u64;
+                    self.shared.queue.write_buffer(
+                        &self.shared.node_matrices_buffer,
+                        nm_offset,
+                        &self.node_matrix_staging[..byte_len],
+                    );
                 }
-                let nm_offset = (i * self.shared.node_matrices_stride) as u64;
-                self.shared.queue.write_buffer(
-                    &self.shared.node_matrices_buffer,
-                    nm_offset,
-                    &self.node_matrix_staging[..byte_len],
-                );
             }
         }
 
         self.shared.queue.write_buffer(
             &self.shared.atmosphere_buffer,
             0,
-            bytemuck::bytes_of(&game.atmosphere),
+            bytemuck::bytes_of(&game.atmosphere_data()),
         );
 
         // Upload sky params for merged lighting+sky pass
@@ -464,6 +487,8 @@ impl Renderer {
             models: &self.models,
             render_list: &render_list,
             game,
+            frame_index: self.frame_counter,
+            prev_view_projection: self.prev_vp,
         };
 
         // Prepare phase — mutable pass access for uniform uploads
@@ -495,6 +520,10 @@ impl Renderer {
             pass.post_submit();
         }
 
+        // Save current VP for next frame's temporal reprojection
+        self.prev_vp = game.camera.projection * game.camera.view;
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+
         // Return preallocated buffers
         render_list.clear();
         self.render_list = render_list;
@@ -510,6 +539,17 @@ fn create_fullscreen_pipeline(
     shader_source: wgpu::ShaderModuleDescriptor,
     bind_group_layouts: &[&wgpu::BindGroupLayout],
     color_targets: &[Option<wgpu::ColorTargetState>],
+    label: &str,
+) -> wgpu::RenderPipeline {
+    create_fullscreen_pipeline_with_depth(device, shader_source, bind_group_layouts, color_targets, None, label)
+}
+
+fn create_fullscreen_pipeline_with_depth(
+    device: &wgpu::Device,
+    shader_source: wgpu::ShaderModuleDescriptor,
+    bind_group_layouts: &[&wgpu::BindGroupLayout],
+    color_targets: &[Option<wgpu::ColorTargetState>],
+    depth_stencil: Option<wgpu::DepthStencilState>,
     label: &str,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(shader_source);
@@ -538,11 +578,49 @@ fn create_fullscreen_pipeline(
             topology: wgpu::PrimitiveTopology::TriangleList,
             ..Default::default()
         },
-        depth_stencil: None,
+        depth_stencil,
         multisample: Default::default(),
         multiview_mask: None,
         cache: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Shared draw loop — used by all geometry passes
+// ---------------------------------------------------------------------------
+
+/// Draw all visible models. Caller must set pipeline and group 0 (camera) before calling.
+/// Groups 1 (model) and 3 (node matrices) are set per-object with dynamic offsets.
+/// If `bind_materials` is true, sets group 2 per mesh part from material bind groups.
+/// Otherwise group 2 is assumed pre-set by the caller (forward lighting passes).
+pub(crate) fn draw_models<'a>(
+    rpass: &mut wgpu::RenderPass<'a>,
+    shared: &'a SharedResources,
+    ctx: &'a FrameContext<'a>,
+    bind_materials: bool,
+) {
+    for (obj_slot, &(_obj_idx, model_idx)) in ctx.render_list.iter().enumerate() {
+        let model_offset = (obj_slot * shared.model_stride) as u32;
+        let nm_offset = (obj_slot * shared.node_matrices_stride) as u32;
+        let gpu_model = &ctx.models[model_idx];
+
+        rpass.set_bind_group(1, &shared.model_bind_group, &[model_offset]);
+        rpass.set_bind_group(3, &shared.node_matrices_bind_group, &[nm_offset]);
+
+        for mesh in &gpu_model.meshes {
+            rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            rpass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+            for part in &mesh.parts {
+                if bind_materials {
+                    if let Some(material) = gpu_model.materials.get(part.material_index) {
+                        rpass.set_bind_group(2, &material.bind_group, &[]);
+                    }
+                }
+                rpass.draw_indexed(part.index_start..part.index_start + part.index_count, 0, 0..1);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

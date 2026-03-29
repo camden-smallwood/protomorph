@@ -44,9 +44,9 @@ impl LightData {
             diffuse_color: Vec3::ONE,
             ambient_color: Vec3::splat(0.05),
             specular_color: Vec3::ONE,
-            constant_atten: 1.0,
-            linear_atten: 0.009,
-            quadratic_atten: 0.0032,
+            constant_atten: 1.0, // H3 "light size" — used as 1/(size + d²)
+            linear_atten: 0.0,  // unused in H3 falloff model
+            quadratic_atten: 0.0, // unused in H3 falloff model
             inner_cutoff: 0.0,
             outer_cutoff: 0.0,
         }

@@ -1,6 +1,38 @@
 use bitflags::bitflags;
+use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use crate::models::ModelData;
+
+/// Dual quaternion: 8 floats (real quaternion + dual quaternion).
+/// Encodes rigid transform (rotation + translation) in 32 bytes vs 64 for Mat4.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct DualQuat {
+    pub real: [f32; 4], // rotation quaternion (x, y, z, w)
+    pub dual: [f32; 4], // translation quaternion
+}
+
+impl DualQuat {
+    pub const IDENTITY: Self = Self {
+        real: [0.0, 0.0, 0.0, 1.0],
+        dual: [0.0, 0.0, 0.0, 0.0],
+    };
+
+    /// Convert a Mat4 bone matrix to a dual quaternion.
+    /// Extracts rotation and translation; non-uniform scale is NOT supported.
+    pub fn from_mat4(m: Mat4) -> Self {
+        let (_scale, rotation, translation) = m.to_scale_rotation_translation();
+        let r = rotation;
+        // Dual part = 0.5 * translation_quat * rotation
+        // where translation_quat = Quat(tx, ty, tz, 0)
+        let t = Quat::from_xyzw(translation.x, translation.y, translation.z, 0.0);
+        let d = t * r * 0.5;
+        Self {
+            real: [r.x, r.y, r.z, r.w],
+            dual: [d.x, d.y, d.z, d.w],
+        }
+    }
+}
 
 /// Negate `from` if needed so that slerp takes the shortest arc.
 fn ensure_shortest_path(from: Quat, to: Quat) -> Quat {
@@ -92,6 +124,10 @@ pub struct AnimationChannel {
     pub scaling_keys: Vec<ScalingKey>,
     pub mesh_keys: Vec<MeshKey>,
     pub morph_keys: Vec<MorphKey>,
+    // Pre-computed time arrays to avoid per-frame heap allocation
+    pub position_times: Vec<f32>,
+    pub rotation_times: Vec<f32>,
+    pub scaling_times: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +136,8 @@ pub struct AnimationData {
     pub duration: f32,
     pub ticks_per_second: f32,
     pub channels: Vec<AnimationChannel>,
+    /// Pre-built lookup: node_index → [channel indices]. Avoids O(N×M) scan per frame.
+    pub node_channel_map: Vec<Vec<usize>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +190,10 @@ pub struct AnimationManager {
     active_animations: Vec<bool>,
     states: Vec<AnimationState>,
     pub node_matrices: Vec<Mat4>,
+    /// Dual quaternion representation of node_matrices, for GPU upload.
+    pub node_dual_quats: Vec<DualQuat>,
+    /// Set to true when node_matrices change; cleared by the renderer after upload.
+    pub matrices_dirty: bool,
 }
 
 impl AnimationManager {
@@ -175,6 +217,8 @@ impl AnimationManager {
             active_animations: vec![false; anim_count],
             states,
             node_matrices: vec![Mat4::IDENTITY; node_count],
+            node_dual_quats: vec![DualQuat::IDENTITY; node_count],
+            matrices_dirty: true,
         }
     }
 
@@ -233,7 +277,21 @@ impl AnimationManager {
     }
 
     pub fn update(&mut self, model: &ModelData, delta_seconds: f32) {
+        self.matrices_dirty = false;
+
+        // Check if any animation is active and not paused
+        let any_active = self.active_animations.iter().enumerate().any(|(i, &active)| {
+            active && !self.states[i].flags.contains(AnimationStateFlags::PAUSED)
+        });
+
+        if !any_active {
+            return;
+        }
+
         for animation_index in 0..model.animations.len() {
+            if !self.active_animations[animation_index] {
+                continue;
+            }
             self.update_animation(model, animation_index, delta_seconds);
         }
 
@@ -242,8 +300,10 @@ impl AnimationManager {
         }
 
         if let Some(root) = model.get_root_node() {
-            self.compute_node_matrices(model, root, Mat4::IDENTITY);
+            self.compute_node_matrices(model, root, model.root_inverse_transform);
         }
+
+        self.matrices_dirty = true;
     }
 
     // --- Private methods ---
@@ -311,22 +371,22 @@ impl AnimationManager {
             let mut total_rotation = Quat::IDENTITY;
             let mut total_scale = Vec3::ONE;
 
-            for channel in &animation.channels {
-                if channel.channel_type != AnimationChannelType::Node {
-                    continue;
-                }
+            // Use pre-built lookup instead of scanning all channels
+            let channel_indices = if node_index < animation.node_channel_map.len() {
+                &animation.node_channel_map[node_index]
+            } else {
+                &[][..]
+            };
 
-                if channel.target_index != node_index as i32 {
-                    continue;
-                }
+            for &ch_idx in channel_indices {
+                let channel = &animation.channels[ch_idx];
 
                 // Position keys
                 if channel.position_keys.len() == 1 {
                     total_position = channel.position_keys[0].position;
                     animation_count += 1;
                 } else if !channel.position_keys.is_empty() {
-                    let times: Vec<f32> = channel.position_keys.iter().map(|k| k.time).collect();
-                    let (i, next_i, factor) = find_keyframe_pair(&times, state.time);
+                    let (i, next_i, factor) = find_keyframe_pair(&channel.position_times, state.time);
                     total_position = channel.position_keys[i].position
                         .lerp(channel.position_keys[next_i].position, factor);
                     animation_count += 1;
@@ -337,8 +397,7 @@ impl AnimationManager {
                     total_rotation = channel.rotation_keys[0].rotation;
                     animation_count += 1;
                 } else if !channel.rotation_keys.is_empty() {
-                    let times: Vec<f32> = channel.rotation_keys.iter().map(|k| k.time).collect();
-                    let (i, next_i, factor) = find_keyframe_pair(&times, state.time);
+                    let (i, next_i, factor) = find_keyframe_pair(&channel.rotation_times, state.time);
                     let from = ensure_shortest_path(
                         channel.rotation_keys[i].rotation,
                         channel.rotation_keys[next_i].rotation,
@@ -352,8 +411,7 @@ impl AnimationManager {
                     total_scale = channel.scaling_keys[0].scaling;
                     animation_count += 1;
                 } else if !channel.scaling_keys.is_empty() {
-                    let times: Vec<f32> = channel.scaling_keys.iter().map(|k| k.time).collect();
-                    let (i, next_i, factor) = find_keyframe_pair(&times, state.time);
+                    let (i, next_i, factor) = find_keyframe_pair(&channel.scaling_times, state.time);
                     total_scale = channel.scaling_keys[i].scaling
                         .lerp(channel.scaling_keys[next_i].scaling, factor);
                     animation_count += 1;

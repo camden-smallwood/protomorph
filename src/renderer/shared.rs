@@ -11,7 +11,7 @@ use crate::{
         GpuModel, MAX_OBJECTS,
         bloom::BLOOM_MIP_COUNT,
         create_1x1_texture, create_screen_texture,
-        env_probe::{GpuAtmosphereData, GpuSkyParams},
+        env_probe::{GpuAtmosphereData, GpuEnvProbeData, GpuSHCoefficients, GpuSkyParams},
         sampler_entry, tex_entry, uniform_entry,
     },
 };
@@ -67,6 +67,7 @@ pub struct GBuffer {
     pub normal_view: wgpu::TextureView,
     pub albedo_specular_view: wgpu::TextureView,
     pub material_view: wgpu::TextureView,
+    pub emissive_view: wgpu::TextureView,
     pub depth_view: wgpu::TextureView,
 }
 
@@ -82,7 +83,8 @@ impl GBuffer {
             "gb_albedo_spec",
         );
 
-        let material = create_screen_texture(device, w, h, wgpu::TextureFormat::Rgba16Float, "gb_material");
+        let material = create_screen_texture(device, w, h, wgpu::TextureFormat::Rgba8Unorm, "gb_material");
+        let emissive = create_screen_texture(device, w, h, wgpu::TextureFormat::Rg11b10Ufloat, "gb_emissive");
 
         let depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gb_depth"),
@@ -95,7 +97,7 @@ impl GBuffer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
@@ -105,6 +107,7 @@ impl GBuffer {
             normal_view: dv(&normal),
             albedo_specular_view: dv(&albedo_specular),
             material_view: dv(&material),
+            emissive_view: dv(&emissive),
             depth_view: dv(&depth),
         }
     }
@@ -116,12 +119,18 @@ impl GBuffer {
 
 pub struct IntermediateTargets {
     pub ssao_view: wgpu::TextureView,
-    pub ssao_blur_view: wgpu::TextureView,
     pub lighting_base_view: wgpu::TextureView,
     pub god_rays_view: wgpu::TextureView,
     pub bloom_mip_views: Vec<wgpu::TextureView>,
     pub bloom_mip_sizes: Vec<(u32, u32)>,
     pub post_composite_view: wgpu::TextureView,
+    pub water_copy_view: wgpu::TextureView,
+    pub water_copy_texture: wgpu::Texture,
+    pub lighting_base_texture: wgpu::Texture,
+    // Cloud intermediate targets
+    pub cloud_raymarch_view: wgpu::TextureView,
+    pub cloud_history_views: [wgpu::TextureView; 2],
+    pub cloud_quarter_size: (u32, u32),
 }
 
 impl IntermediateTargets {
@@ -135,16 +144,8 @@ impl IntermediateTargets {
             device,
             (w / 2).max(1),
             (h / 2).max(1),
-            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Rgba8Unorm,
             "ssao",
-        );
-
-        let ssao_blur = create_screen_texture(
-            device,
-            (w / 2).max(1),
-            (h / 2).max(1),
-            wgpu::TextureFormat::Rgba16Float,
-            "ssao_blur",
         );
 
         let lighting_base = create_screen_texture(
@@ -181,7 +182,7 @@ impl IntermediateTargets {
                 device,
                 mip_w,
                 mip_h,
-                wgpu::TextureFormat::Rgba16Float,
+                wgpu::TextureFormat::Rg11b10Ufloat,
                 &format!("bloom_mip_{i}"),
             );
 
@@ -192,16 +193,56 @@ impl IntermediateTargets {
             mip_h = (mip_h / 2).max(1);
         }
 
+        let water_copy = create_screen_texture(
+            device,
+            w,
+            h,
+            wgpu::TextureFormat::Rg11b10Ufloat,
+            "water_copy",
+        );
+
+        // Cloud targets: quarter-res raymarch output + two full-res history for temporal ping-pong
+        let qw = (w / 4).max(1);
+        let qh = (h / 4).max(1);
+        let cloud_raymarch = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cloud_raymarch"),
+            size: wgpu::Extent3d { width: qw, height: qh, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let cloud_history_textures: [wgpu::Texture; 2] = std::array::from_fn(|i| {
+            create_screen_texture(
+                device,
+                w,
+                h,
+                wgpu::TextureFormat::Rgba16Float,
+                &format!("cloud_history_{i}"),
+            )
+        });
+
         let dv = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let cloud_history_views =
+            [dv(&cloud_history_textures[0]), dv(&cloud_history_textures[1])];
 
         Self {
             ssao_view: dv(&ssao),
-            ssao_blur_view: dv(&ssao_blur),
             lighting_base_view: dv(&lighting_base),
             god_rays_view: dv(&god_rays),
             bloom_mip_views,
             bloom_mip_sizes,
             post_composite_view: dv(&post_composite),
+            water_copy_view: dv(&water_copy),
+            water_copy_texture: water_copy,
+            lighting_base_texture: lighting_base,
+            cloud_raymarch_view: dv(&cloud_raymarch),
+            cloud_history_views,
+            cloud_quarter_size: (qw, qh),
         }
     }
 }
@@ -226,6 +267,8 @@ pub struct FrameContext<'a> {
     pub models: &'a [GpuModel],
     pub render_list: &'a [(ObjectIndex, usize)],
     pub game: &'a GameState,
+    pub frame_index: u32,
+    pub prev_view_projection: glam::Mat4,
 }
 
 pub trait RenderPass {
@@ -286,8 +329,14 @@ pub struct SharedResources {
     pub lighting_buffer: wgpu::Buffer,
     pub atmosphere_buffer: wgpu::Buffer,
     pub sky_params_buffer: wgpu::Buffer,
-    pub lighting_uniforms_bgl: wgpu::BindGroupLayout,
-    pub lighting_uniforms_bind_group: wgpu::BindGroup,
+
+    // Env probe data (buffers owned here, written by EnvProbePass each frame)
+    pub env_probe_buffer: wgpu::Buffer,
+    pub sh_buffer: wgpu::Buffer,
+
+    // Shadow uniform data (owned here, written by ShadowPass each frame)
+    pub shadow_uniform_buffer: wgpu::Buffer,
+
 
     // Material BGL
     pub material_bgl: wgpu::BindGroupLayout,
@@ -373,8 +422,6 @@ impl SharedResources {
         let model_bgl = Self::create_model_bgl(&device);
         let material_bgl = Self::create_material_bgl(&device);
         let node_matrices_bgl = Self::create_node_matrices_bgl(&device);
-        let lighting_uniforms_bgl = Self::create_lighting_uniforms_bgl(&device);
-
         // --- Uniform buffers ---
         let min_alignment = device.limits().min_uniform_buffer_offset_alignment as usize;
         let min_storage_alignment = device.limits().min_storage_buffer_offset_alignment as usize;
@@ -428,6 +475,27 @@ impl SharedResources {
             mapped_at_creation: false,
         });
 
+        let env_probe_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("env_probe_buffer"),
+            size: size_of::<GpuEnvProbeData>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let sh_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sh_coefficients_buffer"),
+            size: size_of::<GpuSHCoefficients>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let shadow_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow_uniform_buffer"),
+            size: size_of::<crate::renderer::shadow::GpuShadowData>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // --- Bind groups ---
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("camera_bg"),
@@ -461,25 +529,6 @@ impl SharedResources {
                 }),
             }],
         });
-        let lighting_uniforms_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lighting_uniforms_bg"),
-            layout: &lighting_uniforms_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: lighting_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: atmosphere_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: sky_params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
         Self {
             device,
             queue,
@@ -503,8 +552,9 @@ impl SharedResources {
             lighting_buffer,
             atmosphere_buffer,
             sky_params_buffer,
-            lighting_uniforms_bgl,
-            lighting_uniforms_bind_group,
+            env_probe_buffer,
+            sh_buffer,
+            shadow_uniform_buffer,
             material_bgl,
             fallback_textures,
         }
@@ -576,29 +626,4 @@ impl SharedResources {
         })
     }
 
-    fn create_lighting_uniforms_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("lighting_uniforms_bgl"),
-            entries: &[
-                uniform_entry(
-                    0,
-                    size_of::<GpuLightingUniforms>() as u64,
-                    wgpu::ShaderStages::FRAGMENT,
-                    false,
-                ),
-                uniform_entry(
-                    1,
-                    size_of::<GpuAtmosphereData>() as u64,
-                    wgpu::ShaderStages::FRAGMENT,
-                    false,
-                ),
-                uniform_entry(
-                    2,
-                    size_of::<GpuSkyParams>() as u64,
-                    wgpu::ShaderStages::FRAGMENT,
-                    false,
-                ),
-            ],
-        })
-    }
 }

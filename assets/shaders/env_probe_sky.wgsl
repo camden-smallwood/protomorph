@@ -1,5 +1,5 @@
 // Procedural atmospheric sky for env probe cubemap faces.
-// Same scattering logic as sky.wgsl but fills every pixel (no G-buffer discard).
+// Same scattering logic as the merged sky in lighting.wgsl.
 
 struct SkyParams {
     inverse_view_projection: mat4x4<f32>,
@@ -19,7 +19,17 @@ struct AtmosphereData {
     max_fog_thickness: f32,
     inscatter_scale: f32,
     reference_height: f32,
-    _pad: vec2<f32>,
+    sun_luminance: f32,
+    sun_angular_radius: f32,
+    sun_edge_softness: f32,
+    sun_disc_intensity: f32,
+    sun_inner_glow_intensity: f32,
+    sun_air_mass_scale: f32,
+    sun_tint: vec3<f32>,
+    zenith_air_mass_factor: f32,
+    horizon_fade_start: f32,
+    horizon_fade_end: f32,
+    _pad2: vec2<f32>,
 };
 @group(0) @binding(1) var<uniform> atmosphere: AtmosphereData;
 
@@ -43,10 +53,6 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 const PI: f32 = 3.14159265;
 
-const SUN_ANGULAR_RADIUS: f32 = 0.00935;
-const SUN_EDGE_SOFTNESS: f32 = 0.00015;
-const SUN_INTENSITY: f32 = 50.0;
-
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.tex_coords;
@@ -60,46 +66,65 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sun_dir = select(vec3<f32>(0.0, 0.0, 1.0), atmosphere.sun_direction / sun_dir_len, sun_dir_len > 0.0001);
 
     let h_cam = max(sky.camera_position.z - atmosphere.reference_height, 0.0);
-    let sin_elev = max(ray_dir.z, 0.02);
-    let air_mass = 1.0 / sin_elev;
-
     let rayleigh_density_at_cam = exp(-h_cam / atmosphere.rayleigh_height_scale);
     let mie_density_at_cam = exp(-h_cam / atmosphere.mie_height_scale);
-    let rayleigh_depth = rayleigh_density_at_cam * atmosphere.rayleigh_height_scale * air_mass;
-    let mie_depth = mie_density_at_cam * atmosphere.mie_height_scale * air_mass;
 
-    // Extinction (Beer's law)
+    // View ray air mass
+    let sin_elev = max(ray_dir.z, 0.02);
+    let view_air_mass = 1.0 / sin_elev;
+
+    let rayleigh_depth = rayleigh_density_at_cam * atmosphere.rayleigh_height_scale * view_air_mass;
+    let mie_depth = mie_density_at_cam * atmosphere.mie_height_scale * view_air_mass;
+
+    // View extinction
     let extinction = exp(-(atmosphere.rayleigh_coefficients * rayleigh_depth
                          + vec3(atmosphere.mie_coefficient) * mie_depth));
 
+    // Sun extinction — atmospheric filtering of sunlight before it scatters into view.
+    // View-dependent: horizon scatter points get full filtering (warm sunset),
+    // zenith scatter points get reduced filtering (preserves blue sky above).
+    let sun_sin_elev = max(sun_dir.z, 0.01);
+    let base_sun_air_mass = atmosphere.sun_air_mass_scale / sun_sin_elev;
+    let zenith_lerp = smoothstep(0.0, 0.5, max(ray_dir.z, 0.0));
+    let sun_air_mass = base_sun_air_mass * mix(1.0, atmosphere.zenith_air_mass_factor, zenith_lerp);
+
+    let sun_rayleigh_depth = rayleigh_density_at_cam * atmosphere.rayleigh_height_scale * sun_air_mass;
+    let sun_mie_depth = mie_density_at_cam * atmosphere.mie_height_scale * sun_air_mass;
+    let sun_extinction = exp(-(atmosphere.rayleigh_coefficients * sun_rayleigh_depth
+                             + vec3(atmosphere.mie_coefficient) * sun_mie_depth));
+
     // Phase functions
     let cos_theta = dot(ray_dir, sun_dir);
-
-    // Rayleigh: (3/16π)(1 + cos²θ)
     let rayleigh_phase = 0.05968 * (1.0 + cos_theta * cos_theta);
 
-    // Mie: Henyey-Greenstein
     let g = atmosphere.mie_g;
     let g2 = g * g;
     let mie_base = max(1.0 + g2 - 2.0 * g * cos_theta, 0.00001);
     let mie_phase = 0.07958 * (1.0 - g2) / pow(mie_base, 1.5);
 
-    // Inscatter
+    // Inscatter — modulated by sun_extinction (warm sky at low sun angles)
     let scatter = vec3(1.0) - extinction;
-    let sun_luminance = 20.0;
     var sky_color = (atmosphere.rayleigh_coefficients * rayleigh_phase
                    + vec3(atmosphere.mie_coefficient) * mie_phase)
-                   * scatter * atmosphere.inscatter_scale * sun_luminance;
+                   * scatter * sun_extinction * atmosphere.inscatter_scale * atmosphere.sun_luminance;
 
-    // Sun disk
+    // Sun disc with limb darkening + glow layers
     let sun_cos_angle = dot(ray_dir, sun_dir);
-    let sun_edge = smoothstep(cos(SUN_ANGULAR_RADIUS + SUN_EDGE_SOFTNESS),
-                              cos(SUN_ANGULAR_RADIUS - SUN_EDGE_SOFTNESS),
-                              sun_cos_angle);
-    sky_color += vec3<f32>(SUN_INTENSITY) * sun_edge;
+    let angular_dist = acos(clamp(sun_cos_angle, -1.0, 1.0));
+
+    let disc_mask = 1.0 - smoothstep(atmosphere.sun_angular_radius - atmosphere.sun_edge_softness,
+                                      atmosphere.sun_angular_radius + atmosphere.sun_edge_softness,
+                                      angular_dist);
+    let mu = saturate(1.0 - angular_dist / atmosphere.sun_angular_radius);
+    let limb_dark = 1.0 - 0.6 * (1.0 - sqrt(mu));
+    let sun_disc = disc_mask * limb_dark * atmosphere.sun_disc_intensity;
+
+    let glow_inner = pow(max(sun_cos_angle, 0.0), 256.0) * atmosphere.sun_inner_glow_intensity;
+
+    sky_color += (sun_disc + glow_inner) * atmosphere.sun_tint * sun_extinction * extinction;
 
     // Darken below horizon
-    let horizon_fade = smoothstep(-0.05, 0.0, ray_dir.z);
+    let horizon_fade = smoothstep(atmosphere.horizon_fade_start, atmosphere.horizon_fade_end, ray_dir.z);
     sky_color *= horizon_fade;
 
     // Sanitize output — env probe writes to Rgba16Float

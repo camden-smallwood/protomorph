@@ -1,12 +1,17 @@
 use crate::{
     animation::AnimationManager,
     camera::Camera,
+    collision::{
+        self, CollisionMesh, PlayerPhysics, build_collision_mesh,
+        EYE_HEIGHT, GRAVITY, GROUND_SNAP, JUMP_VELOCITY, PLAYER_RADIUS,
+    },
     lights::{LightData, LightIndex, LightStore},
     models::ModelData,
     objects::{ObjectIndex, ObjectStore},
     renderer::{Renderer, env_probe::GpuAtmosphereData},
+    sky::SkyConfig,
 };
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use std::collections::HashSet;
 use winit::keyboard::KeyCode;
 
@@ -48,18 +53,25 @@ pub struct GameState {
     pub camera: Camera,
     pub model_data: Vec<ModelData>,
     pub fps_counter: FpsCounter,
-    pub atmosphere: GpuAtmosphereData,
+    pub sky: SkyConfig,
 
     flashlight_index: LightIndex,
     weapon_index: ObjectIndex,
     grunt_index: ObjectIndex,
     weapon_model_index: usize,
+    weapon_idle_anim_idx: Option<usize>,
     weapon_moving_anim_idx: Option<usize>,
     rotation_towards_grunt: f32,
     pub weapon_detached: bool,
     pub debug_cubemap: bool,
     pub debug_cubemap_colors: bool,
     pub enable_specular_occlusion: bool,
+    pub enable_vignette: bool,
+    pub total_time: f32,
+    collision_mesh: CollisionMesh,
+    physics: PlayerPhysics,
+    pub flycam: bool,
+    is_moving: bool,
 }
 
 impl GameState {
@@ -96,60 +108,44 @@ impl GameState {
         // grunt_spot.casts_shadow = true;
         // lights.new_light(grunt_spot);
 
-        // More angled sun angle
-        let sun_dir = Vec3::new(-0.7, 0.4, -0.2).normalize();
+        let sky = SkyConfig::default();
 
-        // More overhead sun angle:
-        // let sun_dir = Vec3::new(-0.5, 0.3, -0.866).normalize();
-
-        // Warm sunset — low sun from front-left
+        // Sun light from sky config
         let mut sun = LightData::new_directional();
-        sun.direction = sun_dir;
-        sun.diffuse_color = Vec3::new(1.4, 0.7, 0.3);
-        sun.ambient_color = Vec3::new(0.12, 0.08, 0.06);
-        sun.specular_color = Vec3::new(1.4, 0.7, 0.3);
+        sun.direction = sky.sun_direction;
+        sun.diffuse_color = sky.sun_diffuse_color;
+        sun.ambient_color = sky.sun_ambient_color;
+        sun.specular_color = sky.sun_specular_color;
         sun.casts_shadow = true;
         lights.new_light(sun);
 
-        // // Noon summer sun
-        // let mut sun = LightData::new_directional();
-        // sun.direction = sun_dir;
-        // sun.diffuse_color = Vec3::new(1.0, 0.95, 0.8);
-        // sun.ambient_color = Vec3::new(0.15, 0.14, 0.12);
-        // sun.specular_color = Vec3::new(1.0, 0.95, 0.8);
-        // sun.casts_shadow = true;
-        // lights.new_light(sun);
-
-        let atmo_sun = -sun_dir; // direction TO the sun = negation of light travel
         let mut state = Self {
             objects: ObjectStore::new(),
             lights,
             camera,
             model_data: Vec::new(),
             fps_counter: FpsCounter::new(),
-            atmosphere: GpuAtmosphereData {
-                sun_direction: atmo_sun.to_array(),
-                atmosphere_enable: 1.0,
-                rayleigh_coefficients: [0.02, 0.05, 0.1],
-                rayleigh_height_scale: 20.0,
-                mie_coefficient: 0.01,
-                mie_height_scale: 8.0,
-                mie_g: 0.76,
-                max_fog_thickness: 50.0,
-                inscatter_scale: 1.0,
-                reference_height: 0.0,
-                _pad: [0.0; 2],
-            },
+            sky,
             flashlight_index,
             weapon_index: ObjectIndex(0),
             grunt_index: ObjectIndex(0),
             weapon_model_index: 0,
+            weapon_idle_anim_idx: None,
             weapon_moving_anim_idx: None,
             rotation_towards_grunt: 0.0,
             weapon_detached: false,
             debug_cubemap: false,
             debug_cubemap_colors: false,
             enable_specular_occlusion: true,
+            enable_vignette: true,
+            total_time: 0.0,
+            collision_mesh: CollisionMesh {
+                floor_triangles: Vec::new(),
+                wall_segments: Vec::new(),
+            },
+            physics: PlayerPhysics::new(),
+            flycam: false,
+            is_moving: false,
         };
 
         state.load_scene(renderer);
@@ -159,7 +155,8 @@ impl GameState {
     fn load_scene(&mut self, renderer: &mut Renderer) {
         let manifest = env!("CARGO_MANIFEST_DIR");
 
-        let (plane_model, plane_data) = renderer.load_model(&format!("{manifest}/assets/models/plane.fbx"));
+        // let (plane_model, plane_data) = renderer.load_model_with_uv_scale(&format!("{manifest}/assets/models/plane.fbx"), 10.0);
+        let (plane_model, plane_data) = renderer.load_model(&format!("{manifest}/assets/models/plane2.fbx"));
         self.model_data.push(plane_data);
 
         let (grunt_model, grunt_data) = renderer.load_model(&format!("{manifest}/assets/models/grunt.fbx"));
@@ -171,7 +168,12 @@ impl GameState {
 
         // Plane
         let plane = self.objects.new_object();
+        // self.objects.get_mut(plane).scale = Vec3::splat(10.0);
         self.objects.get_mut(plane).model_index = Some(plane_model);
+
+        // Build collision mesh from plane geometry
+        let model_matrix = self.objects.get(plane).model_matrix();
+        self.collision_mesh = build_collision_mesh(&self.model_data[plane_model], model_matrix);
 
         // Grunt
         let grunt = self.objects.new_object();
@@ -191,6 +193,13 @@ impl GameState {
         self.objects.get_mut(weapon).model_index = Some(weapon_model);
         self.init_animations(weapon, weapon_model);
         self.weapon_index = weapon;
+
+        // Set "first_person idle" to looping (but not active) and cache the index
+        if let Some(idle_idx) = self.model_data[weapon_model].find_animation_by_name("first_person idle") {
+            let anim = self.objects.get_mut(weapon).animations.as_mut().unwrap();
+            anim.set_looping(idle_idx, true);
+            self.weapon_idle_anim_idx = Some(idle_idx);
+        }
 
         // Set "first_person moving" to looping (but not active) and cache the index
         if let Some(moving_idx) = self.model_data[weapon_model].find_animation_by_name("first_person moving") {
@@ -224,6 +233,7 @@ impl GameState {
         self.update_weapon_animations();
         self.objects.update(&self.model_data, dt);
         self.fps_counter.update(dt);
+        self.total_time += dt;
     }
 
     pub fn toggle_debug_cubemap(&mut self) {
@@ -234,9 +244,18 @@ impl GameState {
         self.debug_cubemap_colors = !self.debug_cubemap_colors;
     }
 
+    pub fn atmosphere_data(&self) -> GpuAtmosphereData {
+        GpuAtmosphereData::from_sky_config(&self.sky)
+    }
+
     pub fn toggle_specular_occlusion(&mut self) {
         self.enable_specular_occlusion = !self.enable_specular_occlusion;
     }
+
+    pub fn toggle_vignette(&mut self) {
+        self.enable_vignette = !self.enable_vignette;
+    }
+
 
     pub fn is_grunt_animation_paused(&self) -> bool {
         self.objects.get(self.grunt_index).animations.as_ref()
@@ -254,6 +273,19 @@ impl GameState {
         self.weapon_detached = !self.weapon_detached;
     }
 
+    pub fn toggle_flycam(&mut self) {
+        self.flycam = !self.flycam;
+        if !self.flycam {
+            // Re-entering player mode: reset vertical velocity
+            self.physics.vertical_velocity = 0.0;
+            self.physics.is_grounded = false;
+        }
+    }
+
+    pub fn is_flycam(&self) -> bool {
+        self.flycam
+    }
+
     pub fn toggle_flashlight(&mut self) {
         let light = self.lights.get_mut(self.flashlight_index);
         light.hidden = !light.hidden;
@@ -264,9 +296,22 @@ impl GameState {
     }
 
     pub fn trigger_weapon_animation(&mut self, name: &str) {
+        let animations = self.objects.get_mut(self.weapon_index).animations.as_mut().unwrap();
+        
+        if let Some(idle_index) = self.weapon_idle_anim_idx
+            && animations.is_active(idle_index)
+        {
+            animations.set_active(idle_index, false);
+        }
+        
+        if let Some(moving_index) = self.weapon_moving_anim_idx
+            && animations.is_active(moving_index)
+        {
+            animations.set_active(moving_index, false);
+        }
+        
         if let Some(idx) = self.model_data[self.weapon_model_index].find_animation_by_name(name) {
-            let anim = self.objects.get_mut(self.weapon_index).animations.as_mut().unwrap();
-            anim.set_active(idx, true);
+            animations.set_active(idx, true);
         }
     }
 
@@ -281,6 +326,14 @@ impl GameState {
     }
 
     fn update_movement(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
+        if self.flycam {
+            self.update_movement_flycam(keys, dt);
+        } else {
+            self.update_movement_player(keys, dt);
+        }
+    }
+
+    fn update_movement_flycam(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
         let mut move_dir = Vec3::ZERO;
         if keys.contains(&KeyCode::KeyW) { move_dir += self.camera.forward; }
         if keys.contains(&KeyCode::KeyS) { move_dir -= self.camera.forward; }
@@ -298,7 +351,75 @@ impl GameState {
             speed *= 2.0;
         }
 
+        self.is_moving = move_dir.length_squared() > 0.0;
         self.camera.velocity = move_dir * speed * dt;
+        self.camera.update();
+    }
+
+    fn update_movement_player(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
+        // Horizontal input — project forward/right onto XY plane
+        let forward_xy = Vec2::new(self.camera.forward.x, self.camera.forward.y).normalize_or_zero();
+        let right_xy = Vec2::new(self.camera.right.x, self.camera.right.y).normalize_or_zero();
+
+        let mut move_dir = Vec2::ZERO;
+        if keys.contains(&KeyCode::KeyW) { move_dir += forward_xy; }
+        if keys.contains(&KeyCode::KeyS) { move_dir -= forward_xy; }
+        if keys.contains(&KeyCode::KeyA) { move_dir += right_xy; }
+        if keys.contains(&KeyCode::KeyD) { move_dir -= right_xy; }
+        self.is_moving = move_dir.length_squared() > 0.0;
+        if self.is_moving {
+            move_dir = move_dir.normalize();
+        }
+
+        let mut speed = MOVEMENT_SPEED;
+        if keys.contains(&KeyCode::ShiftLeft) || keys.contains(&KeyCode::ShiftRight) {
+            speed *= 2.0;
+        }
+
+        // Apply horizontal movement + wall collision
+        let new_xy = self.camera.position.truncate() + move_dir * speed * dt;
+        let feet_z = self.camera.position.z - EYE_HEIGHT;
+        let resolved_xy = collision::collide_and_slide(
+            new_xy,
+            feet_z,
+            &self.collision_mesh.wall_segments,
+            PLAYER_RADIUS,
+        );
+        self.camera.position.x = resolved_xy.x;
+        self.camera.position.y = resolved_xy.y;
+
+        // Jump
+        if keys.contains(&KeyCode::Space) && self.physics.is_grounded {
+            self.physics.vertical_velocity = JUMP_VELOCITY;
+            self.physics.is_grounded = false;
+        }
+
+        // Gravity
+        if !self.physics.is_grounded {
+            self.physics.vertical_velocity -= GRAVITY * dt;
+        }
+
+        // Apply vertical movement
+        self.camera.position.z += self.physics.vertical_velocity * dt;
+
+        // Ground check
+        if let Some(ground_z) = collision::ground_raycast(
+            self.camera.position,
+            &self.collision_mesh.floor_triangles,
+        ) {
+            let feet_z = self.camera.position.z - EYE_HEIGHT;
+            if feet_z <= ground_z + GROUND_SNAP && self.physics.vertical_velocity <= 0.0 {
+                self.camera.position.z = ground_z + EYE_HEIGHT;
+                self.physics.vertical_velocity = 0.0;
+                self.physics.is_grounded = true;
+            } else if feet_z > ground_z + GROUND_SNAP {
+                self.physics.is_grounded = false;
+            }
+        } else {
+            self.physics.is_grounded = false;
+        }
+
+        self.camera.velocity = Vec3::ZERO;
         self.camera.update();
     }
 
@@ -318,19 +439,46 @@ impl GameState {
     }
 
     fn update_weapon_animations(&mut self) {
-        let is_moving = self.camera.velocity.length_squared() > 0.0;
+        let object = self.objects.get_mut(self.weapon_index);
+        let animations = object.animations.as_mut().unwrap();
 
-        if let Some(moving_idx) = self.weapon_moving_anim_idx {
-            let anim = self.objects.get_mut(self.weapon_index).animations.as_mut().unwrap();
-            let was_active = anim.is_active(moving_idx);
+        for (index, animation) in self.model_data[self.weapon_model_index].animations.iter().enumerate() {
+            match animation.name.as_str() {
+                "first_person ready" | "first_person idle" | "first_person moving" => continue,
 
-            if !was_active && is_moving {
-                anim.set_active(moving_idx, true);
-            } else if was_active && !is_moving {
-                anim.set_active(moving_idx, false);
+                _ => {
+                    if animations.is_active(index) {
+                        return;
+                    }
+                }
+            }
+        }
+
+        match (self.weapon_idle_anim_idx, self.weapon_moving_anim_idx) {
+            (Some(idle_idx), Some(moving_idx)) => {
+                let was_moving_active = animations.is_active(moving_idx);
+                let was_idle_active = animations.is_active(idle_idx);
+
+                if self.is_moving {
+                    if was_idle_active {
+                        animations.set_active(idle_idx, false);
+                    }
+                    if !was_moving_active {
+                        animations.set_active(moving_idx, true);
+                    }
+                } else {
+                    if was_moving_active {
+                        animations.set_active(moving_idx, false);
+                    }
+                    if !was_idle_active {
+                        animations.set_active(idle_idx, true);
+                    }
+                }
+
+                animations.set_speed(moving_idx, if self.is_moving { 1.0 } else { 0.0 });
             }
 
-            anim.set_speed(moving_idx, if is_moving { 1.0 } else { 0.0 });
+            _ => todo!(),
         }
     }
 }

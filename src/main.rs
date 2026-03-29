@@ -9,6 +9,7 @@ use winit::{
 
 mod animation;
 mod camera;
+mod collision;
 mod dds;
 mod game;
 mod lights;
@@ -16,6 +17,7 @@ mod materials;
 mod models;
 mod objects;
 mod renderer;
+mod sky;
 
 use game::GameState;
 use renderer::Renderer;
@@ -90,6 +92,8 @@ impl ApplicationHandler for App {
                                 KeyCode::Digit3 => game.trigger_weapon_animation("first_person melee_strike_1"),
                                 KeyCode::KeyG => game.toggle_grunt_animation_pause(),
                                 KeyCode::KeyT => game.toggle_weapon_detach(),
+                                KeyCode::KeyV => game.toggle_vignette(),
+                                KeyCode::Tab => game.toggle_flycam(),
                                 _ => {}
                             }
                         }

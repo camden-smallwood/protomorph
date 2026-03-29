@@ -38,8 +38,10 @@ impl GodRaysTracePass {
     pub fn new(
         shared: &SharedResources,
         depth_view: &wgpu::TextureView,
+        cloud_view: &wgpu::TextureView,
     ) -> Self {
         let device = &shared.device;
+        let filterable = wgpu::TextureSampleType::Float { filterable: true };
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("god_ray_bgl"),
@@ -52,6 +54,8 @@ impl GodRaysTracePass {
                     wgpu::ShaderStages::FRAGMENT,
                     false,
                 ),
+                tex_entry(3, filterable),  // cloud buffer (quarter-res, A=transmittance)
+                sampler_entry(4, wgpu::SamplerBindingType::Filtering),
             ],
         });
         let pipeline = create_fullscreen_pipeline(
@@ -79,6 +83,8 @@ impl GodRaysTracePass {
             depth_view,
             &shared.nearest_sampler,
             &params_buffer,
+            cloud_view,
+            &shared.filtering_sampler,
         );
 
         Self {
@@ -95,23 +101,18 @@ impl GodRaysTracePass {
         depth_view: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
         params_buffer: &wgpu::Buffer,
+        cloud_view: &wgpu::TextureView,
+        cloud_sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("god_ray_bg"),
             layout,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buffer.as_entire_binding(),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(cloud_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(cloud_sampler) },
             ],
         })
     }
@@ -130,6 +131,8 @@ impl RenderPass for GodRaysTracePass {
             &gbuffer.depth_view,
             &shared.nearest_sampler,
             &self.params_buffer,
+            &_intermediates.cloud_raymarch_view,
+            &shared.filtering_sampler,
         );
     }
 
@@ -184,127 +187,6 @@ impl RenderPass for GodRaysTracePass {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("god_rays_pass"),
             color_attachments: &[Some(color_clear_attach(&ctx.intermediates.god_rays_view))],
-            depth_stencil_attachment: None,
-            ..Default::default()
-        });
-
-        rpass.set_pipeline(&self.pipeline);
-        rpass.set_bind_group(0, &self.bind_group, &[]);
-        rpass.set_vertex_buffer(0, ctx.shared.quad_vertex_buffer.slice(..));
-        rpass.draw(0..6, 0..1);
-    }
-}
-
-// ===========================================================================
-// God Rays Composite Pass
-// ===========================================================================
-
-pub struct GodRaysCompositePass {
-    pipeline: wgpu::RenderPipeline,
-    bgl: wgpu::BindGroupLayout,
-    bind_group: wgpu::BindGroup,
-}
-
-impl GodRaysCompositePass {
-    pub fn new(
-        shared: &SharedResources,
-        intermediates: &IntermediateTargets,
-    ) -> Self {
-        let device = &shared.device;
-
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("god_rays_composite_bgl"),
-            entries: &[
-                tex_entry(0, wgpu::TextureSampleType::Float { filterable: true }),
-                sampler_entry(1, wgpu::SamplerBindingType::Filtering),
-            ],
-        });
-        let pipeline = create_fullscreen_pipeline(
-            device,
-            wgpu::include_wgsl!("../../assets/shaders/god_rays_composite.wgsl"),
-            &[&bgl],
-            &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rg11b10Ufloat,
-                blend: Some(wgpu::BlendState {
-                    color: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::One,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    alpha: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::One,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                }),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            "god_rays_composite_pipeline",
-        );
-        let bind_group = Self::create_bind_group(
-            device,
-            &bgl,
-            &intermediates.god_rays_view,
-            &shared.bloom_sampler,
-        );
-
-        Self {
-            pipeline,
-            bgl,
-            bind_group,
-        }
-    }
-
-    fn create_bind_group(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        god_rays_view: &wgpu::TextureView,
-        filtering_sampler: &wgpu::Sampler,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("god_rays_composite_bg"),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(god_rays_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(filtering_sampler),
-                },
-            ],
-        })
-    }
-}
-
-impl RenderPass for GodRaysCompositePass {
-    fn resize(
-        &mut self,
-        shared: &SharedResources,
-        _gbuffer: &GBuffer,
-        intermediates: &IntermediateTargets,
-    ) {
-        self.bind_group = Self::create_bind_group(
-            &shared.device,
-            &self.bgl,
-            &intermediates.god_rays_view,
-            &shared.bloom_sampler,
-        );
-    }
-
-    fn record(&self, encoder: &mut wgpu::CommandEncoder, ctx: &FrameContext) {
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("god_rays_composite_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &ctx.intermediates.lighting_base_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
             depth_stencil_attachment: None,
             ..Default::default()
         });

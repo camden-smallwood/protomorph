@@ -32,6 +32,7 @@ pub enum MaterialTextureUsage {
     Unknown,
 }
 
+#[derive(Debug)]
 pub struct MaterialTexture {
     pub usage: MaterialTextureUsage,
     pub path: String,
@@ -41,6 +42,7 @@ pub struct MaterialTexture {
 // Material property types
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct MaterialBaseProperties {
     pub name: String,
     pub two_sided: bool,
@@ -79,6 +81,7 @@ impl Default for MaterialBaseProperties {
     }
 }
 
+#[derive(Debug)]
 pub struct MaterialPbrProperties {
     pub base_color: Vec3,
     pub metallic_factor: f32,
@@ -91,13 +94,13 @@ impl Default for MaterialPbrProperties {
         Self {
             base_color: Vec3::ONE,
             metallic_factor: 0.0,
-            roughness_factor: 0.0,
+            roughness_factor: 0.5,
             anisotropy_factor: 0.0,
         }
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct MaterialSpecularProperties {
     pub specular_factor: f32,
     pub glossiness_factor: f32,
@@ -112,6 +115,7 @@ impl MaterialSpecularProperties {
     }
 }
 
+#[derive(Debug)]
 pub struct MaterialEmissiveProperties {
     pub intensity: f32,
 }
@@ -122,6 +126,7 @@ impl Default for MaterialEmissiveProperties {
     }
 }
 
+#[derive(Debug)]
 pub struct MaterialSheenProperties {
     pub color_factor: f32,
     pub roughness_factor: f32,
@@ -136,6 +141,7 @@ impl Default for MaterialSheenProperties {
     }
 }
 
+#[derive(Debug)]
 pub struct MaterialClearcoatProperties {
     pub clearcoat_factor: f32,
     pub roughness_factor: f32,
@@ -150,6 +156,7 @@ impl Default for MaterialClearcoatProperties {
     }
 }
 
+#[derive(Debug)]
 pub struct MaterialTransmissionProperties {
     pub transmission_factor: f32,
 }
@@ -162,6 +169,7 @@ impl Default for MaterialTransmissionProperties {
     }
 }
 
+#[derive(Debug)]
 pub struct MaterialVolumeProperties {
     pub thickness_factor: f32,
     pub attenuation_distance: f32,
@@ -178,11 +186,12 @@ impl Default for MaterialVolumeProperties {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct MaterialAmbientOcclusionProperties {
     pub use_ao_texture: bool,
 }
 
+#[derive(Debug)]
 pub struct MaterialData {
     pub textures: Vec<MaterialTexture>,
     pub base: MaterialBaseProperties,
@@ -339,7 +348,7 @@ impl MaterialData {
             }
         }
 
-        Self {
+        let result = Self {
             textures,
             base,
             pbr,
@@ -351,7 +360,9 @@ impl MaterialData {
             volume,
             ambient_occlusion,
             has_transparency,
-        }
+        };
+
+        result
     }
 
     pub fn find_texture(&self, usage: MaterialTextureUsage) -> Option<&str> {
@@ -379,7 +390,8 @@ pub struct GpuMaterialProps {
     pub emissive_intensity: f32,
     pub roughness: f32,
     pub fresnel_f0: f32,
-    pub _pad: [f32; 2],
+    pub metallic: f32,
+    pub _pad: f32,
 }
 
 impl GpuMaterialProps {
@@ -390,7 +402,7 @@ impl GpuMaterialProps {
             ambient_color: mat.base.color_ambient.into(),
             ambient_amount: 0.1, // hardcoded, matching C render.c:472
             specular_color: mat.base.color_specular.into(),
-            specular_amount: mat.specular.specular_factor,
+            specular_amount: mat.base.shininess_strength,
             emissive_color: if mat.base.color_emissive == Vec3::ZERO
                 && mat.find_texture(MaterialTextureUsage::Emissive).is_some()
             {
@@ -400,25 +412,17 @@ impl GpuMaterialProps {
             },
             emissive_intensity: mat.emissive.intensity,
             roughness: {
-                if mat.pbr.roughness_factor > 0.0 {
-                    // PBR workflow (glTF, USDZ) — direct [0,1] roughness
-                    mat.pbr.roughness_factor
-                } else if mat.base.shininess > 1.0 {
-                    // Legacy Blinn-Phong — Beckmann NDF mapping
+                if mat.base.shininess >= 1.0 {
+                    // Beckmann NDF mapping from Blinn-Phong shininess
                     (2.0 / (mat.base.shininess + 2.0)).sqrt()
                 } else {
-                    0.5
+                    0.8 // shininess < 1 = very rough
                 }
             },
-            fresnel_f0: {
-                if mat.pbr.metallic_factor > 0.0 {
-                    // Metallic workflow — blend dielectric (0.04) to conductor (0.5)
-                    0.04 + mat.pbr.metallic_factor * 0.46
-                } else {
-                    0.15
-                }
-            },
-            _pad: [0.0; 2],
+            // Dielectric F0 scaled by reflectivity (env reflection amount)
+            fresnel_f0: 0.04 * mat.base.reflectivity,
+            metallic: 0.0,
+            _pad: 0.0,
         }
     }
 }

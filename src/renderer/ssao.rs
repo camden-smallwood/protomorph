@@ -49,7 +49,7 @@ impl SsaoPass {
             &shared.device,
             wgpu::include_wgsl!("../../assets/shaders/ssao.wgsl"),
             &[&bgl],
-            &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })],
             "ssao_pipeline",
         );
 

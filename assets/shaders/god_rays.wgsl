@@ -16,6 +16,8 @@ struct GodRayParams {
 @group(0) @binding(0) var t_depth: texture_depth_2d;
 @group(0) @binding(1) var s_nearest: sampler;
 @group(0) @binding(2) var<uniform> params: GodRayParams;
+@group(0) @binding(3) var t_cloud: texture_2d<f32>;    // cloud buffer (A = transmittance)
+@group(0) @binding(4) var s_cloud: sampler;             // filtering sampler for quarter-res
 
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -49,7 +51,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4(0.0);
     }
 
-    let num_samples = i32(params.num_samples);
+    let num_samples = min(i32(params.num_samples), 16);
     let delta_uv = to_sun * params.density / f32(num_samples);
 
     var uv = in.tex_coords;
@@ -65,8 +67,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Sample depth buffer — sky pixels have depth==0.0 (reverse-Z clears to 0.0)
         let sample_depth = textureSample(t_depth, s_nearest, clamped_uv);
 
-        // Sky (depth<=0.0) contributes light, geometry occludes — branchless
-        color += step(sample_depth, 0.001) * params.weight * illumination_decay;
+        // Sky contributes light, geometry and clouds occlude
+        let is_sky = step(sample_depth, 0.001);
+        let cloud_t = textureSample(t_cloud, s_cloud, clamped_uv).a; // cloud transmittance
+        color += is_sky * cloud_t * params.weight * illumination_decay;
         illumination_decay *= params.decay;
     }
 

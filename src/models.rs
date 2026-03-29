@@ -5,9 +5,13 @@ use crate::{
     },
     materials::MaterialData,
 };
-use asset_importer::{Scene, mesh::Mesh, node::Node, postprocess::PostProcessSteps};
+use asset_importer::{
+    Scene, mesh::Mesh, node::Node, postprocess::PostProcessSteps,
+    importer::{PropertyStore, import_properties},
+};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
+use half::f16;
 use std::{collections::HashMap, path::Path};
 
 #[repr(C)]
@@ -20,70 +24,91 @@ pub struct ModelUniforms {
 // Vertex types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VertexType {
-    Rigid,
-    Skinned,
-}
-
+/// Compressed vertex: 32 bytes (down from 92).
+/// Normal: oct-encoded Snorm8x2. Texcoord: Float16x2. Tangent: Snorm8x4 (xyz + w handedness).
+/// Bitangent: reconstructed in shader as cross(normal, tangent.xyz) * sign(tangent.w).
+/// Bone indices: Uint8x4. Bone weights: Unorm8x4.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-pub struct VertexRigid {
-    pub position: [f32; 3],
-    pub normal: [f32; 3],
-    pub texcoord: [f32; 2],
-    pub tangent: [f32; 3],
-    pub bitangent: [f32; 3],
+pub struct ModelVertex {
+    pub position: [f32; 3],    // 12 bytes, offset 0
+    pub texcoord: [u16; 2],    // 4 bytes, offset 12 (Float16x2, raw bits)
+    pub normal: [i8; 2],       // 2 bytes, offset 16 (Snorm8x2, oct-encoded)
+    pub _pad: [u8; 2],        // 2 bytes, offset 18 (alignment padding)
+    pub tangent: [i8; 4],      // 4 bytes, offset 20 (Snorm8x4, xyz + w sign)
+    pub node_indices: [u8; 4], // 4 bytes, offset 24 (Uint8x4)
+    pub node_weights: [u8; 4], // 4 bytes, offset 28 (Unorm8x4)
 }
 
-impl VertexRigid {
-    const ATTRIBS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
-        0 => Float32x3,  // position
-        1 => Float32x3,  // normal
-        2 => Float32x2,  // texcoord
-        3 => Float32x3,  // tangent
-        4 => Float32x3,  // bitangent
+impl ModelVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 6] = [
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3,  offset: 0,  shader_location: 0 }, // position
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Snorm8x2,   offset: 16, shader_location: 1 }, // normal (oct)
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float16x2,  offset: 12, shader_location: 2 }, // texcoord
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Snorm8x4,   offset: 20, shader_location: 3 }, // tangent (xyz+w)
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint8x4,    offset: 24, shader_location: 4 }, // node_indices
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Unorm8x4,   offset: 28, shader_location: 5 }, // node_weights
     ];
 
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
-            array_stride: size_of::<VertexRigid>() as wgpu::BufferAddress,
+            array_stride: size_of::<ModelVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &Self::ATTRIBS,
         }
     }
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-pub struct VertexSkinned {
-    pub position: [f32; 3],
-    pub normal: [f32; 3],
-    pub texcoord: [f32; 2],
-    pub tangent: [f32; 3],
-    pub bitangent: [f32; 3],
-    pub node_indices: [u32; 4],
-    pub node_weights: [f32; 4],
+// ---------------------------------------------------------------------------
+// Vertex packing helpers
+// ---------------------------------------------------------------------------
+
+/// Octahedral encode: unit vec3 → [i8; 2] (Snorm8)
+fn oct_encode_snorm8(n: Vec3) -> [i8; 2] {
+    let n = n.normalize();
+    let sum = n.x.abs() + n.y.abs() + n.z.abs();
+    let mut p = [n.x / sum, n.y / sum];
+    if n.z < 0.0 {
+        let px = p[0];
+        let py = p[1];
+        p[0] = (1.0 - py.abs()) * px.signum();
+        p[1] = (1.0 - px.abs()) * py.signum();
+    }
+    [
+        (p[0].clamp(-1.0, 1.0) * 127.0).round() as i8,
+        (p[1].clamp(-1.0, 1.0) * 127.0).round() as i8,
+    ]
 }
 
-impl VertexSkinned {
-    const ATTRIBS: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
-        0 => Float32x3,  // position
-        1 => Float32x3,  // normal
-        2 => Float32x2,  // texcoord
-        3 => Float32x3,  // tangent
-        4 => Float32x3,  // bitangent
-        5 => Uint32x4,   // node_indices
-        6 => Float32x4,  // node_weights
-    ];
+/// Pack tangent xyz + bitangent handedness sign into [i8; 4]
+fn pack_tangent_with_sign(tangent: Vec3, normal: Vec3, bitangent: Vec3) -> [i8; 4] {
+    let t = tangent.normalize_or_zero();
+    let sign = normal.cross(t).dot(bitangent);
+    [
+        (t.x.clamp(-1.0, 1.0) * 127.0).round() as i8,
+        (t.y.clamp(-1.0, 1.0) * 127.0).round() as i8,
+        (t.z.clamp(-1.0, 1.0) * 127.0).round() as i8,
+        if sign >= 0.0 { 127i8 } else { -127i8 },
+    ]
+}
 
-    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: size_of::<VertexSkinned>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &Self::ATTRIBS,
-        }
+/// Pack bone weights to Unorm8, normalized so they sum to 255
+fn pack_weights_unorm8(weights: [f32; 4]) -> [u8; 4] {
+    let sum: f32 = weights.iter().sum();
+    if sum < 0.0001 {
+        return [0; 4];
     }
+    let normalized = weights.map(|w| w / sum);
+    let mut packed: [u8; 4] = normalized.map(|w| (w * 255.0).round() as u8);
+    // Fix rounding error so they sum to 255
+    let packed_sum: u16 = packed.iter().map(|&b| b as u16).sum();
+    if packed_sum > 0 && packed_sum != 255 {
+        let diff = 255i16 - packed_sum as i16;
+        // Apply correction to largest weight
+        let max_idx = packed.iter().enumerate().max_by_key(|&(_, &v)| v).unwrap().0;
+        packed[max_idx] = (packed[max_idx] as i16 + diff).clamp(0, 255) as u8;
+    }
+    packed
 }
 
 // ---------------------------------------------------------------------------
@@ -98,9 +123,7 @@ pub struct ModelMeshPart {
 }
 
 pub struct ModelMesh {
-    pub vertex_type: VertexType,
-    pub rigid_vertices: Vec<VertexRigid>,
-    pub skinned_vertices: Vec<VertexSkinned>,
+    pub vertices: Vec<ModelVertex>,
     pub indices: Vec<u32>,
     pub parts: Vec<ModelMeshPart>,
 }
@@ -129,6 +152,7 @@ pub struct ModelData {
     pub nodes: Vec<ModelNode>,
     pub markers: Vec<ModelMarker>,
     pub animations: Vec<AnimationData>,
+    pub root_inverse_transform: Mat4,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,34 +219,88 @@ fn mat4_from_assimp(m: &asset_importer::Matrix4x4) -> Mat4 {
 }
 
 // ---------------------------------------------------------------------------
-// Scene node tree walking (for bone parent resolution)
+// Skeleton hierarchy import
 // ---------------------------------------------------------------------------
 
-/// Build a map from node name -> parent node name by walking the scene node tree.
-fn build_node_parent_map(
-    node: &Node,
-    parent_name: Option<&str>,
-    map: &mut HashMap<String, String>,
-) {
-    let name = node.name();
-
-    if let Some(pname) = parent_name {
-        map.insert(name.clone(), pname.to_string());
+/// Collect bone names and offset matrices from all meshes in the scene graph.
+fn collect_bone_info_recursive(scene: &Scene, node: &Node, info: &mut HashMap<String, Mat4>) {
+    for mesh_idx in node.mesh_indices_iter() {
+        if let Some(mesh) = scene.mesh(mesh_idx) {
+            if mesh.has_bones() {
+                for bone in mesh.bones() {
+                    let name = bone.name();
+                    info.entry(name)
+                        .or_insert_with(|| mat4_from_assimp(&bone.offset_matrix()));
+                }
+            }
+        }
     }
-
     for child in node.children() {
-        build_node_parent_map(&child, Some(&name), map);
+        collect_bone_info_recursive(scene, &child, info);
     }
 }
 
-/// Build a map from node name -> node transformation by walking the scene node tree.
-fn build_node_transform_map(node: &Node, map: &mut HashMap<String, Mat4>) {
+/// Check if any descendant of this node (inclusive) is a bone.
+fn has_bone_descendant(node: &Node, bone_info: &HashMap<String, Mat4>) -> bool {
+    if bone_info.contains_key(&node.name()) {
+        return true;
+    }
+    for child in node.children() {
+        if has_bone_descendant(&child, bone_info) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Walk scene graph depth-first, creating model nodes only for actual bones.
+/// Non-bone ancestors (scene root, armature) are traversed but not included,
+/// preserving the same hierarchy the old code built while guaranteeing correct
+/// parent-child ordering (parents are always created before children).
+fn import_skeleton(
+    node: &Node,
+    model: &mut ModelData,
+    bone_info: &HashMap<String, Mat4>,
+    parent_model_index: i32,
+) {
     let name = node.name();
-    
-    map.insert(name.clone(), mat4_from_assimp(&node.transformation()));
+    let is_bone = bone_info.contains_key(&name);
+
+    let current_parent = if is_bone {
+        let default_transform = mat4_from_assimp(&node.transformation());
+        let offset_matrix = bone_info[&name];
+        let default_decomposed = decompose_transform(&default_transform);
+
+        let new_node = ModelNode {
+            name: name.clone(),
+            parent_index: -1,
+            first_child_index: -1,
+            next_sibling_index: -1,
+            offset_matrix,
+            default_transform,
+            default_decomposed,
+        };
+
+        model.add_child_node(parent_model_index, new_node) as i32
+    } else {
+        // Not a bone — traverse through without creating a node
+        parent_model_index
+    };
 
     for child in node.children() {
-        build_node_transform_map(&child, map);
+        if has_bone_descendant(&child, bone_info) {
+            import_skeleton(&child, model, bone_info, current_parent);
+        }
+    }
+}
+
+/// Strip `$AssimpFbx$` suffixes from node names.
+/// Assimp may generate these when `preserve_pivots` is true, and they can
+/// persist in animation channel names even when `preserve_pivots` is false.
+fn strip_assimp_fbx_suffix(name: &str) -> &str {
+    match name.find("_$AssimpFbx$") {
+        Some(pos) => &name[..pos],
+        None => name,
     }
 }
 
@@ -232,7 +310,16 @@ fn build_node_transform_map(node: &Node, map: &mut HashMap<String, Mat4>) {
 
 impl ModelData {
     pub fn from_file(path: &str) -> Self {
-        let scene = Scene::from_file_with_flags(
+        Self::from_file_with_uv_scale(path, 1.0)
+    }
+
+    pub fn from_file_with_uv_scale(path: &str, uv_scale: f32) -> Self {
+        // Disable preserve_pivots to prevent Assimp from creating $AssimpFbx$
+        // intermediate nodes that break bone hierarchy parent chains.
+        let mut props = PropertyStore::new();
+        props.set_bool(import_properties::FBX_PRESERVE_PIVOTS, false);
+
+        let scene = Scene::from_file_with_props(
             path,
             PostProcessSteps::TRIANGULATE
                 | PostProcessSteps::CALC_TANGENT_SPACE
@@ -241,6 +328,7 @@ impl ModelData {
                 | PostProcessSteps::FIND_DEGENERATES
                 | PostProcessSteps::FIND_INVALID_DATA
                 | PostProcessSteps::VALIDATE_DATA_STRUCTURE,
+            &props,
         )
         .expect("Failed to load model");
 
@@ -258,24 +346,20 @@ impl ModelData {
             nodes: Vec::new(),
             markers: Vec::new(),
             animations: Vec::new(),
+            root_inverse_transform: Mat4::IDENTITY,
         };
 
-        // Build helper maps from the scene node tree for bone parent/transform resolution
-        let mut node_parent_map = HashMap::new();
-        let mut node_transform_map = HashMap::new();
-
         if let Some(root) = scene.root_node() {
-            build_node_parent_map(&root, None, &mut node_parent_map);
-            build_node_transform_map(&root, &mut node_transform_map);
+            // Phase 1: Collect bone names + offset matrices from all meshes
+            let mut bone_info = HashMap::new();
+            collect_bone_info_recursive(&scene, &root, &mut bone_info);
 
-            // Walk scene graph: import meshes + bones
-            import_node(
-                &scene,
-                &root,
-                &mut model,
-                &node_parent_map,
-                &node_transform_map,
-            );
+            // Phase 2: Build skeleton hierarchy by walking the scene graph depth-first.
+            // This guarantees parents are created before children.
+            import_skeleton(&root, &mut model, &bone_info, -1);
+
+            // Phase 3: Import mesh geometry and bone weights
+            import_node(&scene, &root, &mut model, uv_scale);
 
             // Import markers (# prefixed meshes)
             import_markers(&scene, &root, &mut model);
@@ -344,54 +428,27 @@ fn import_node(
     scene: &Scene,
     node: &Node,
     model: &mut ModelData,
-    node_parent_map: &HashMap<String, String>,
-    node_transform_map: &HashMap<String, Mat4>,
+    uv_scale: f32,
 ) {
-    // Collect mesh indices so we can iterate twice (has_bones check + import)
     let mesh_indices: Vec<usize> = node.mesh_indices_iter().collect();
 
-    // Determine if any mesh in this node has bones
-    let has_bones = mesh_indices
-        .iter()
-        .any(|&idx| scene.mesh(idx).map_or(false, |m| m.has_bones()));
-
-    let vertex_type = if has_bones {
-        VertexType::Skinned
-    } else {
-        VertexType::Rigid
-    };
-
     let mut mesh = ModelMesh {
-        vertex_type,
-        rigid_vertices: Vec::new(),
-        skinned_vertices: Vec::new(),
+        vertices: Vec::new(),
         indices: Vec::new(),
         parts: Vec::new(),
     };
 
     for &mesh_idx in &mesh_indices {
         let assimp_mesh = scene.mesh(mesh_idx).unwrap();
-
-        import_mesh(
-            &assimp_mesh,
-            &mut mesh,
-            model,
-            node_parent_map,
-            node_transform_map,
-        );
+        import_mesh(&assimp_mesh, &mut mesh, model, uv_scale);
     }
 
-    let has_verts = match vertex_type {
-        VertexType::Rigid => !mesh.rigid_vertices.is_empty(),
-        VertexType::Skinned => !mesh.skinned_vertices.is_empty(),
-    };
-
-    if has_verts {
+    if !mesh.vertices.is_empty() {
         model.meshes.push(mesh);
     }
 
     for child in node.children() {
-        import_node(scene, &child, model, node_parent_map, node_transform_map);
+        import_node(scene, &child, model, uv_scale);
     }
 }
 
@@ -476,8 +533,7 @@ fn import_mesh(
     assimp_mesh: &Mesh,
     out_mesh: &mut ModelMesh,
     model: &mut ModelData,
-    node_parent_map: &HashMap<String, String>,
-    node_transform_map: &HashMap<String, Mat4>,
+    uv_scale: f32,
 ) {
     let mesh_name = assimp_mesh.name();
 
@@ -487,10 +543,7 @@ fn import_mesh(
 
     let num_vertices = assimp_mesh.num_vertices();
 
-    let vertex_start = match out_mesh.vertex_type {
-        VertexType::Rigid => out_mesh.rigid_vertices.len() as u32,
-        VertexType::Skinned => out_mesh.skinned_vertices.len() as u32,
-    };
+    let vertex_start = out_mesh.vertices.len() as u32;
 
     let index_start = out_mesh.indices.len() as u32;
 
@@ -500,56 +553,22 @@ fn import_mesh(
     let bitangents = assimp_mesh.bitangents();
     let uvs = assimp_mesh.texture_coords(0);
 
-    // Extract bone data if present
+    // Extract bone data if present — nodes already exist from import_skeleton
     let mut per_vertex_indices = vec![[0u32; 4]; num_vertices];
     let mut per_vertex_weights = vec![[0.0f32; 4]; num_vertices];
 
-    if out_mesh.vertex_type == VertexType::Skinned {
+    if assimp_mesh.has_bones() {
         for bone in assimp_mesh.bones() {
             let bone_name = bone.name();
-
-            // Skip "Armature" bone (Blender hack)
-            if bone_name == "Armature" {
-                continue;
-            }
 
             let node_index = match model.find_node_by_name(&bone_name) {
                 Some(idx) => idx,
                 None => {
-                    // Create new model node for this bone
-                    let default_transform = node_transform_map
-                        .get(&bone_name)
-                        .copied()
-                        .unwrap_or(Mat4::IDENTITY);
-
-                    let offset_matrix = mat4_from_assimp(&bone.offset_matrix());
-
-                    // Find parent node index by walking the scene node tree
-                    let parent_node_index = node_parent_map
-                        .get(&bone_name)
-                        .and_then(|parent_name| {
-                            // Skip "Armature" as parent (Blender hack)
-                            if parent_name == "Armature" {
-                                return None;
-                            }
-                            model.find_node_by_name(parent_name)
-                        })
-                        .map(|idx| idx as i32)
-                        .unwrap_or(-1);
-
-                    let default_decomposed = decompose_transform(&default_transform);
-
-                    let new_node = ModelNode {
-                        name: bone_name.clone(),
-                        parent_index: -1,
-                        first_child_index: -1,
-                        next_sibling_index: -1,
-                        offset_matrix,
-                        default_transform,
-                        default_decomposed,
-                    };
-
-                    model.add_child_node(parent_node_index, new_node)
+                    eprintln!(
+                        "Warning: bone '{}' not found in skeleton hierarchy",
+                        bone_name
+                    );
+                    continue;
                 }
             };
 
@@ -566,7 +585,8 @@ fn import_mesh(
                         && per_vertex_weights[vid][slot] > 0.0
                     {
                         // Same bone, keep max weight
-                        per_vertex_weights[vid][slot] = per_vertex_weights[vid][slot].max(weight.weight);
+                        per_vertex_weights[vid][slot] =
+                            per_vertex_weights[vid][slot].max(weight.weight);
                         break;
                     }
 
@@ -580,7 +600,7 @@ fn import_mesh(
         }
     }
 
-    // Create vertices
+    // Create compressed vertices
     for i in 0..num_vertices {
         let pos = &vertices[i];
         let normal = normals.as_ref().and_then(|v| v.get(i));
@@ -590,49 +610,46 @@ fn import_mesh(
 
         let position = [pos.x, pos.y, pos.z];
 
-        let normal_arr = [
+        let normal_vec = Vec3::new(
             normal.map_or(0.0, |v| v.x),
             normal.map_or(0.0, |v| v.y),
-            normal.map_or(0.0, |v| v.z),
-        ];
+            normal.map_or(1.0, |v| v.z),
+        );
 
-        let texcoord = [uv.map_or(0.0, |v| v.x), -uv.map_or(0.0, |v| v.y)];
+        let u = uv.map_or(0.0, |v| v.x) * uv_scale;
+        let v_coord = -uv.map_or(0.0, |v| v.y) * uv_scale;
+        let texcoord = [f16::from_f32(u).to_bits(), f16::from_f32(v_coord).to_bits()];
 
-        let tangent_arr = [
-            tangent.map_or(0.0, |v| v.x),
+        let tangent_vec = Vec3::new(
+            tangent.map_or(1.0, |v| v.x),
             tangent.map_or(0.0, |v| v.y),
             tangent.map_or(0.0, |v| v.z),
-        ];
-
-        let bitangent_arr = [
+        );
+        let bitangent_vec = Vec3::new(
             bitangent.map_or(0.0, |v| v.x),
-            bitangent.map_or(0.0, |v| v.y),
+            bitangent.map_or(1.0, |v| v.y),
             bitangent.map_or(0.0, |v| v.z),
+        );
+
+        let packed_normal = oct_encode_snorm8(normal_vec);
+        let packed_tangent = pack_tangent_with_sign(tangent_vec, normal_vec, bitangent_vec);
+        let packed_indices = [
+            per_vertex_indices[i][0] as u8,
+            per_vertex_indices[i][1] as u8,
+            per_vertex_indices[i][2] as u8,
+            per_vertex_indices[i][3] as u8,
         ];
+        let packed_weights = pack_weights_unorm8(per_vertex_weights[i]);
 
-        match out_mesh.vertex_type {
-            VertexType::Rigid => {
-                out_mesh.rigid_vertices.push(VertexRigid {
-                    position,
-                    normal: normal_arr,
-                    texcoord,
-                    tangent: tangent_arr,
-                    bitangent: bitangent_arr,
-                });
-            }
-
-            VertexType::Skinned => {
-                out_mesh.skinned_vertices.push(VertexSkinned {
-                    position,
-                    normal: normal_arr,
-                    texcoord,
-                    tangent: tangent_arr,
-                    bitangent: bitangent_arr,
-                    node_indices: per_vertex_indices[i],
-                    node_weights: per_vertex_weights[i],
-                });
-            }
-        }
+        out_mesh.vertices.push(ModelVertex {
+            position,
+            texcoord,
+            normal: packed_normal,
+            _pad: [0; 2],
+            tangent: packed_tangent,
+            node_indices: packed_indices,
+            node_weights: packed_weights,
+        });
     }
 
     // Create indices
@@ -705,27 +722,25 @@ fn import_animation(anim: &asset_importer::Animation, model: &mut ModelData) {
         duration: anim.duration() as f32,
         ticks_per_second: anim.ticks_per_second() as f32,
         channels: Vec::new(),
+        node_channel_map: Vec::new(),
     };
 
     // Node channels
     for node_anim in anim.channels() {
-        let node_name = node_anim.node_name();
-
-        // Blender hack: skip "Armature" channel
-        if node_name == "Armature" {
-            continue;
-        }
+        let raw_name = node_anim.node_name();
+        // Strip $AssimpFbx$ suffixes that may persist from Assimp's FBX pivot handling
+        let node_name = strip_assimp_fbx_suffix(&raw_name);
 
         let node_index = model
-            .find_node_by_name(&node_name)
+            .find_node_by_name(node_name)
             .map(|i| i as i32)
             .unwrap_or(-1);
 
         if node_index == -1 {
-            eprintln!(
-                "Warning: animation channel references unknown node '{}'",
-                node_name
-            );
+            // eprintln!(
+            //     "Warning: animation channel references unknown node '{}'",
+            //     node_name
+            // );
             continue;
         }
 
@@ -757,6 +772,9 @@ fn import_animation(anim: &asset_importer::Animation, model: &mut ModelData) {
             })
             .collect();
 
+        let position_times: Vec<f32> = position_keys.iter().map(|k| k.time).collect();
+        let rotation_times: Vec<f32> = rotation_keys.iter().map(|k| k.time).collect();
+        let scaling_times: Vec<f32> = scaling_keys.iter().map(|k| k.time).collect();
         animation.channels.push(AnimationChannel {
             channel_type: AnimationChannelType::Node,
             target_index: node_index,
@@ -765,6 +783,9 @@ fn import_animation(anim: &asset_importer::Animation, model: &mut ModelData) {
             scaling_keys,
             mesh_keys: Vec::new(),
             morph_keys: Vec::new(),
+            position_times,
+            rotation_times,
+            scaling_times,
         });
     }
 
@@ -787,6 +808,9 @@ fn import_animation(anim: &asset_importer::Animation, model: &mut ModelData) {
             scaling_keys: Vec::new(),
             mesh_keys,
             morph_keys: Vec::new(),
+            position_times: Vec::new(),
+            rotation_times: Vec::new(),
+            scaling_times: Vec::new(),
         });
     }
 
@@ -809,8 +833,24 @@ fn import_animation(anim: &asset_importer::Animation, model: &mut ModelData) {
             scaling_keys: Vec::new(),
             mesh_keys: Vec::new(),
             morph_keys,
+            position_times: Vec::new(),
+            rotation_times: Vec::new(),
+            scaling_times: Vec::new(),
         });
     }
+
+    // Build node_index → [channel indices] lookup
+    let num_nodes = model.nodes.len();
+    let mut node_channel_map: Vec<Vec<usize>> = vec![Vec::new(); num_nodes];
+    for (ch_idx, channel) in animation.channels.iter().enumerate() {
+        if channel.channel_type == AnimationChannelType::Node && channel.target_index >= 0 {
+            let ni = channel.target_index as usize;
+            if ni < num_nodes {
+                node_channel_map[ni].push(ch_idx);
+            }
+        }
+    }
+    animation.node_channel_map = node_channel_map;
 
     model.animations.push(animation);
 }

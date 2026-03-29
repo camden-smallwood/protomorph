@@ -1,16 +1,14 @@
 use crate::{
     camera::CameraUniforms,
     lights::LightType,
-    models::{VertexRigid, VertexSkinned, VertexType},
+    models::ModelVertex,
     renderer::{
         create_fullscreen_pipeline,
-        shared::{FrameContext, QuadVertex, RenderPass, SharedBindGroup, SharedResources},
+        shared::{FrameContext, QuadVertex, RenderPass, SharedResources},
         uniform_entry,
     },
 };
 use bytemuck::{Pod, Zeroable};
-use std::cell::RefCell;
-use std::rc::Rc;
 use glam::{Mat4, Vec3};
 
 // Each face renders its matching world direction — no swizzle needed at sample time.
@@ -23,7 +21,7 @@ const FACE_DIRECTIONS: [(Vec3, Vec3); 6] = [
     (Vec3::Z, Vec3::new(0.0, -1.0, 0.0)),
 ];
 
-const UPDATE_INTERVAL: u64 = 1;
+const UPDATE_INTERVAL: u64 = 8;
 
 pub const ENV_PROBE_SIZE: u32 = 128;
 pub const ENV_PROBE_MIP_COUNT: u32 = 6; // 128 -> 4
@@ -42,17 +40,62 @@ pub struct GpuEnvProbeData {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct GpuAtmosphereData {
-    pub sun_direction: [f32; 3],
-    pub atmosphere_enable: f32,
-    pub rayleigh_coefficients: [f32; 3],
-    pub rayleigh_height_scale: f32,
-    pub mie_coefficient: f32,
-    pub mie_height_scale: f32,
-    pub mie_g: f32,
-    pub max_fog_thickness: f32,
-    pub inscatter_scale: f32,
-    pub reference_height: f32,
-    pub _pad: [f32; 2],
+    // --- Scattering (offsets 0-55) ---
+    pub sun_direction: [f32; 3],          // 0
+    pub atmosphere_enable: f32,            // 12
+    pub rayleigh_coefficients: [f32; 3],  // 16 (vec3 align 16)
+    pub rayleigh_height_scale: f32,        // 28
+    pub mie_coefficient: f32,              // 32
+    pub mie_height_scale: f32,             // 36
+    pub mie_g: f32,                        // 40
+    pub max_fog_thickness: f32,            // 44
+    pub inscatter_scale: f32,              // 48
+    pub reference_height: f32,             // 52
+
+    // --- Sun appearance (offsets 56-111) ---
+    pub sun_luminance: f32,                // 56
+    pub sun_angular_radius: f32,           // 60
+    pub sun_edge_softness: f32,            // 64
+    pub sun_disc_intensity: f32,           // 68
+    pub sun_inner_glow_intensity: f32,     // 72
+    pub sun_air_mass_scale: f32,           // 76
+    pub sun_tint: [f32; 3],               // 80 (vec3 align 16: 80%16=0)
+    pub zenith_air_mass_factor: f32,       // 92
+    pub horizon_fade_start: f32,           // 96
+    pub horizon_fade_end: f32,             // 100
+    pub _pad: [f32; 2],                    // 104 (total: 112, 112%16=0)
+}
+
+impl GpuAtmosphereData {
+    pub fn from_sky_config(sky: &crate::sky::SkyConfig) -> Self {
+        let atmo_sun = -sky.sun_direction; // direction TO the sun
+        Self {
+            sun_direction: atmo_sun.to_array(),
+            atmosphere_enable: 1.0,
+            rayleigh_coefficients: sky.rayleigh_coefficients,
+            rayleigh_height_scale: sky.rayleigh_height_scale,
+            mie_coefficient: sky.mie_coefficient,
+            mie_height_scale: sky.mie_height_scale,
+            mie_g: sky.mie_g,
+            max_fog_thickness: sky.max_fog_thickness,
+            inscatter_scale: sky.inscatter_scale,
+            reference_height: sky.reference_height,
+            sun_luminance: sky.sun_luminance,
+            sun_angular_radius: sky.sun_angular_radius,
+            sun_edge_softness: sky.sun_edge_softness,
+            sun_disc_intensity: sky.sun_disc_intensity,
+            sun_inner_glow_intensity: sky.sun_inner_glow_intensity,
+            sun_air_mass_scale: sky.sun_air_mass_scale,
+            sun_tint: sky.sun_tint,
+            zenith_air_mass_factor: sky.zenith_air_mass_factor,
+            // Push horizon fade well below horizon for the cubemap so that
+            // high-roughness mip levels don't bleed dark below-horizon values
+            // into near-horizon texels (which causes grazing-angle reflection cutoff).
+            horizon_fade_start: -0.4,
+            horizon_fade_end: -0.2,
+            _pad: [0.0; 2],
+        }
+    }
 }
 
 #[repr(C)]
@@ -76,9 +119,7 @@ pub struct EnvProbePass {
     sky_params_buffers: [wgpu::Buffer; 6],
     sky_bind_groups: [wgpu::BindGroup; 6],
 
-    // Forward rendering pipeline (rigid + skinned)
     forward_pipeline: wgpu::RenderPipeline,
-    forward_skinned_pipeline: wgpu::RenderPipeline,
 
     // Mip downsample pipeline
     downsample_pipeline: wgpu::RenderPipeline,
@@ -87,7 +128,6 @@ pub struct EnvProbePass {
 
     // Cubemap texture + views
     cubemap_texture: wgpu::Texture,
-    cubemap_cube_view: wgpu::TextureView,
     face_mip_views: Vec<Vec<wgpu::TextureView>>, // [face][mip]
 
     // Depth texture for rendering (reused across faces)
@@ -98,12 +138,6 @@ pub struct EnvProbePass {
     camera_buffer: wgpu::Buffer,
     camera_stride: usize,
     camera_bind_group: wgpu::BindGroup,
-
-    // Env probe uniform for lighting pass (group 3)
-    probe_buffer: wgpu::Buffer,
-    sh_buffer: wgpu::Buffer,
-    pub bgl: wgpu::BindGroupLayout,
-    pub bind_group: SharedBindGroup,
 
     // Filtering sampler for cubemap
     filtering_sampler: wgpu::Sampler,
@@ -167,12 +201,6 @@ impl EnvProbePass {
             view_formats: &[],
         });
 
-        let cubemap_cube_view = cubemap_texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("env_probe_cube_view"),
-            dimension: Some(wgpu::TextureViewDimension::Cube),
-            ..Default::default()
-        });
-
         // Per-face per-mip views for rendering
         let mut face_mip_views: Vec<Vec<wgpu::TextureView>> = Vec::with_capacity(6);
         for face in 0..6u32 {
@@ -208,7 +236,7 @@ impl EnvProbePass {
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // --- Forward pipelines ---
+        // --- Forward pipeline (unified — all vertices are ModelVertex with bone data) ---
         let forward_pipeline = {
             let shader = device.create_shader_module(wgpu::include_wgsl!(
                 "../../assets/shaders/env_probe_forward.wgsl"
@@ -216,7 +244,7 @@ impl EnvProbePass {
 
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("env_forward_layout"),
-                bind_group_layouts: &[&camera_bgl, &shared.model_bgl, &shared.material_bgl],
+                bind_group_layouts: &[&camera_bgl, &shared.model_bgl, &shared.material_bgl, &shared.node_matrices_bgl],
                 immediate_size: 0,
             });
 
@@ -226,55 +254,7 @@ impl EnvProbePass {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_main"),
-                    buffers: &[VertexRigid::layout()],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    front_face: wgpu::FrontFace::Cw,
-                    cull_mode: Some(wgpu::Face::Back),
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let forward_skinned_pipeline = {
-            let shader = device.create_shader_module(wgpu::include_wgsl!(
-                "../../assets/shaders/env_probe_forward_skinned.wgsl"
-            ));
-
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("env_forward_skinned_layout"),
-                bind_group_layouts: &[&camera_bgl, &shared.model_bgl, &shared.material_bgl, &shared.node_matrices_bgl],
-                immediate_size: 0,
-            });
-
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("env_forward_skinned_pipeline"),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[VertexSkinned::layout()],
+                    buffers: &[ModelVertex::layout()],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -468,105 +448,28 @@ impl EnvProbePass {
         // --- Probe uniform buffer + BGL for lighting pass group 3 ---
         let probe_data = GpuEnvProbeData {
             probe_position: [0.0, 0.0, 1.0],
-            env_roughness_scale: 1.0,
+            env_roughness_scale: 0.5,
             env_specular_contribution: 0.5,
             env_mip_count: ENV_PROBE_MIP_COUNT as f32,
             env_intensity: 1.0,
             env_diffuse_intensity: 0.3,
         };
 
-        let probe_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("env_probe_buffer"),
-            size: size_of::<GpuEnvProbeData>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let sh_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sh_coefficients_buffer"),
-            size: size_of::<GpuSHCoefficients>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("env_probe_lighting_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::Cube,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                uniform_entry(
-                    2,
-                    size_of::<GpuEnvProbeData>() as u64,
-                    wgpu::ShaderStages::FRAGMENT,
-                    false,
-                ),
-                uniform_entry(
-                    3,
-                    size_of::<GpuSHCoefficients>() as u64,
-                    wgpu::ShaderStages::FRAGMENT,
-                    false,
-                ),
-            ],
-        });
-
-        let bind_group = Rc::new(RefCell::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("env_probe_lighting_bg"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&cubemap_cube_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&filtering_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: probe_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: sh_buffer.as_entire_binding(),
-                },
-            ],
-        })));
-
         Self {
             sky_pipeline,
             sky_params_buffers,
             sky_bind_groups,
             forward_pipeline,
-            forward_skinned_pipeline,
             downsample_pipeline,
             downsample_bgl,
             downsample_bind_groups,
             cubemap_texture,
-            cubemap_cube_view,
             face_mip_views,
             depth_view,
             camera_bgl,
             camera_buffer,
             camera_stride,
             camera_bind_group,
-            probe_buffer,
-            sh_buffer,
-            bgl,
-            bind_group,
             filtering_sampler,
             frame_counter: 0,
             probe_data,
@@ -575,6 +478,14 @@ impl EnvProbePass {
 
     pub fn face_view(&self, face: usize) -> &wgpu::TextureView {
         &self.face_mip_views[face][0]
+    }
+
+    pub fn create_cube_view(&self) -> wgpu::TextureView {
+        self.cubemap_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("env_probe_cube_view_shared"),
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        })
     }
 
     pub fn filtering_sampler(&self) -> &wgpu::Sampler {
@@ -677,7 +588,7 @@ impl RenderPass for EnvProbePass {
         // Upload probe data
         self.probe_data.probe_position = camera_position.into();
         shared.queue.write_buffer(
-            &self.probe_buffer,
+            &shared.env_probe_buffer,
             0,
             bytemuck::bytes_of(&self.probe_data),
         );
@@ -685,7 +596,7 @@ impl RenderPass for EnvProbePass {
         // Upload SH coefficients
         let sh = Self::compute_analytical_sh(sun_direction, sun_color, ambient_color);
         shared.queue.write_buffer(
-            &self.sh_buffer,
+            &shared.sh_buffer,
             0,
             bytemuck::bytes_of(&sh),
         );
@@ -822,36 +733,20 @@ impl RenderPass for EnvProbePass {
                 rpass.set_bind_group(0, &self.camera_bind_group, &[camera_dynamic_offset]);
 
                 // Draw models
-                for (obj_slot, &(_obj_idx, model_idx)) in render_list.iter().enumerate() {
+                rpass.set_pipeline(&self.forward_pipeline);
+                for (obj_slot, &(obj_idx, model_idx)) in render_list.iter().enumerate() {
+                    // Skip animated objects from env probe
+                    if ctx.game.objects.get(obj_idx).animations.is_some() {
+                        continue;
+                    }
                     let model_dynamic_offset = (obj_slot * shared.model_stride) as u32;
                     let nm_dynamic_offset = (obj_slot * shared.node_matrices_stride) as u32;
                     let gpu_model = &models[model_idx];
 
-                    for mesh in &gpu_model.meshes {
-                        match mesh.vertex_type {
-                            VertexType::Rigid => {
-                                rpass.set_pipeline(&self.forward_pipeline);
-                                rpass.set_bind_group(
-                                    1,
-                                    &shared.model_bind_group,
-                                    &[model_dynamic_offset],
-                                );
-                            }
-                            VertexType::Skinned => {
-                                rpass.set_pipeline(&self.forward_skinned_pipeline);
-                                rpass.set_bind_group(
-                                    1,
-                                    &shared.model_bind_group,
-                                    &[model_dynamic_offset],
-                                );
-                                rpass.set_bind_group(
-                                    3,
-                                    &shared.node_matrices_bind_group,
-                                    &[nm_dynamic_offset],
-                                );
-                            }
-                        }
+                    rpass.set_bind_group(1, &shared.model_bind_group, &[model_dynamic_offset]);
+                    rpass.set_bind_group(3, &shared.node_matrices_bind_group, &[nm_dynamic_offset]);
 
+                    for mesh in &gpu_model.meshes {
                         rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         rpass.set_index_buffer(
                             mesh.index_buffer.slice(..),

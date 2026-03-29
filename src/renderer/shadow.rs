@@ -1,8 +1,8 @@
 use crate::{
     camera::CameraUniforms,
     lights::{GpuLightingUniforms, LightType},
-    models::{VertexRigid, VertexSkinned, VertexType},
-    renderer::{GpuModel, sampler_entry, shared::{FrameContext, RenderPass, SharedBindGroup, SharedResources}, uniform_entry},
+    models::ModelVertex,
+    renderer::{sampler_entry, shared::{FrameContext, RenderPass, SharedBindGroup, SharedResources}, uniform_entry},
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
@@ -17,6 +17,32 @@ pub const CSM_CASCADE_COUNT: usize = 3;
 pub const CSM_MAP_SIZE: u32 = 2048;
 pub const SHADOW_CAMERA_SLOTS: usize = MAX_POINT_SHADOW_CASTERS * 6 + MAX_SPOT_SHADOW_CASTERS + CSM_CASCADE_COUNT;
 
+pub const SHADOW_ATLAS_SIZE: u32 = 4096;
+
+/// Atlas tile layout (fixed):
+/// Cascade 0: (0,0) 2048x2048      Cascade 1: (2048,0) 2048x2048
+/// Cascade 2: (0,2048) 2048x2048   Spot 0-3: 4x 1024x1024 in bottom-right quadrant
+fn cascade_atlas_tile(idx: usize) -> [f32; 4] {
+    let s = SHADOW_ATLAS_SIZE as f32;
+    match idx {
+        0 => [0.0 / s, 0.0 / s, 2048.0 / s, 0.0],
+        1 => [2048.0 / s, 0.0 / s, 2048.0 / s, 0.0],
+        2 => [0.0 / s, 2048.0 / s, 2048.0 / s, 0.0],
+        _ => [0.0, 0.0, 1.0, 0.0],
+    }
+}
+
+fn spot_atlas_tile(idx: usize) -> [f32; 4] {
+    let s = SHADOW_ATLAS_SIZE as f32;
+    match idx {
+        0 => [2048.0 / s, 2048.0 / s, 1024.0 / s, 0.0],
+        1 => [3072.0 / s, 2048.0 / s, 1024.0 / s, 0.0],
+        2 => [2048.0 / s, 3072.0 / s, 1024.0 / s, 0.0],
+        3 => [3072.0 / s, 3072.0 / s, 1024.0 / s, 0.0],
+        _ => [0.0, 0.0, 1.0, 0.0],
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct GpuShadowData {
@@ -25,25 +51,26 @@ pub struct GpuShadowData {
     pub spot_params: [[f32; 4]; MAX_SPOT_SHADOW_CASTERS],
     pub cascade_view_proj: [[[f32; 4]; 4]; CSM_CASCADE_COUNT],
     pub cascade_splits: [f32; 4],
-    pub cascade_texel_sizes: [f32; 4], // world-space texel size per cascade, [3] = pad
+    pub cascade_texel_sizes: [f32; 4],
     pub num_point_casters: u32,
     pub num_spot_casters: u32,
     pub _shadow_pad: [f32; 2],
+    // Atlas tile info: [offset_x, offset_y, scale, pad] for each cascade and spot
+    pub cascade_atlas: [[f32; 4]; CSM_CASCADE_COUNT],
+    pub spot_atlas: [[f32; 4]; MAX_SPOT_SHADOW_CASTERS],
 }
 
 #[allow(dead_code)]
 pub struct ShadowPass {
     pipeline: wgpu::RenderPipeline,
-    skinned_pipeline: wgpu::RenderPipeline,
     cascade_pipeline: wgpu::RenderPipeline,
-    cascade_skinned_pipeline: wgpu::RenderPipeline,
 
     camera_bgl: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
     camera_stride: usize,
     camera_bind_group: wgpu::BindGroup,
 
-    uniform_buffer: wgpu::Buffer,
+    // uniform_buffer lives on SharedResources (shadow_uniform_buffer)
 
     pub bgl: wgpu::BindGroupLayout,
     pub bind_group: SharedBindGroup,
@@ -53,14 +80,9 @@ pub struct ShadowPass {
     point_cubemap_array_view: wgpu::TextureView,
     point_face_views: Vec<[wgpu::TextureView; 6]>,
 
-    // Spot light 2D array (one layer per shadow caster)
-    spot_array: wgpu::Texture,
-    spot_array_view: wgpu::TextureView,
-    spot_layer_views: Vec<wgpu::TextureView>,
-
-    cascade_texture: wgpu::Texture,
-    cascade_array_view: wgpu::TextureView,
-    cascade_layer_views: [wgpu::TextureView; CSM_CASCADE_COUNT],
+    // Shadow atlas: single 4096x4096 depth texture for cascades + spots
+    pub atlas_texture: wgpu::Texture,
+    atlas_view: wgpu::TextureView,
 
     // Per-frame scratch buffers (internalized from Renderer)
     point_shadow_casters: Vec<(usize, usize)>,
@@ -94,13 +116,13 @@ impl ShadowPass {
                     },
                     count: None,
                 },
-                // binding 1: spot light 2D array
+                // binding 1: shadow atlas (cascades + spots packed into single 2D texture)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
@@ -114,17 +136,6 @@ impl ShadowPass {
                     wgpu::ShaderStages::FRAGMENT,
                     false,
                 ),
-                // binding 4: CSM cascade array
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
             ],
         });
 
@@ -139,22 +150,8 @@ impl ShadowPass {
             clamp: 0.0,
         };
 
-        let pipeline = Self::create_pipeline(&shared.device, &camera_bgl, &shared.model_bgl, point_spot_bias);
-        let skinned_pipeline = Self::create_skinned_pipeline(
-            &shared.device,
-            &camera_bgl,
-            &shared.model_bgl,
-            &shared.node_matrices_bgl,
-            point_spot_bias,
-        );
-        let cascade_pipeline = Self::create_pipeline(&shared.device, &camera_bgl, &shared.model_bgl, cascade_bias);
-        let cascade_skinned_pipeline = Self::create_skinned_pipeline(
-            &shared.device,
-            &camera_bgl,
-            &shared.model_bgl,
-            &shared.node_matrices_bgl,
-            cascade_bias,
-        );
+        let pipeline = Self::create_pipeline(&shared.device, &camera_bgl, &shared.model_bgl, &shared.node_matrices_bgl, point_spot_bias);
+        let cascade_pipeline = Self::create_pipeline(&shared.device, &camera_bgl, &shared.model_bgl, &shared.node_matrices_bgl, cascade_bias);
 
         let min_alignment = shared.device.limits().min_uniform_buffer_offset_alignment as usize;
         let camera_size = size_of::<CameraUniforms>();
@@ -165,12 +162,8 @@ impl ShadowPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let uniform_buffer = shared.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("shadow_uniform_buffer"),
-            size: size_of::<GpuShadowData>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Shadow uniform buffer lives on SharedResources
+        let uniform_buffer = &shared.shadow_uniform_buffer;
 
         let camera_bind_group = shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shadow_camera_bg"),
@@ -223,13 +216,13 @@ impl ShadowPass {
             point_face_views.push(face_views);
         }
 
-        // Spot light 2D array
-        let spot_array = shared.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("shadow_spot_array"),
+        // Shadow atlas: single 4096x4096 depth texture for cascades + spots
+        let atlas_texture = shared.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow_atlas"),
             size: wgpu::Extent3d {
-                width: SPOT_SHADOW_MAP_SIZE,
-                height: SPOT_SHADOW_MAP_SIZE,
-                depth_or_array_layers: MAX_SPOT_SHADOW_CASTERS as u32,
+                width: SHADOW_ATLAS_SIZE,
+                height: SHADOW_ATLAS_SIZE,
+                depth_or_array_layers: 1,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -239,52 +232,11 @@ impl ShadowPass {
             view_formats: &[],
         });
 
-        let spot_array_view = spot_array.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("shadow_spot_array_view"),
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
+        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("shadow_atlas_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2),
             ..Default::default()
         });
-
-        let mut spot_layer_views = Vec::with_capacity(MAX_SPOT_SHADOW_CASTERS);
-        for i in 0..MAX_SPOT_SHADOW_CASTERS {
-            spot_layer_views.push(spot_array.create_view(&wgpu::TextureViewDescriptor {
-                label: Some(&format!("shadow_spot_layer_{i}")),
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                base_array_layer: i as u32,
-                array_layer_count: Some(1),
-                ..Default::default()
-            }));
-        }
-
-        // Cascade shadow map texture (2D array, one layer per cascade)
-        let cascade_texture = shared.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("shadow_cascade"),
-            size: wgpu::Extent3d {
-                width: CSM_MAP_SIZE,
-                height: CSM_MAP_SIZE,
-                depth_or_array_layers: CSM_CASCADE_COUNT as u32,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let cascade_array_view = cascade_texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
-        let cascade_layer_views: [wgpu::TextureView; CSM_CASCADE_COUNT] =
-            std::array::from_fn(|i| {
-                cascade_texture.create_view(&wgpu::TextureViewDescriptor {
-                    label: Some(&format!("shadow_cascade_layer_{i}")),
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    base_array_layer: i as u32,
-                    array_layer_count: Some(1),
-                    ..Default::default()
-                })
-            });
 
         let bind_group = Rc::new(RefCell::new(shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shadow_bg"),
@@ -296,7 +248,7 @@ impl ShadowPass {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&spot_array_view),
+                    resource: wgpu::BindingResource::TextureView(&atlas_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -306,34 +258,23 @@ impl ShadowPass {
                     binding: 3,
                     resource: uniform_buffer.as_entire_binding(),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&cascade_array_view),
-                },
             ],
         })));
 
         Self {
             pipeline,
-            skinned_pipeline,
             cascade_pipeline,
-            cascade_skinned_pipeline,
             camera_bgl,
             camera_buffer,
             camera_stride,
             camera_bind_group,
-            uniform_buffer,
             bgl,
             bind_group,
             point_cubemap_array,
             point_cubemap_array_view,
             point_face_views,
-            spot_array,
-            spot_array_view,
-            spot_layer_views,
-            cascade_texture,
-            cascade_array_view,
-            cascade_layer_views,
+            atlas_texture,
+            atlas_view,
             point_shadow_casters: Vec::with_capacity(MAX_POINT_SHADOW_CASTERS),
             spot_shadow_casters: Vec::with_capacity(MAX_SPOT_SHADOW_CASTERS),
             shadow_assignments: Vec::with_capacity(MAX_POINT_SHADOW_CASTERS + MAX_SPOT_SHADOW_CASTERS),
@@ -341,6 +282,16 @@ impl ShadowPass {
         }
     }
 
+    // Create owned texture views for forward lighting pass (stored for resize)
+    pub fn create_point_cubemap_view(&self) -> wgpu::TextureView {
+        self.point_cubemap_array.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("shadow_point_cube_shared"),
+            dimension: Some(wgpu::TextureViewDimension::CubeArray),
+            ..Default::default()
+        })
+    }
+
+    // uniform_buffer accessor removed — use shared.shadow_uniform_buffer directly
 }
 
 impl RenderPass for ShadowPass {
@@ -590,7 +541,15 @@ impl RenderPass for ShadowPass {
 
         }
 
-        shared.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&shadow_data));
+        // Fill atlas tile coordinates for shader UV transform
+        for i in 0..CSM_CASCADE_COUNT {
+            shadow_data.cascade_atlas[i] = cascade_atlas_tile(i);
+        }
+        for i in 0..MAX_SPOT_SHADOW_CASTERS {
+            shadow_data.spot_atlas[i] = spot_atlas_tile(i);
+        }
+
+        shared.queue.write_buffer(&shared.shadow_uniform_buffer, 0, bytemuck::bytes_of(&shadow_data));
 
         // Upload lighting uniforms (depends on shadow_assignments computed above)
         let light_uniforms = GpuLightingUniforms::from_scene(
@@ -609,8 +568,6 @@ impl RenderPass for ShadowPass {
 
     fn record(&self, encoder: &mut wgpu::CommandEncoder, ctx: &FrameContext) {
         let shared = ctx.shared;
-        let models = ctx.models;
-        let render_list = ctx.render_list;
 
         // Point light shadow passes (6 faces per caster)
         for (pi, &(_gpu_slot, _store_idx)) in self.point_shadow_casters.iter().enumerate() {
@@ -633,17 +590,18 @@ impl RenderPass for ShadowPass {
                 let camera_dynamic_offset = (camera_slot * self.camera_stride) as u32;
                 rpass.set_bind_group(0, &self.camera_bind_group, &[camera_dynamic_offset]);
 
-                Self::draw_models(&mut rpass, shared, models, render_list, &self.pipeline, &self.skinned_pipeline);
+                rpass.set_pipeline(&self.pipeline);
+                Self::draw_shadow_models(&mut rpass, shared, ctx);
             }
         }
 
-        // Spot light shadow passes (1 per caster)
-        for (si, &(_gpu_slot, _store_idx)) in self.spot_shadow_casters.iter().enumerate() {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("shadow_spot_pass"),
+        // Clear the entire atlas once, then render tiles with viewport
+        {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow_atlas_clear"),
                 color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.spot_layer_views[si],
+                    view: &self.atlas_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -652,24 +610,55 @@ impl RenderPass for ShadowPass {
                 }),
                 ..Default::default()
             });
+        }
+
+        // Spot light shadow passes — render into atlas tiles via viewport
+        for (si, &(_gpu_slot, _store_idx)) in self.spot_shadow_casters.iter().enumerate() {
+            let tile = spot_atlas_tile(si);
+            let tile_x = (tile[0] * SHADOW_ATLAS_SIZE as f32) as u32;
+            let tile_y = (tile[1] * SHADOW_ATLAS_SIZE as f32) as u32;
+            let tile_size = (tile[2] * SHADOW_ATLAS_SIZE as f32) as u32;
+
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow_spot_atlas"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.atlas_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            rpass.set_viewport(tile_x as f32, tile_y as f32, tile_size as f32, tile_size as f32, 0.0, 1.0);
+            rpass.set_scissor_rect(tile_x, tile_y, tile_size, tile_size);
 
             let camera_slot = MAX_POINT_SHADOW_CASTERS * 6 + si;
             let camera_dynamic_offset = (camera_slot * self.camera_stride) as u32;
             rpass.set_bind_group(0, &self.camera_bind_group, &[camera_dynamic_offset]);
 
-            Self::draw_models(&mut rpass, shared, models, render_list, &self.pipeline, &self.skinned_pipeline);
+            rpass.set_pipeline(&self.pipeline);
+            Self::draw_shadow_models(&mut rpass, shared, ctx);
         }
 
-        // Cascade shadow passes (one per cascade layer)
+        // Cascade shadow passes — render into atlas tiles via viewport
         if self.has_directional_shadow {
             for cascade in 0..CSM_CASCADE_COUNT {
+                let tile = cascade_atlas_tile(cascade);
+                let tile_x = (tile[0] * SHADOW_ATLAS_SIZE as f32) as u32;
+                let tile_y = (tile[1] * SHADOW_ATLAS_SIZE as f32) as u32;
+                let tile_size = (tile[2] * SHADOW_ATLAS_SIZE as f32) as u32;
+
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("shadow_cascade_pass"),
+                    label: Some("shadow_cascade_atlas"),
                     color_attachments: &[],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.cascade_layer_views[cascade],
+                        view: &self.atlas_view,
                         depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
+                            load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         }),
                         stencil_ops: None,
@@ -677,12 +666,16 @@ impl RenderPass for ShadowPass {
                     ..Default::default()
                 });
 
+                rpass.set_viewport(tile_x as f32, tile_y as f32, tile_size as f32, tile_size as f32, 0.0, 1.0);
+                rpass.set_scissor_rect(tile_x, tile_y, tile_size, tile_size);
+
                 let camera_slot =
                     MAX_POINT_SHADOW_CASTERS * 6 + MAX_SPOT_SHADOW_CASTERS + cascade;
                 let camera_dynamic_offset = (camera_slot * self.camera_stride) as u32;
                 rpass.set_bind_group(0, &self.camera_bind_group, &[camera_dynamic_offset]);
 
-                Self::draw_models(&mut rpass, shared, models, render_list, &self.cascade_pipeline, &self.cascade_skinned_pipeline);
+                rpass.set_pipeline(&self.cascade_pipeline);
+                Self::draw_shadow_models(&mut rpass, shared, ctx);
             }
         }
     }
@@ -690,46 +683,26 @@ impl RenderPass for ShadowPass {
 }
 
 impl ShadowPass {
-    fn draw_models<'a>(
+    /// Shadow draw loop — node_matrices at group 2 (not group 3 like other passes)
+    fn draw_shadow_models<'a>(
         rpass: &mut wgpu::RenderPass<'a>,
         shared: &'a SharedResources,
-        models: &'a [GpuModel],
-        render_list: &[(crate::objects::ObjectIndex, usize)],
-        rigid_pipeline: &'a wgpu::RenderPipeline,
-        skinned_pipeline: &'a wgpu::RenderPipeline,
+        ctx: &'a FrameContext<'a>,
     ) {
-        for (obj_slot, &(_obj_idx, model_idx)) in render_list.iter().enumerate() {
-            let model_dynamic_offset = (obj_slot * shared.model_stride) as u32;
-            let nm_dynamic_offset = (obj_slot * shared.node_matrices_stride) as u32;
-            let gpu_model = &models[model_idx];
+        for (obj_slot, &(_obj_idx, model_idx)) in ctx.render_list.iter().enumerate() {
+            let model_offset = (obj_slot * shared.model_stride) as u32;
+            let nm_offset = (obj_slot * shared.node_matrices_stride) as u32;
+            let gpu_model = &ctx.models[model_idx];
+
+            rpass.set_bind_group(1, &shared.model_bind_group, &[model_offset]);
+            rpass.set_bind_group(2, &shared.node_matrices_bind_group, &[nm_offset]);
 
             for mesh in &gpu_model.meshes {
-                match mesh.vertex_type {
-                    VertexType::Rigid => {
-                        rpass.set_pipeline(rigid_pipeline);
-                        rpass.set_bind_group(1, &shared.model_bind_group, &[model_dynamic_offset]);
-                    }
-
-                    VertexType::Skinned => {
-                        rpass.set_pipeline(skinned_pipeline);
-                        rpass.set_bind_group(1, &shared.model_bind_group, &[model_dynamic_offset]);
-                        rpass.set_bind_group(
-                            2,
-                            &shared.node_matrices_bind_group,
-                            &[nm_dynamic_offset],
-                        );
-                    }
-                }
-
                 rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 rpass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
                 for part in &mesh.parts {
-                    rpass.draw_indexed(
-                        part.index_start..part.index_start + part.index_count,
-                        0,
-                        0..1,
-                    );
+                    rpass.draw_indexed(part.index_start..part.index_start + part.index_count, 0, 0..1);
                 }
             }
         }
@@ -739,6 +712,7 @@ impl ShadowPass {
         device: &wgpu::Device,
         shadow_camera_bgl: &wgpu::BindGroupLayout,
         model_bgl: &wgpu::BindGroupLayout,
+        node_matrices_bgl: &wgpu::BindGroupLayout,
         bias: wgpu::DepthBiasState,
     ) -> wgpu::RenderPipeline {
         let shader = device.create_shader_module(wgpu::include_wgsl!(
@@ -747,7 +721,7 @@ impl ShadowPass {
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow_layout"),
-            bind_group_layouts: &[shadow_camera_bgl, model_bgl],
+            bind_group_layouts: &[shadow_camera_bgl, model_bgl, node_matrices_bgl],
             immediate_size: 0,
         });
 
@@ -758,74 +732,12 @@ impl ShadowPass {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: size_of::<VertexRigid>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: None,
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: Default::default(),
-                bias,
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        })
-    }
-
-    fn create_skinned_pipeline(
-        device: &wgpu::Device,
-        shadow_camera_bgl: &wgpu::BindGroupLayout,
-        model_bgl: &wgpu::BindGroupLayout,
-        node_matrices_bgl: &wgpu::BindGroupLayout,
-        bias: wgpu::DepthBiasState,
-    ) -> wgpu::RenderPipeline {
-        let shader = device.create_shader_module(wgpu::include_wgsl!(
-            "../../assets/shaders/shadow_skinned.wgsl"
-        ));
-
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shadow_skinned_layout"),
-            bind_group_layouts: &[shadow_camera_bgl, model_bgl, node_matrices_bgl],
-            immediate_size: 0,
-        });
-
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shadow_skinned_pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: size_of::<VertexSkinned>() as wgpu::BufferAddress,
+                    array_stride: size_of::<ModelVertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Uint32x4,
-                            offset: 56,
-                            shader_location: 1,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
-                            offset: 72,
-                            shader_location: 2,
-                        },
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint8x4, offset: 24, shader_location: 1 },
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Unorm8x4, offset: 28, shader_location: 2 },
                     ],
                 }],
                 compilation_options: Default::default(),
@@ -849,4 +761,5 @@ impl ShadowPass {
             cache: None,
         })
     }
+
 }
