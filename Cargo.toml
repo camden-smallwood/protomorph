@@ -3,6 +3,9 @@ name = "protomorph"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+static = ["asset-importer/static-link"]
+
 [dependencies]
 asset-importer = "0.7"
 bitflags = "2"
