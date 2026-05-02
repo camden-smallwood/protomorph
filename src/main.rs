@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Instant};
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, WindowEvent},
@@ -23,6 +23,18 @@ use game::GameState;
 use renderer::Renderer;
 
 const LOOK_SENSITIVITY: f32 = 5.0;
+
+pub fn assets_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        let candidate = exe_dir.join("assets");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets")
+}
 
 // ---------------------------------------------------------------------------
 // Application

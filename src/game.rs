@@ -153,16 +153,17 @@ impl GameState {
     }
 
     fn load_scene(&mut self, renderer: &mut Renderer) {
-        let manifest = env!("CARGO_MANIFEST_DIR");
+        let models_dir = crate::assets_dir().join("models");
+        let model_path = |name: &str| models_dir.join(name).to_string_lossy().into_owned();
 
-        // let (plane_model, plane_data) = renderer.load_model_with_uv_scale(&format!("{manifest}/assets/models/plane.fbx"), 10.0);
-        let (plane_model, plane_data) = renderer.load_model(&format!("{manifest}/assets/models/plane2.fbx"));
+        // let (plane_model, plane_data) = renderer.load_model_with_uv_scale(&model_path("plane.fbx"), 10.0);
+        let (plane_model, plane_data) = renderer.load_model(&model_path("plane2.fbx"));
         self.model_data.push(plane_data);
 
-        let (grunt_model, grunt_data) = renderer.load_model(&format!("{manifest}/assets/models/grunt.fbx"));
+        let (grunt_model, grunt_data) = renderer.load_model(&model_path("grunt.fbx"));
         self.model_data.push(grunt_data);
 
-        let (weapon_model, weapon_data) = renderer.load_model(&format!("{manifest}/assets/models/assault_rifle.fbx"));
+        let (weapon_model, weapon_data) = renderer.load_model(&model_path("assault_rifle.fbx"));
         self.model_data.push(weapon_data);
         self.weapon_model_index = weapon_model;
 

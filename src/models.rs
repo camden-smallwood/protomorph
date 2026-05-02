@@ -379,7 +379,7 @@ fn resolve_texture_path(model_dir: &Path, raw_path: &str) -> Option<String> {
         .strip_prefix("/Users/camden/Source/c-language-prototypes/")
         .unwrap_or(raw_path);
 
-    let assets_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let assets_dir = crate::assets_dir();
 
     let candidate = assets_dir.join(stripped);
 
