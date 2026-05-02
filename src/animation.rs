@@ -12,28 +12,6 @@ pub struct DualQuat {
     pub dual: [f32; 4], // translation quaternion
 }
 
-impl DualQuat {
-    pub const IDENTITY: Self = Self {
-        real: [0.0, 0.0, 0.0, 1.0],
-        dual: [0.0, 0.0, 0.0, 0.0],
-    };
-
-    /// Convert a Mat4 bone matrix to a dual quaternion.
-    /// Extracts rotation and translation; non-uniform scale is NOT supported.
-    pub fn from_mat4(m: Mat4) -> Self {
-        let (_scale, rotation, translation) = m.to_scale_rotation_translation();
-        let r = rotation;
-        // Dual part = 0.5 * translation_quat * rotation
-        // where translation_quat = Quat(tx, ty, tz, 0)
-        let t = Quat::from_xyzw(translation.x, translation.y, translation.z, 0.0);
-        let d = t * r * 0.5;
-        Self {
-            real: [r.x, r.y, r.z, r.w],
-            dual: [d.x, d.y, d.z, d.w],
-        }
-    }
-}
-
 /// Negate `from` if needed so that slerp takes the shortest arc.
 fn ensure_shortest_path(from: Quat, to: Quat) -> Quat {
     if from.dot(to) < 0.0 { -from } else { from }
@@ -190,8 +168,6 @@ pub struct AnimationManager {
     active_animations: Vec<bool>,
     states: Vec<AnimationState>,
     pub node_matrices: Vec<Mat4>,
-    /// Dual quaternion representation of node_matrices, for GPU upload.
-    pub node_dual_quats: Vec<DualQuat>,
     /// Set to true when node_matrices change; cleared by the renderer after upload.
     pub matrices_dirty: bool,
 }
@@ -217,7 +193,6 @@ impl AnimationManager {
             active_animations: vec![false; anim_count],
             states,
             node_matrices: vec![Mat4::IDENTITY; node_count],
-            node_dual_quats: vec![DualQuat::IDENTITY; node_count],
             matrices_dirty: true,
         }
     }

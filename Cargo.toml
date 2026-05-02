@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-asset-importer = { version = "0.7", default-features = false, features = ["system"] }
+asset-importer = "0.7"
 bitflags = "2"
 bytemuck = { version = "1.24", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
