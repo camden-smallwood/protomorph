@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-blam-tags = { path = "../blam-tags/blam-tags" }
+blam-tags = { git = "https://github.com/camden-smallwood/blam-tags", rev = "e636fab09b95869d3ce3561cc044b7a1e76809f9" }
 bitflags = "2"
 bytemuck = { version = "1.24", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
