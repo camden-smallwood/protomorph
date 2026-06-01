@@ -1,0 +1,32 @@
+//! Mirror of `Ares/source/geometry/geometry_constants.h` (50 lines).
+//!
+//! Hard caps that geometry-related fixed arrays size against.
+
+pub const MAXIMUM_VERTEX_BUFFERS_PER_GEOMETRY_PART: usize = 6;
+pub const MAXIMUM_VERTEX_BUFFERS_PER_GEOMETRY_SECTION: usize = 512;
+pub const MAXIMUM_VERTICES_PER_GEOMETRY_SECTION: usize = 32767;
+pub const MAXIMUM_TRIANGLES_PER_GEOMETRY_SECTION: usize = 65535;
+pub const MAXIMUM_STRIP_INDICES_PER_GEOMETRY_SECTION: usize = 65535;
+pub const MAXIMUM_EXPLICIT_EDGES_PER_GEOMETRY_SECTION: usize = 65535;
+pub const MAXIMUM_SHARED_EDGE_GROUPS_PER_GEOMETRY_SECTION: usize = 512;
+pub const MAXIMUM_SHARED_EDGES_PER_GEOMETRY_SECTION: usize = 16384;
+pub const MAXIMUM_PARTS_PER_GEOMETRY_SECTION: usize = 255;
+pub const MAXIMUM_NODE_INDICES_PER_GEOMETRY_POINT: usize = 4;
+pub const MAXIMUM_NODE_INDICES_PER_GEOMETRY_PART_CENTROID: usize = 4;
+pub const MAXIMUM_RIGID_PLANE_GROUPS_PER_GEOMETRY_SECTION: usize = 65280;
+pub const MAXIMUM_RIGID_POINT_GROUPS_PER_GEOMETRY_SECTION: usize = 32767;
+pub const MAXIMUM_MATERIALS_PER_GEOMETRY: usize = 1024;
+pub const MAXIMUM_PROPERTIES_PER_MATERIAL: usize = 16;
+pub const MAXIMUM_BYTES_PER_GEOMETRY_RUNTIME_POINT_DATA: usize = 1_048_544;
+pub const MAXIMUM_BYTES_PER_GEOMETRY_RUNTIME_ISQ_PLANE_DATA: usize = 2_097_120;
+pub const MAXIMUM_RESOURCES_PER_GEOMETRY_BLOCK: usize = 1024;
+pub const MAXIMUM_SUBPARTS_PER_SECTION: usize = 32768;
+pub const MAXIMUM_NODE_INDICES_PER_GEOMETRY_SUBPART_VISIBILITY: usize = 4;
+
+/// `e_geometry_detail_level` (h:33-37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum GeometryDetailLevel {
+    Low = 0,
+    High = 1,
+}

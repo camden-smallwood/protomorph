@@ -3,17 +3,19 @@ name = "protomorph"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-static = ["asset-importer/static-link"]
-
 [dependencies]
-asset-importer = { version = "0.7", default-features = false, features = ["build-assimp"] }
+blam-tags = { path = "../blam-tags/blam-tags" }
 bitflags = "2"
 bytemuck = { version = "1.24", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
 glam = { version = "0.32", features = ["bytemuck"] }
 glyphon = "0.10"
+# `release_max_level_warn` compiles out trace!/debug!/info! in release builds.
+# wgpu's per-call atomic-load filter check then short-circuits at compile time —
+# Bevy measured ~15% perf win disabling these (gfx-rs/wgpu#6046).
+log = { version = "0.4", features = ["release_max_level_warn"] }
 pollster = "0.4"
 rand = "0.9"
+rfd = "0.17.2"
 wgpu = "28.0"
 winit = "0.30"

@@ -7,20 +7,11 @@ use winit::{
     window::{CursorGrabMode, Window, WindowId},
 };
 
-mod animation;
-mod camera;
-mod collision;
-mod dds;
 mod game;
-mod lights;
-mod materials;
-mod models;
-mod objects;
-mod renderer;
-mod sky;
+mod halo;
 
 use game::GameState;
-use renderer::Renderer;
+use halo::render::Renderer;
 
 const LOOK_SENSITIVITY: f32 = 5.0;
 
@@ -43,6 +34,7 @@ pub fn assets_dir() -> PathBuf {
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Renderer>,
+    scenario_path: PathBuf,
     game: Option<GameState>,
     keys_pressed: HashSet<KeyCode>,
     cursor_grabbed: bool,
@@ -61,7 +53,7 @@ impl ApplicationHandler for App {
 
         let mut renderer = Renderer::new(Arc::clone(&window));
 
-        let game = GameState::new(&mut renderer, size.width, size.height);
+        let game = GameState::new(&mut renderer, size.width, size.height, self.scenario_path.clone());
 
         self.gpu = Some(renderer);
         self.game = Some(game);
@@ -95,18 +87,27 @@ impl ApplicationHandler for App {
                     } else {
                         if let Some(game) = self.game.as_mut() {
                             match key {
-                                KeyCode::KeyH => game.toggle_flashlight(),
                                 KeyCode::KeyK => game.toggle_specular_occlusion(),
-                                KeyCode::KeyP => game.toggle_debug_cubemap(),
-                                KeyCode::KeyO => game.toggle_debug_cubemap_colors(),
-                                KeyCode::Digit1 => game.trigger_weapon_animation("first_person ready"),
-                                KeyCode::Digit2 => game.trigger_weapon_animation("first_person reload_empty"),
-                                KeyCode::Digit3 => game.trigger_weapon_animation("first_person melee_strike_1"),
-                                KeyCode::KeyG => game.toggle_grunt_animation_pause(),
-                                KeyCode::KeyT => game.toggle_weapon_detach(),
                                 KeyCode::KeyV => game.toggle_vignette(),
-                                KeyCode::Tab => game.toggle_flycam(),
                                 _ => {}
+                            }
+                        }
+                        if let Some(gpu) = self.gpu.as_mut() {
+                            if key == KeyCode::KeyT {
+                                let r = &mut gpu.transparency_renderer;
+                                r.render_enabled = !r.render_enabled;
+                                eprintln!(
+                                    "[diag] transparency_renderer.render_enabled = {}",
+                                    r.render_enabled,
+                                );
+                            }
+                            if key == KeyCode::KeyP {
+                                let d = &mut gpu.decal_gpu;
+                                d.render_enabled = !d.render_enabled;
+                                eprintln!(
+                                    "[diag] decal_gpu.render_enabled = {}",
+                                    d.render_enabled,
+                                );
                             }
                         }
 
@@ -148,7 +149,6 @@ impl ApplicationHandler for App {
         if !self.cursor_grabbed {
             return;
         }
-
         if let DeviceEvent::MouseMotion { delta } = event {
             if let Some(game) = self.game.as_mut() {
                 game.camera.rotation.x += -delta.0 as f32 * 0.01 * LOOK_SENSITIVITY;
@@ -196,9 +196,30 @@ fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
+    let mut args = std::env::args();
+    args.next();
+
+    let scenario_path = match args.next() {
+        Some(s) => PathBuf::from(s),
+        None => {
+            use rfd::FileDialog;
+
+            let Some(scenario_path) = FileDialog::new()
+                .add_filter("scenario", &["scenario"])
+                .set_directory(".")
+                .pick_file()
+            else {
+                return;
+            };
+
+            scenario_path
+        }
+    };
+
     let mut app = App {
         window: None,
         gpu: None,
+        scenario_path,
         game: None,
         keys_pressed: HashSet::new(),
         cursor_grabbed: false,

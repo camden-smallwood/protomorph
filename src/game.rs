@@ -1,21 +1,14 @@
-use crate::{
-    animation::AnimationManager,
-    camera::Camera,
-    collision::{
-        self, CollisionMesh, PlayerPhysics, build_collision_mesh,
-        EYE_HEIGHT, GRAVITY, GROUND_SNAP, JUMP_VELOCITY, PLAYER_RADIUS,
-    },
-    lights::{LightData, LightIndex, LightStore},
-    models::ModelData,
-    objects::{ObjectIndex, ObjectStore},
-    renderer::{Renderer, env_probe::GpuAtmosphereData},
-    sky::SkyConfig,
-};
-use glam::{Vec2, Vec3};
+use crate::halo::animations::AnimationManager;
+use crate::halo::camera::FlyingCamera;
+use crate::halo::geometry::ModelData;
+use crate::halo::objects::{ObjectIndex, ObjectStore};
+use crate::halo::render::Renderer;
+use glam::Vec3;
 use std::collections::HashSet;
+use std::path::Path;
 use winit::keyboard::KeyCode;
 
-const MOVEMENT_SPEED: f32 = 1.0;
+const MOVEMENT_SPEED: f32 = 10.0;
 
 // ---------------------------------------------------------------------------
 // FPS counter
@@ -44,181 +37,556 @@ impl FpsCounter {
 }
 
 // ---------------------------------------------------------------------------
-// Game state
+// Game state — Phase 1 Halo viewer (flycam-only, no collision/physics)
 // ---------------------------------------------------------------------------
 
 pub struct GameState {
     pub objects: ObjectStore,
-    pub lights: LightStore,
-    pub camera: Camera,
+    pub camera: FlyingCamera,
     pub model_data: Vec<ModelData>,
     pub fps_counter: FpsCounter,
-    pub sky: SkyConfig,
+    /// `scenario.skies[0]` loaded as an object — the sky model
+    /// (`.scenery → .model → .render_model`). Per Ares' `render_sky`
+    /// chain, this object's node matrices get translated by the
+    /// camera position each frame so the sky stays infinitely far.
+    pub sky_object: Option<ObjectIndex>,
+    /// Tracks how many placements have been registered against each
+    /// renderer `model_index`. Used to assign each new placement an
+    /// `instance_within_model` slot index (Path B per-instance cbuffer
+    /// pool — see [[project_render_method_function_port_plan_2026_05_20]]).
+    /// Accumulates across multiple `load_visible_placements` calls so
+    /// different scenario placement types (scenery / weapons / crates)
+    /// don't collide on slot indices.
+    pub placements_per_model: std::collections::HashMap<usize, u32>,
 
-    flashlight_index: LightIndex,
-    weapon_index: ObjectIndex,
-    grunt_index: ObjectIndex,
-    weapon_model_index: usize,
-    weapon_idle_anim_idx: Option<usize>,
-    weapon_moving_anim_idx: Option<usize>,
-    rotation_towards_grunt: f32,
-    pub weapon_detached: bool,
-    pub debug_cubemap: bool,
-    pub debug_cubemap_colors: bool,
     pub enable_specular_occlusion: bool,
     pub enable_vignette: bool,
     pub total_time: f32,
-    collision_mesh: CollisionMesh,
-    physics: PlayerPhysics,
-    pub flycam: bool,
-    is_moving: bool,
+    /// Real per-frame `dt` written by `update`, read by the renderer.
+    /// Mirrors engine `c_patchy_fog::ms_dt` (set by the main game tick,
+    /// consumed by `render_patchy_fog` to scale `wind_direction`).
+    pub delta_time: f32,
 }
 
 impl GameState {
-    pub fn new(renderer: &mut Renderer, width: u32, height: u32) -> Self {
-        let mut camera = Camera::new();
+    pub fn new<P: AsRef<Path>>(renderer: &mut Renderer, width: u32, height: u32, scenario_path: P) -> Self {
+        let mut camera = FlyingCamera::new();
         camera.handle_resize(width, height);
-
-        let mut lights = LightStore::new();
-
-        // Flashlight (hidden by default)
-        let mut flashlight = LightData::new_spot();
-        flashlight.hidden = true;
-        flashlight.diffuse_color = Vec3::splat(3.0);
-        flashlight.ambient_color = Vec3::splat(0.05);
-        flashlight.specular_color = Vec3::splat(3.0);
-        flashlight.constant_atten = 1.0;
-        flashlight.inner_cutoff = 10.0;
-        flashlight.outer_cutoff = 25.0;
-        flashlight.casts_shadow = true;
-        let flashlight_index = lights.new_light(flashlight);
-
-        // // Angled spot light over the grunt
-        // let mut grunt_spot = LightData::new_spot();
-        // grunt_spot.position = Vec3::new(-3.0, 2.0, 5.0);
-        // grunt_spot.direction = (Vec3::new(-5.0, 0.0, 0.0) - grunt_spot.position).normalize();
-        // grunt_spot.diffuse_color = Vec3::splat(2.0);
-        // grunt_spot.ambient_color = Vec3::splat(0.1);
-        // grunt_spot.specular_color = Vec3::splat(2.0);
-        // grunt_spot.constant_atten = 1.0;
-        // grunt_spot.linear_atten = 0.02;
-        // grunt_spot.quadratic_atten = 0.005;
-        // grunt_spot.inner_cutoff = 20.0;
-        // grunt_spot.outer_cutoff = 35.0;
-        // grunt_spot.casts_shadow = true;
-        // lights.new_light(grunt_spot);
-
-        let sky = SkyConfig::default();
-
-        // Sun light from sky config
-        let mut sun = LightData::new_directional();
-        sun.direction = sky.sun_direction;
-        sun.diffuse_color = sky.sun_diffuse_color;
-        sun.ambient_color = sky.sun_ambient_color;
-        sun.specular_color = sky.sun_specular_color;
-        sun.casts_shadow = true;
-        lights.new_light(sun);
+        // Cyberdyne — UNSC TRAINING B FACILITY wall sign reference view
+        // matching sapien Camera (X=-12.85, Y=-10.27, Z=4.13). F5/F6/F7
+        // jump to other decal reference views.
+        camera.position = Vec3::new(-12.85, -10.27, 4.13);
+        camera.rotation = glam::Vec2::new(90.0, 0.0);
+        // PROTOMORPH_CAMERA="x,y,z" / "x,y,z,yaw,pitch" override —
+        // lets us jump straight to a specific decal placement for
+        // visual debugging without flying.
+        if let Ok(s) = std::env::var("PROTOMORPH_CAMERA") {
+            let parts: Vec<f32> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            if parts.len() >= 3 {
+                camera.position = Vec3::new(parts[0], parts[1], parts[2]);
+            }
+            if parts.len() >= 5 {
+                camera.rotation = glam::Vec2::new(parts[3], parts[4]);
+            }
+        }
+        camera.update();
 
         let mut state = Self {
             objects: ObjectStore::new(),
-            lights,
             camera,
             model_data: Vec::new(),
             fps_counter: FpsCounter::new(),
-            sky,
-            flashlight_index,
-            weapon_index: ObjectIndex(0),
-            grunt_index: ObjectIndex(0),
-            weapon_model_index: 0,
-            weapon_idle_anim_idx: None,
-            weapon_moving_anim_idx: None,
-            rotation_towards_grunt: 0.0,
-            weapon_detached: false,
-            debug_cubemap: false,
-            debug_cubemap_colors: false,
+            sky_object: None,
+            placements_per_model: std::collections::HashMap::new(),
             enable_specular_occlusion: true,
             enable_vignette: true,
             total_time: 0.0,
-            collision_mesh: CollisionMesh {
-                floor_triangles: Vec::new(),
-                wall_segments: Vec::new(),
-            },
-            physics: PlayerPhysics::new(),
-            flycam: false,
-            is_moving: false,
+            delta_time: 1.0 / 60.0,
         };
 
-        state.load_scene(renderer);
+        state.load_scene(renderer, scenario_path);
         state
     }
 
-    fn load_scene(&mut self, renderer: &mut Renderer) {
-        let models_dir = crate::assets_dir().join("models");
-        let model_path = |name: &str| models_dir.join(name).to_string_lossy().into_owned();
+    fn load_scene<P: AsRef<Path>>(&mut self, renderer: &mut Renderer, scenario_path: P) {
+        // Phase D1 smoke test: load riverworld.scenario if it's there
+        // and report what came back. This doesn't render anything yet —
+        // Phase D2/D3 wires sbsp meshes through the pipeline.
+        let scenario_path = scenario_path.as_ref();
 
-        // let (plane_model, plane_data) = renderer.load_model_with_uv_scale(&model_path("plane.fbx"), 10.0);
-        let (plane_model, plane_data) = renderer.load_model(&model_path("plane2.fbx"));
-        self.model_data.push(plane_data);
+        if scenario_path.exists() {
+            match renderer.load_scenario(scenario_path) {
+                Ok(loaded) => {
+                    eprintln!(
+                        "[scenario] loaded {} — zone_set[{}] '{}' (bsps active: {}, pvs={})",
+                        loaded.scenario_path.display(),
+                        loaded.active_zone_set,
+                        loaded.zone_set().name,
+                        loaded.active_bsps.len(),
+                        loaded.zone_set().pvs_index,
+                    );
+                    for bsp in &loaded.active_bsps {
+                        let r = loaded.bsp_reference(bsp);
+                        let total_verts: usize =
+                            bsp.meshes.iter().map(|m| m.vertices.len()).sum();
+                        let total_tris: usize =
+                            bsp.meshes.iter().map(|m| m.indices.len() / 3).sum();
+                        eprintln!(
+                            "[scenario]   bsp[{}] {} — {} clusters, {} instances, {} materials, {} meshes ({} verts, {} tris), lightmap={}",
+                            bsp.scenario_bsp_index,
+                            r.structure_bsp,
+                            bsp.sbsp.clusters.len(),
+                            bsp.sbsp.instanced_geometry_instances.len(),
+                            bsp.sbsp.materials.len(),
+                            bsp.meshes.len(),
+                            total_verts,
+                            total_tris,
+                            bsp.lightmap.is_some(),
+                        );
 
-        let (grunt_model, grunt_data) = renderer.load_model(&model_path("grunt.fbx"));
-        self.model_data.push(grunt_data);
+                        // Upload the BSP through the dedicated structure
+                        // renderer path — separate from the per-character
+                        // ModelData/ObjectData pipeline. Mirrors Ares'
+                        // `c_structure_renderer` (per the deep trace in
+                        // `reference_h3_structure_render_pipeline.md` in
+                        // auto-memory).
+                        let bsp_idx = renderer.upload_bsp(
+                            bsp,
+                            &loaded.tags_root,
+                            &loaded.scenario.cubemaps,
+                        );
+                        eprintln!(
+                            "[scenario]   uploaded BSP[{}] via structure renderer",
+                            bsp_idx,
+                        );
+                    }
+                    for (kind, palette, placements) in loaded.all_placements() {
+                        if !placements.is_empty() {
+                            eprintln!(
+                                "[scenario]   {kind}: {} unique × {} placements",
+                                palette.len(),
+                                placements.len(),
+                            );
+                        }
+                    }
 
-        let (weapon_model, weapon_data) = renderer.load_model(&model_path("assault_rifle.fbx"));
-        self.model_data.push(weapon_data);
-        self.weapon_model_index = weapon_model;
+                    // Decorator (foliage) authoring data — MCC tag-ships
+                    // the per-set placement arrays but NOT the per-cluster
+                    // runtime structures (those live in sbsp's stripped
+                    // `decorator sets` block). Runtime cluster assignment
+                    // happens at load via point-in-cluster tests.
+                    for (idx, dec) in loaded.decorators().iter().enumerate() {
+                        let total: usize = dec.sets.iter().map(|s| s.placements.len()).sum();
+                        eprintln!(
+                            "[scenario]   decorator block[{}]: {} palettes, {} sets, {} placements (count_field={})",
+                            idx,
+                            dec.palettes.len(),
+                            dec.sets.len(),
+                            total,
+                            dec.decorator_count,
+                        );
+                        for (si, set) in dec.sets.iter().enumerate() {
+                            if !set.placements.is_empty() {
+                                let loaded_set = loaded
+                                    .decorator_sets
+                                    .get(idx)
+                                    .and_then(|sets| sets.get(si))
+                                    .and_then(|t| t.as_ref());
+                                let shader = loaded_set
+                                    .map(|t| format!("{:?}", t.render_shader))
+                                    .unwrap_or_else(|| "(unloaded)".to_string());
+                                let types = loaded_set
+                                    .map(|t| t.decorator_types.len())
+                                    .unwrap_or(0);
+                                let rm = loaded
+                                    .decorator_render_models
+                                    .get(idx)
+                                    .and_then(|rms| rms.get(si))
+                                    .and_then(|t| t.as_ref());
+                                let (verts, tris) = rm
+                                    .map(|m| {
+                                        let v: u32 = m.meshes.iter().map(|x| x.vertices.len() as u32).sum();
+                                        let t: u32 = m
+                                            .meshes
+                                            .iter()
+                                            .map(|x| (x.indices.len() / 3) as u32)
+                                            .sum();
+                                        (v, t)
+                                    })
+                                    .unwrap_or((0, 0));
+                                let meshes = rm.map(|m| m.meshes.len()).unwrap_or(0);
+                                eprintln!(
+                                    "[scenario]     set[{}] {} — {} placements, shader={}, {} types, mesh_blocks={}, {} verts, {} tris",
+                                    si,
+                                    set.decorator_set,
+                                    set.placements.len(),
+                                    shader,
+                                    types,
+                                    meshes,
+                                    verts,
+                                    tris,
+                                );
+                            }
+                        }
+                    }
 
-        // Plane
-        let plane = self.objects.new_object();
-        // self.objects.get_mut(plane).scale = Vec3::splat(10.0);
-        self.objects.get_mut(plane).model_index = Some(plane_model);
+                    // Sky load — Ares' `c_object_renderer::submit_and_render_sky`
+                    // chain. `scenario.skies[i].sky` is a `.scenery` tag-ref
+                    // pointing at the sky's `_object_definition`; the
+                    // existing object loader walks .scenery → .model →
+                    // .render_model. We register it as a regular object
+                    // and override its position to the camera per frame
+                    // (Ares' `render_sky_modify_node_matrices` applies an
+                    // offset = camera_position to keep the sky dome
+                    // centered on the viewer).
+                    //
+                    // For v1 we just take skies[0]; per-cluster sky
+                    // selection (`bsp.cluster.scenario_sky_index`) lands
+                    // alongside PVS in Phase H.
+                    if let Some(sky_ref) = loaded.skies().first() {
+                        if !sky_ref.sky.is_empty() {
+                            let sky_path = blam_tags::paths::resolve_tag_path(
+                                &loaded.tags_root,
+                                &sky_ref.sky,
+                                "scenery",
+                            );
+                            if sky_path.exists() {
+                                let (model, data) = renderer.load_object_tag(&sky_path);
+                                let obj = self.objects.new_object();
+                                self.model_data.push(data);
+                                let slot = self.objects.get_mut(obj);
+                                slot.model_index = Some(model);
+                                self.init_animations(obj, model);
+                                self.sky_object = Some(obj);
+                                eprintln!(
+                                    "[scenario]   sky: {} (model={})",
+                                    sky_ref.sky, model,
+                                );
+                            } else {
+                                eprintln!(
+                                    "[scenario]   sky tag missing: {}",
+                                    sky_path.display(),
+                                );
+                            }
+                        }
+                    }
 
-        // Build collision mesh from plane geometry
-        let model_matrix = self.objects.get(plane).model_matrix();
-        self.collision_mesh = build_collision_mesh(&self.model_data[plane_model], model_matrix);
+                    // Pick a spawn vantage from the scenery placements that
+                    // reference an MP respawn-point/zone palette entry. MP
+                    // scenarios author these as `objects/multi/spawning/
+                    // respawn_point.scenery` (and game-mode-specific zone
+                    // variants like `slayer_respawn_zone.scenery`). Halo's
+                    // runtime spawn picker is more involved (game-mode
+                    // gating + respawn timer + visibility check), but for
+                    // a flycam smoke test the first respawn point is fine.
+                    let respawns: Vec<(Vec3, f32)> = loaded
+                        .scenario
+                        .scenery
+                        .iter()
+                        .filter_map(|p| {
+                            let idx = p.palette_index;
+                            if idx < 0 { return None; }
+                            let palette = loaded.scenario.scenery_palette.get(idx as usize)?;
+                            let tp = palette.tag_path.to_ascii_lowercase();
+                            if tp.contains("respawn_point") || tp.contains("respawn_zone") {
+                                let pos = p.object_data.position;
+                                Some((
+                                    Vec3::new(pos.x, pos.y, pos.z),
+                                    p.object_data.rotation.yaw,
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if let Some(&(pos, yaw_rad)) = respawns.first() {
+                        // Eye-height offset — Halo units are world-meters,
+                        // biped eye height ≈ 1.7m.
+                        self.camera.position = pos + Vec3::new(0.0, 0.0, 1.7);
+                        self.camera.rotation = glam::Vec2::new(yaw_rad.to_degrees(), -5.0);
+                        self.camera.update();
+                        eprintln!(
+                            "[scenario]   spawning at respawn[0]: pos=({:.2}, {:.2}, {:.2}) yaw={:.1}° ({} respawn points)",
+                            self.camera.position.x, self.camera.position.y, self.camera.position.z,
+                            self.camera.rotation.x, respawns.len(),
+                        );
+                    }
+                    // PROTOMORPH_CAMERA override applies LAST so it wins
+                    // over respawn-point auto-positioning. Format:
+                    // "x,y,z" or "x,y,z,yaw,pitch".
+                    if let Ok(s) = std::env::var("PROTOMORPH_CAMERA") {
+                        let parts: Vec<f32> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                        if parts.len() >= 3 {
+                            self.camera.position = Vec3::new(parts[0], parts[1], parts[2]);
+                        }
+                        if parts.len() >= 5 {
+                            self.camera.rotation = glam::Vec2::new(parts[3], parts[4]);
+                        }
+                        self.camera.update();
+                        eprintln!(
+                            "[scenario]   PROTOMORPH_CAMERA override -> pos=({:.2}, {:.2}, {:.2}) yaw={:.1}° pitch={:.1}°",
+                            self.camera.position.x, self.camera.position.y, self.camera.position.z,
+                            self.camera.rotation.x, self.camera.rotation.y,
+                        );
+                    }
 
-        // Grunt
-        let grunt = self.objects.new_object();
-        self.objects.get_mut(grunt).position = Vec3::new(-5.0, 0.0, 0.0);
-        self.objects.get_mut(grunt).scale = Vec3::splat(0.01);
-        self.objects.get_mut(grunt).model_index = Some(grunt_model);
-        self.init_animations(grunt, grunt_model);
-        if let Some(anim) = self.objects.get_mut(grunt).animations.as_mut() {
-            anim.set_active(0, true);
-            anim.set_looping(0, true);
+                    // Halo's runtime renders every visible object placement
+                    // (per `c_object_renderer::submit_objects`). Load
+                    // scenery / crates / weapons / equipment by walking
+                    // each placement array and the matching palette.
+                    // Caching is per-palette so repeated tag references
+                    // upload once.
+                    // Scenery placements pass their per-placement
+                    // engine_lighting offsets (baked from sLdT.scenery_probes).
+                    // Other placement types have no analogous baked probe block
+                    // — engine resolves them via airprobes / device probes / sky
+                    // fallback at runtime; for v1 we pass None and inherit the
+                    // frame default sky probe.
+                    let scenery_offsets = renderer.scenery_lighting_offsets.clone();
+                    let crate_offsets = renderer.crate_lighting_offsets.clone();
+                    let weapon_offsets = renderer.weapon_lighting_offsets.clone();
+                    let equipment_offsets = renderer.equipment_lighting_offsets.clone();
+                    let machine_offsets = renderer.machine_lighting_offsets.clone();
+                    let control_offsets = renderer.control_lighting_offsets.clone();
+                    use crate::halo::objects::object_type::ObjectType;
+                    self.load_visible_placements(
+                        renderer,
+                        &loaded.scenario,
+                        ObjectType::Scenery,
+                        &loaded.scenario.scenery,
+                        &loaded.scenario.scenery_palette,
+                        &loaded.tags_root,
+                        "scenery",
+                        |tp| tp.contains("spawn_point") || tp.contains("respawn_zone"),
+                        Some(&scenery_offsets),
+                    );
+                    self.load_visible_placements(
+                        renderer,
+                        &loaded.scenario,
+                        ObjectType::Crate,
+                        &loaded.scenario.crates,
+                        &loaded.scenario.crate_palette,
+                        &loaded.tags_root,
+                        "crate",
+                        |_| false,
+                        Some(&crate_offsets),
+                    );
+                    self.load_visible_placements(
+                        renderer,
+                        &loaded.scenario,
+                        ObjectType::Weapon,
+                        &loaded.scenario.weapons,
+                        &loaded.scenario.weapon_palette,
+                        &loaded.tags_root,
+                        "weapon",
+                        |_| false,
+                        Some(&weapon_offsets),
+                    );
+                    self.load_visible_placements(
+                        renderer,
+                        &loaded.scenario,
+                        ObjectType::Equipment,
+                        &loaded.scenario.equipment,
+                        &loaded.scenario.equipment_palette,
+                        &loaded.tags_root,
+                        "equipment",
+                        |_| false,
+                        Some(&equipment_offsets),
+                    );
+                    self.load_visible_placements(
+                        renderer,
+                        &loaded.scenario,
+                        ObjectType::Machine,
+                        &loaded.scenario.machines,
+                        &loaded.scenario.machine_palette,
+                        &loaded.tags_root,
+                        "machine",
+                        |_| false,
+                        Some(&machine_offsets),
+                    );
+                    self.load_visible_placements(
+                        renderer,
+                        &loaded.scenario,
+                        ObjectType::Control,
+                        &loaded.scenario.controls,
+                        &loaded.scenario.control_palette,
+                        &loaded.tags_root,
+                        "control",
+                        |_| false,
+                        Some(&control_offsets),
+                    );
+                }
+                Err(e) => eprintln!("[scenario] load failed: {e}"),
+            }
         }
-        self.grunt_index = grunt;
 
-        // Weapon (first-person viewmodel)
-        let weapon = self.objects.new_object();
-        self.objects.get_mut(weapon).scale = Vec3::splat(0.01);
-        self.objects.get_mut(weapon).model_index = Some(weapon_model);
-        self.init_animations(weapon, weapon_model);
-        self.weapon_index = weapon;
+        // Test models (grunt biped + wraith vehicle) removed — focus
+        // is riverworld scenario geometry. Wraith uses
+        // `environment_map / dynamic` (option 2) which we don't yet
+        // port; loading it triggers the dispatcher panic. Grunt
+        // animations + biped placement come back when Phase E lands
+        // (object_placement_data lifecycle from scenario.bipeds).
+    }
 
-        // Set "first_person idle" to looping (but not active) and cache the index
-        if let Some(idle_idx) = self.model_data[weapon_model].find_animation_by_name("first_person idle") {
-            let anim = self.objects.get_mut(weapon).animations.as_mut().unwrap();
-            anim.set_looping(idle_idx, true);
-            self.weapon_idle_anim_idx = Some(idle_idx);
+    /// Walk a `[ObjectPlacement]` array + palette and create an object
+    /// slot per placement. Loads each unique palette tag once (cached
+    /// `palette_index → renderer_model_idx`).
+    ///
+    /// `skip_palette_path` returns `true` for palette entries that
+    /// should be ignored (e.g. invisible spawn markers in scenery).
+    /// Tag paths are passed lowercased.
+    ///
+    /// Per `feedback_wgsl_must_mirror_hlsl.md`: silent fallbacks hide
+    /// what needs porting. Render-method dispatcher panics on
+    /// unsupported shader options propagate up — no `catch_unwind`.
+    #[allow(clippy::too_many_arguments)]
+    fn load_visible_placements(
+        &mut self,
+        renderer: &mut Renderer,
+        scenario: &blam_tags::scenario::Scenario,
+        object_type: crate::halo::objects::object_type::ObjectType,
+        placements: &[blam_tags::scenario::ObjectPlacement],
+        palette: &[blam_tags::scenario::TagReferencePalette],
+        tags_root: &std::path::Path,
+        ext_and_label: &str,
+        skip_palette_path: impl Fn(&str) -> bool,
+        per_placement_lighting_offsets: Option<&[Option<u32>]>,
+    ) {
+        let mut palette_to_model: std::collections::HashMap<i16, Option<usize>> =
+            std::collections::HashMap::new();
+        let mut loaded_count = 0usize;
+        let mut skipped_marker = 0usize;
+        let mut skipped_failed = 0usize;
+        for (placement_index, p) in placements.iter().enumerate() {
+            let idx = p.palette_index;
+            if idx < 0 { continue; }
+            let Some(entry) = palette.get(idx as usize) else { continue; };
+            let tp_lower = entry.tag_path.to_ascii_lowercase();
+            if tp_lower.is_empty() || skip_palette_path(&tp_lower) {
+                skipped_marker += 1;
+                continue;
+            }
+            let renderer_model_idx = match palette_to_model.get(&idx).copied() {
+                Some(v) => v,
+                None => {
+                    let path = blam_tags::paths::resolve_tag_path(
+                        tags_root,
+                        &entry.tag_path,
+                        ext_and_label,
+                    );
+                    let result = if !path.exists() {
+                        eprintln!(
+                            "[scenario]   {ext_and_label} tag missing: {}",
+                            path.display(),
+                        );
+                        None
+                    } else {
+                        // No catch_unwind — unsupported shader options
+                        // panic the app per the engine-faithful policy.
+                        match crate::halo::loader::load_object(&path) {
+                            Ok(model) => {
+                                let r_idx = renderer.upload_model_data(&model);
+                                self.model_data.push(model);
+                                Some(r_idx)
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[scenario]   {ext_and_label} load failed {}: {}",
+                                    entry.tag_path, e,
+                                );
+                                None
+                            }
+                        }
+                    };
+                    palette_to_model.insert(idx, result);
+                    result
+                }
+            };
+            let Some(model_idx) = renderer_model_idx else {
+                skipped_failed += 1;
+                continue;
+            };
+            let obj = self.objects.new_object();
+            let pos = p.object_data.position;
+            let rot = p.object_data.rotation;
+            let scale = p.object_data.scale;
+            // Path B: assign this placement's slot index within its
+            // model's animated-material cbuffer pool. First placement
+            // of a model gets slot 0; each subsequent gets +1.
+            let instance_within_model = {
+                let count = self.placements_per_model.entry(model_idx).or_insert(0);
+                let assigned = *count;
+                *count += 1;
+                assigned
+            };
+            // Engine `object_index` for this placement — the slot in
+            // `object_header_data` that `*_compute_function_value`
+            // callers receive. Computed from `(object_type,
+            // placement_index)` to match `populate_from_scenario`'s
+            // walk order so the table entry's `object_type` matches.
+            let header_index = crate::halo::objects::object_header_data
+                ::header_index_for_placement(
+                    scenario,
+                    object_type,
+                    placement_index as u32,
+                );
+            {
+                let slot = self.objects.get_mut(obj);
+                slot.model_index = Some(model_idx);
+                slot.instance_within_model = instance_within_model;
+                slot.header_index = Some(header_index);
+                slot.position = Vec3::new(pos.x, pos.y, pos.z);
+                slot.rotation = Vec3::new(
+                    rot.yaw.to_degrees(),
+                    rot.pitch.to_degrees(),
+                    rot.roll.to_degrees(),
+                );
+                // `scale = 0.0` means "use object's authored default
+                // scale" per Halo runtime convention.
+                if scale > 0.0 {
+                    slot.scale = Vec3::splat(scale);
+                }
+                // L4 — pin the per-placement engine_lighting offset so
+                // per-draw bind-group rebinding picks up this object's
+                // baked SH probe (instead of the frame-default sky probe).
+                slot.engine_lighting_offset = per_placement_lighting_offsets
+                    .and_then(|offsets| offsets.get(placement_index).copied().flatten());
+                // Diag: match PROTOMORPH_DIAG_LIGHTING filter and log
+                // the obj_idx ↔ lighting_offset binding so draw-time
+                // logs can correlate against bake-time output.
+                if let Ok(filt) = std::env::var("PROTOMORPH_DIAG_LIGHTING") {
+                    let matches = filt == "all" || filt == ext_and_label || {
+                        filt.strip_prefix(ext_and_label)
+                            .and_then(|s| s.strip_prefix(':'))
+                            .map(|rest| rest.split(',').any(|tok| tok.trim().parse::<usize>() == Ok(placement_index)))
+                            .unwrap_or(false)
+                    };
+                    if matches {
+                        eprintln!(
+                            "[diag-lighting] {ext_and_label}[{placement_index}] load-time bind: obj_idx={:?} model_idx={model_idx} engine_lighting_offset={:?} header_index={header_index}",
+                            obj, slot.engine_lighting_offset,
+                        );
+                    }
+                }
+            }
+            self.init_animations(obj, model_idx);
+            loaded_count += 1;
         }
-
-        // Set "first_person moving" to looping (but not active) and cache the index
-        if let Some(moving_idx) = self.model_data[weapon_model].find_animation_by_name("first_person moving") {
-            let anim = self.objects.get_mut(weapon).animations.as_mut().unwrap();
-            anim.set_looping(moving_idx, true);
-            self.weapon_moving_anim_idx = Some(moving_idx);
-        }
-
-        // Play "first_person ready" once at startup
-        if let Some(ready_idx) = self.model_data[weapon_model].find_animation_by_name("first_person ready") {
-            let anim = self.objects.get_mut(weapon).animations.as_mut().unwrap();
-            anim.set_active(ready_idx, true);
-        }
+        let unique_loaded =
+            palette_to_model.values().filter(|v| v.is_some()).count();
+        eprintln!(
+            "[scenario]   {ext_and_label}: {} placements ({} unique tags), {} skipped, {} failed",
+            loaded_count, unique_loaded, skipped_marker, skipped_failed,
+        );
     }
 
     fn init_animations(&mut self, obj_index: ObjectIndex, model_index: usize) {
         let model = &self.model_data[model_index];
-        if model.nodes.is_empty() || model.animations.is_empty() {
+        // Any model with nodes needs an AnimationManager so its
+        // bind-pose node matrices reach the GPU — even with zero
+        // animations. Skinned vertices sample `node_matrices` and
+        // would otherwise see zeros.
+        if model.nodes.is_empty() {
             return;
         }
 
@@ -227,26 +595,17 @@ impl GameState {
     }
 
     pub fn update(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
-        self.update_camera_rotation_towards_grunt(dt);
+        self.delta_time = dt;
         self.update_movement(keys, dt);
-        self.update_weapon_viewmodel();
-        self.update_flashlight();
-        self.update_weapon_animations();
         self.objects.update(&self.model_data, dt);
+        // Mirrors Ares' `render_sky_modify_node_matrices(offset=camera)`:
+        // translating the sky model to the camera keeps its dome
+        // centered on the viewer so it appears infinitely far.
+        if let Some(sky) = self.sky_object {
+            self.objects.get_mut(sky).position = self.camera.position;
+        }
         self.fps_counter.update(dt);
         self.total_time += dt;
-    }
-
-    pub fn toggle_debug_cubemap(&mut self) {
-        self.debug_cubemap = !self.debug_cubemap;
-    }
-
-    pub fn toggle_debug_cubemap_colors(&mut self) {
-        self.debug_cubemap_colors = !self.debug_cubemap_colors;
-    }
-
-    pub fn atmosphere_data(&self) -> GpuAtmosphereData {
-        GpuAtmosphereData::from_sky_config(&self.sky)
     }
 
     pub fn toggle_specular_occlusion(&mut self) {
@@ -257,84 +616,7 @@ impl GameState {
         self.enable_vignette = !self.enable_vignette;
     }
 
-
-    pub fn is_grunt_animation_paused(&self) -> bool {
-        self.objects.get(self.grunt_index).animations.as_ref()
-            .map_or(false, |a| a.is_paused(0))
-    }
-
-    pub fn toggle_grunt_animation_pause(&mut self) {
-        if let Some(anim) = self.objects.get_mut(self.grunt_index).animations.as_mut() {
-            let paused = anim.is_paused(0);
-            anim.set_paused(0, !paused);
-        }
-    }
-
-    pub fn toggle_weapon_detach(&mut self) {
-        self.weapon_detached = !self.weapon_detached;
-    }
-
-    pub fn toggle_flycam(&mut self) {
-        self.flycam = !self.flycam;
-        if !self.flycam {
-            // Re-entering player mode: reset vertical velocity
-            self.physics.vertical_velocity = 0.0;
-            self.physics.is_grounded = false;
-        }
-    }
-
-    pub fn is_flycam(&self) -> bool {
-        self.flycam
-    }
-
-    pub fn toggle_flashlight(&mut self) {
-        let light = self.lights.get_mut(self.flashlight_index);
-        light.hidden = !light.hidden;
-    }
-
-    pub fn is_flashlight_on(&self) -> bool {
-        !self.lights.get(self.flashlight_index).hidden
-    }
-
-    pub fn trigger_weapon_animation(&mut self, name: &str) {
-        let animations = self.objects.get_mut(self.weapon_index).animations.as_mut().unwrap();
-        
-        if let Some(idle_index) = self.weapon_idle_anim_idx
-            && animations.is_active(idle_index)
-        {
-            animations.set_active(idle_index, false);
-        }
-        
-        if let Some(moving_index) = self.weapon_moving_anim_idx
-            && animations.is_active(moving_index)
-        {
-            animations.set_active(moving_index, false);
-        }
-        
-        if let Some(idx) = self.model_data[self.weapon_model_index].find_animation_by_name(name) {
-            animations.set_active(idx, true);
-        }
-    }
-
-    // --- Private update methods ---
-
-    fn update_camera_rotation_towards_grunt(&mut self, dt: f32) {
-        if self.rotation_towards_grunt < 1.0 {
-            let grunt_pos = self.objects.get(self.grunt_index).position;
-            self.camera.rotate_towards_point(grunt_pos, self.rotation_towards_grunt);
-            self.rotation_towards_grunt = (self.rotation_towards_grunt + dt * 2.0).min(1.0);
-        }
-    }
-
     fn update_movement(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
-        if self.flycam {
-            self.update_movement_flycam(keys, dt);
-        } else {
-            self.update_movement_player(keys, dt);
-        }
-    }
-
-    fn update_movement_flycam(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
         let mut move_dir = Vec3::ZERO;
         if keys.contains(&KeyCode::KeyW) { move_dir += self.camera.forward; }
         if keys.contains(&KeyCode::KeyS) { move_dir -= self.camera.forward; }
@@ -352,134 +634,7 @@ impl GameState {
             speed *= 2.0;
         }
 
-        self.is_moving = move_dir.length_squared() > 0.0;
         self.camera.velocity = move_dir * speed * dt;
         self.camera.update();
-    }
-
-    fn update_movement_player(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
-        // Horizontal input — project forward/right onto XY plane
-        let forward_xy = Vec2::new(self.camera.forward.x, self.camera.forward.y).normalize_or_zero();
-        let right_xy = Vec2::new(self.camera.right.x, self.camera.right.y).normalize_or_zero();
-
-        let mut move_dir = Vec2::ZERO;
-        if keys.contains(&KeyCode::KeyW) { move_dir += forward_xy; }
-        if keys.contains(&KeyCode::KeyS) { move_dir -= forward_xy; }
-        if keys.contains(&KeyCode::KeyA) { move_dir += right_xy; }
-        if keys.contains(&KeyCode::KeyD) { move_dir -= right_xy; }
-        self.is_moving = move_dir.length_squared() > 0.0;
-        if self.is_moving {
-            move_dir = move_dir.normalize();
-        }
-
-        let mut speed = MOVEMENT_SPEED;
-        if keys.contains(&KeyCode::ShiftLeft) || keys.contains(&KeyCode::ShiftRight) {
-            speed *= 2.0;
-        }
-
-        // Apply horizontal movement + wall collision
-        let new_xy = self.camera.position.truncate() + move_dir * speed * dt;
-        let feet_z = self.camera.position.z - EYE_HEIGHT;
-        let resolved_xy = collision::collide_and_slide(
-            new_xy,
-            feet_z,
-            &self.collision_mesh.wall_segments,
-            PLAYER_RADIUS,
-        );
-        self.camera.position.x = resolved_xy.x;
-        self.camera.position.y = resolved_xy.y;
-
-        // Jump
-        if keys.contains(&KeyCode::Space) && self.physics.is_grounded {
-            self.physics.vertical_velocity = JUMP_VELOCITY;
-            self.physics.is_grounded = false;
-        }
-
-        // Gravity
-        if !self.physics.is_grounded {
-            self.physics.vertical_velocity -= GRAVITY * dt;
-        }
-
-        // Apply vertical movement
-        self.camera.position.z += self.physics.vertical_velocity * dt;
-
-        // Ground check
-        if let Some(ground_z) = collision::ground_raycast(
-            self.camera.position,
-            &self.collision_mesh.floor_triangles,
-        ) {
-            let feet_z = self.camera.position.z - EYE_HEIGHT;
-            if feet_z <= ground_z + GROUND_SNAP && self.physics.vertical_velocity <= 0.0 {
-                self.camera.position.z = ground_z + EYE_HEIGHT;
-                self.physics.vertical_velocity = 0.0;
-                self.physics.is_grounded = true;
-            } else if feet_z > ground_z + GROUND_SNAP {
-                self.physics.is_grounded = false;
-            }
-        } else {
-            self.physics.is_grounded = false;
-        }
-
-        self.camera.velocity = Vec3::ZERO;
-        self.camera.update();
-    }
-
-    fn update_weapon_viewmodel(&mut self) {
-        if self.weapon_detached {
-            return;
-        }
-        let weapon = self.objects.get_mut(self.weapon_index);
-        weapon.position = self.camera.position + Vec3::new(0.0, 0.0, -0.015);
-        weapon.rotation = Vec3::new(0.0, -self.camera.rotation.y, self.camera.rotation.x);
-    }
-
-    fn update_flashlight(&mut self) {
-        let light = self.lights.get_mut(self.flashlight_index);
-        light.position = self.camera.position + (self.camera.forward * 0.25);
-        light.direction = self.camera.forward;
-    }
-
-    fn update_weapon_animations(&mut self) {
-        let object = self.objects.get_mut(self.weapon_index);
-        let animations = object.animations.as_mut().unwrap();
-
-        for (index, animation) in self.model_data[self.weapon_model_index].animations.iter().enumerate() {
-            match animation.name.as_str() {
-                "first_person ready" | "first_person idle" | "first_person moving" => continue,
-
-                _ => {
-                    if animations.is_active(index) {
-                        return;
-                    }
-                }
-            }
-        }
-
-        match (self.weapon_idle_anim_idx, self.weapon_moving_anim_idx) {
-            (Some(idle_idx), Some(moving_idx)) => {
-                let was_moving_active = animations.is_active(moving_idx);
-                let was_idle_active = animations.is_active(idle_idx);
-
-                if self.is_moving {
-                    if was_idle_active {
-                        animations.set_active(idle_idx, false);
-                    }
-                    if !was_moving_active {
-                        animations.set_active(moving_idx, true);
-                    }
-                } else {
-                    if was_moving_active {
-                        animations.set_active(moving_idx, false);
-                    }
-                    if !was_idle_active {
-                        animations.set_active(idle_idx, true);
-                    }
-                }
-
-                animations.set_speed(moving_idx, if self.is_moving { 1.0 } else { 0.0 });
-            }
-
-            _ => todo!(),
-        }
     }
 }
