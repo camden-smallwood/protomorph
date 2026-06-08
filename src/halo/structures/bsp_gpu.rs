@@ -19,7 +19,7 @@ use wgpu::util::DeviceExt;
 
 use crate::halo::geometry::ModelVertex;
 use crate::halo::render::shared::SharedResources;
-use crate::halo::render_methods::material_bindings::{fallback_view_for_param, is_linear_param_name};
+use crate::halo::render_methods::material_bindings::{fallback_view_for_param, sample_intent_for_param};
 use crate::halo::render_methods::materials::{
     InlinePixelFormat, InlineTexture, MaterialData, MaterialTextureUsage,
 };
@@ -100,6 +100,23 @@ pub struct BspMeshPart {
     /// (`is_transparent ? 4 : (part_type & 3)`); the render passes mask
     /// against `flags` to filter parts.
     pub part_type: i8,
+    /// Model-space transparent sort centroid — `RenderMeshPart.sort_position
+    /// .position`. BSP geometry is world-space (identity transform), so for
+    /// cluster parts this is already the world centroid; instance parts
+    /// transform it by the instance matrix. `None` when unauthored. Drives
+    /// the back-to-front transparent sort `z_sort` (engine
+    /// `c_transparency_renderer::add_element`).
+    pub sort_centroid: Option<[f32; 3]>,
+    /// Model-space transparent sort PLANE — `RenderMeshPart.sort_position
+    /// .plane` `(i, j, k, d)`. Fed to the engine transparent sort's stage-2
+    /// BSP plane sort (`c_transparency_renderer::sort_plane_and_point`).
+    /// `None` when unauthored. Combined with `sort_radius > 0.0001` and
+    /// `|n| > 0.5`, this makes the element `use_plane` (engine `add_element`).
+    pub sort_plane: Option<[f32; 4]>,
+    /// `RenderMeshPart.sort_position.radius` — the authored sort-quad radius.
+    /// Engine `add_element` uses it to gate `use_plane`, scale `importance`,
+    /// and size the 9 anchor points. `0.0` when unauthored.
+    pub sort_radius: f32,
 }
 
 pub struct BspMaterial {
@@ -177,6 +194,10 @@ pub struct BspMaterial {
     /// with `_vertex_type_water`), separately from cluster_parts /
     /// transparency. Per `reference_dllcache_water_pipeline.md`.
     pub is_water: bool,
+    /// Transparent draw-order bucket — the render_method's authored
+    /// `sort layer` mapped to `TransparentSortLayer`. Primary key of the
+    /// back-to-front transparent sort. `Normal` for opaque/stub materials.
+    pub sort_layer: crate::halo::render::render_transparents::TransparentSortLayer,
 }
 
 impl BspMaterial {
@@ -396,12 +417,13 @@ pub struct BspGpu {
     /// giving each cluster its own light set (stable across camera
     /// motion, no inter-frame popping).
     pub cluster_simple_lights_offsets: Vec<u32>,
-    /// Resolved `MaterialData` for the FIRST `rmw` material on this
-    /// BSP (if any). Phase A4b will turn this into a per-rmw-material
-    /// cache; for now riverworld has 1 rmw material so single-slot
-    /// works. WaterRenderer reads this at scenario load to extract
-    /// the env_cubemap + reflection/fresnel coefficients (Phase A6a).
-    pub water_material_data: Option<MaterialData>,
+    /// Resolved `MaterialData` for EVERY distinct `rmw` material on this
+    /// BSP, paired with its `material_index` into `sbsp.materials` (the
+    /// same index each `WaterMeshPart` carries). docks has two
+    /// (`dock_water_1` + `dock_water_2`); riverworld has one.
+    /// WaterRenderer builds a per-material slot from each at scenario
+    /// load and selects by `material_index` per water part.
+    pub water_materials: Vec<(u16, MaterialData)>,
     /// Per-cluster scenario cubemap probe selection. `cluster_to_probe[i]`
     /// is the index into `scenario.cubemaps[]` (and
     /// `<scenario>_<bsp>_cubemaps.bitmap` atlas slices) chosen for
@@ -470,7 +492,7 @@ impl BspGpu {
         cubemap_routing: Option<&BspCubemapRouting>,
     ) -> Self {
         let mut materials: Vec<Option<BspMaterial>> = Vec::with_capacity(bsp.sbsp.materials.len());
-        let mut water_material_data: Option<MaterialData> = None;
+        let mut water_materials: Vec<(u16, MaterialData)> = Vec::new();
         // P6.5 — collected during material walk; one entry per animated
         // material. Empty when the BSP has no TagFunction-time materials.
         let mut animated_materials: Vec<AnimatedMaterial> = Vec::new();
@@ -702,14 +724,26 @@ impl BspGpu {
                 render_method_group_tag: mat.render_method_group_tag,
                 is_transparent,
                 is_water,
+                sort_layer: mat_data
+                    .render_method_source
+                    .as_ref()
+                    .map(|s| {
+                        crate::halo::render::render_transparents::TransparentSortLayer::from_global(
+                            s.rmsh.sort_layer.get(),
+                        )
+                    })
+                    .unwrap_or(crate::halo::render::render_transparents::TransparentSortLayer::Normal),
             }));
-            // Capture the FIRST rmw material's resolved data so
-            // WaterRenderer can extract env_cubemap + reflection /
-            // fresnel coefficients (Phase A6a). Riverworld has 1
-            // rmw material; Phase A4b will replace this with a
-            // per-rmw-material cache when multi-material levels arrive.
-            if is_water && water_material_data.is_none() {
-                water_material_data = Some(mat_data);
+            // Capture EVERY rmw material's resolved data + its
+            // material_index so WaterRenderer can build a per-material
+            // slot (env_cubemap + reflection/fresnel + wave/foam/
+            // global_shape textures + variant pipeline) and route each
+            // water part to the right one. docks has 2 (dock_water_1 /
+            // dock_water_2); rendering them both is what makes its
+            // harbor look right (the single-material path forced every
+            // surface onto dock_water_1 → wrong wave size / no foam).
+            if is_water {
+                water_materials.push((mi as u16, mat_data));
             }
         }
 
@@ -760,6 +794,13 @@ impl BspGpu {
                     index_start: p.index_start,
                     index_count: p.index_count,
                     part_type: p.part_type,
+                    sort_centroid: p
+                        .sort_position
+                        .map(|sp| [sp.position.x, sp.position.y, sp.position.z]),
+                    sort_plane: p
+                        .sort_position
+                        .map(|sp| [sp.plane.i, sp.plane.j, sp.plane.k, sp.plane.d]),
+                    sort_radius: p.sort_position.map(|sp| sp.radius).unwrap_or(0.0),
                 })
                 .collect();
 
@@ -1007,7 +1048,7 @@ impl BspGpu {
                     lbsp,
                     i as i32,
                     inst.lightmap_texcoord_block_index,
-                    inst.lightmapping_policy,
+                    inst.lightmapping_policy.get(),
                     mesh_has_prt_stream,
                     has_uv,
                     has_pv,
@@ -1027,6 +1068,7 @@ impl BspGpu {
                 HaloEntryPoint::StaticShPerVertex => n_pv += 1,
                 HaloEntryPoint::StaticPrtAmbient => n_prt += 1,
                 HaloEntryPoint::Albedo => {} // not picked by select_instance_entry_point
+                HaloEntryPoint::StaticVertexColor => {} // sky-only; BSP instances never select it
                 HaloEntryPoint::Decal | HaloEntryPoint::DecalAlbedo | HaloEntryPoint::DecalObject => {} // decals don't use the instance entry-point selector
             }
         }
@@ -1170,6 +1212,11 @@ impl BspGpu {
                     continue;
                 }
                 if *next_probe_slot >= ENGINE_LIGHTING_ENTRIES {
+                    eprintln!(
+                        "[bsp_gpu] WARNING: engine_lighting_buffer slot exhausted ({} max) \
+                         — per-vertex SH probe upload skipped",
+                        ENGINE_LIGHTING_ENTRIES,
+                    );
                     continue;
                 }
                 let n = pv_block.lightprobe_data.len() as f32;
@@ -1385,7 +1432,7 @@ impl BspGpu {
             // Default — populated by `bake_cluster_simple_lights` at
             // scenario load once `scenario_lights` is resolved.
             cluster_simple_lights_offsets: vec![0u32; cluster_count],
-            water_material_data,
+            water_materials,
             cluster_to_probe: cubemap_routing
                 .map(|r| r.cluster_to_probe.clone())
                 .unwrap_or_default(),
@@ -1540,10 +1587,10 @@ fn convert_bsp_vertex(v: &blam_tags::render_model::RenderVertex) -> ModelVertex 
 pub fn upload_inline_texture(
     shared: &SharedResources,
     tex: &InlineTexture,
-    linear: bool,
+    intent: crate::halo::render::SampleIntent,
 ) -> wgpu::TextureView {
-    use crate::halo::render::inline_to_wgpu_format;
-    let format = inline_to_wgpu_format(tex.format, linear);
+    use crate::halo::render::resolve_wgpu_format;
+    let format = resolve_wgpu_format(tex.format, tex.encoding, intent);
     // BC formats need block-aligned texture extents: wgpu rejects
     // `create_texture` whose width/height aren't multiples of 4 for any
     // BC1..BC7 format. Halo's bitmap loader keeps the authored dims
@@ -1797,7 +1844,7 @@ fn resolve_material_resources(
             (Some(tex), _) => ResolvedSlotView::Fixed(upload_inline_texture(
                 shared,
                 tex,
-                is_linear_param_name(&tb.name),
+                sample_intent_for_param(&tb.name),
             )),
             // Cube extern slot with no material bitmap — defer to
             // per-probe build (substitute probe view or rasg default).
@@ -1850,26 +1897,23 @@ fn build_material_bind_group(
     shared: &SharedResources,
     artifacts: &VariantArtifacts,
     resources: &ResolvedMaterialResources,
-    _cube_override: Option<&wgpu::TextureView>,
+    cube_override: Option<&wgpu::TextureView>,
 ) -> wgpu::BindGroup {
     let bindings = &artifacts.bindings;
 
     // Materialize each slot's view (cheap Arc clone for Fixed). Cube
-    // extern slots are temporarily pinned to `black_cube_view` —
-    // routing the real probe atlas / rasg cube into the spec path
-    // blew out structures and wet-darkened rocks because our spec /
-    // env-intensity / exposure plumbing isn't ready to handle a
-    // non-zero cube. Restore `_cube_override` (and the
-    // `fallback_view_for_param` rasg routing) once that math lands;
-    // see `feedback_riverworld_darkness_is_lighting_setup.md`.
+    // extern slots take the per-probe atlas cube (`cube_override`) when
+    // the BSP has a cubemap atlas, else the 1×1 black cube. (Env math +
+    // RGBW decode are faithful; exposure now applies at composite, so
+    // the prior black-cube workaround is being re-measured — see F.)
     let views: Vec<wgpu::TextureView> = resources
         .slots
         .iter()
         .map(|(_, resolved)| match resolved {
             ResolvedSlotView::Fixed(v) => v.clone(),
-            ResolvedSlotView::CubeOverridable => {
-                shared.fallback_textures.black_cube_view.clone()
-            }
+            ResolvedSlotView::CubeOverridable => cube_override
+                .cloned()
+                .unwrap_or_else(|| shared.fallback_textures.black_cube_view.clone()),
         })
         .collect();
 

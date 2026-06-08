@@ -184,7 +184,7 @@ pub fn transform_portal(
     let mut tp = TransformedPortal::default();
     tp.cluster_indices = [cluster_portal.back_cluster, cluster_portal.front_cluster];
     tp.nearest_z = f32::INFINITY;
-    tp.flags = cluster_portal.flags as i32;
+    tp.flags = cluster_portal.flags.clone();
     tp.facing = facing;
     tp.hull = PortalHull::with_capacity(MAXIMUM_POINTS_PER_PORTAL_HULL);
 

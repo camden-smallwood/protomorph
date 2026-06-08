@@ -423,23 +423,24 @@ fn restore_slope(slope01: vec2<f32>, range: vec2<f32>) -> vec2<f32> {
 // displacement array. Mirrors the HLSL DX11 path
 // (`water_shading_fx.hlsl:585-607`) which does
 // `convert_3d_texture_coord_to_array_texture` + 2-slice lerp.
-fn sample_wave_slope(uv: vec2<f32>, slice_position: f32, mip_level: f32) -> vec2<f32> {
+fn sample_wave_slope(uv: vec2<f32>, slice_position: f32, _mip_level: f32) -> vec2<f32> {
     let n = i32(textureNumLayers(wave_slope_array));
     let z_scaled = slice_position * f32(n);
     let z_floor = floor(z_scaled);
     let slice_lo = (i32(z_floor) % n + n) % n;
     let slice_hi = (slice_lo + 1) % n;
     let t_blend = z_scaled - z_floor;
-    // wave_slope_array uses the same sampler as the displacement
-    // array (engine pairs both with `_sampler_filter_anisotropic` +
-    // `_sampler_address_mode_wrap`).
-    let s_lo = textureSampleLevel(
-        wave_slope_array, wave_displacement_array_sampler,
-        uv, slice_lo, mip_level,
+    // Engine PS slope path samples with HARDWARE/derivative mip (`.Sample`,
+    // water_shading_fx.hlsl:586-607) — the VS distance LOD (`_mip_level`) is
+    // NOT applied to the slope. Distance damping happens ONCE downstream via
+    // `normal_hack_ratio`. Using `textureSampleLevel(_mip_level)` here applied
+    // it twice → the surface normal over-blurred to flat at any distance.
+    // Use `textureSample` so the slope gets a sharp, derivative-correct mip.
+    let s_lo = textureSample(
+        wave_slope_array, wave_displacement_array_sampler, uv, slice_lo,
     ).xy;
-    let s_hi = textureSampleLevel(
-        wave_slope_array, wave_displacement_array_sampler,
-        uv, slice_hi, mip_level,
+    let s_hi = textureSample(
+        wave_slope_array, wave_displacement_array_sampler, uv, slice_hi,
     ).xy;
     return mix(s_lo, s_hi, t_blend);
 }

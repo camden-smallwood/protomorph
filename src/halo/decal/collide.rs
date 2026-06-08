@@ -68,7 +68,7 @@
 //! When these become observable bugs (e.g. seam decals on a multi-BSP
 //! map), upgrade individually.
 
-use blam_tags::decal_system::DecalSystem;
+use blam_tags::decal_system::{DecalSystem, DecalSystemFlags};
 use blam_tags::math::{RealPlane3d, RealPoint3d, RealVector3d};
 use blam_tags::structure_bsp::{Bsp3d, BspInstance, BspInstanceDefinition};
 
@@ -102,34 +102,19 @@ const SECONDARY_NUDGE_FRACTION: f32 = -0.5;
 /// instance's center while preserving the projection axis.
 const INSTANCE_SHIFT_FRACTION: f32 = 0.5;
 
-/// `c_decal_system_definition.flags` bit 7 — `no structure collision`.
-/// Engine `0x1803996B0:158-167` clears the outer tester bit that
-/// gates STRUCTURE testing (dllcache outer bit 0; 360 debug
-/// `get_no_structure_collision` accessor). Equivalent in our port to
-/// skipping the main-BSP raycast entirely.
-const SYSTEM_FLAG_NO_STRUCTURE_COLLISION: u32 = 0x80;
-
-/// `c_decal_system_definition.flags` bit 8 — `no instance collision`.
-/// Engine `0x1803996B0:161-167` clears the outer tester bit that
-/// gates INSTANCED_GEOMETRY testing (dllcache outer bit 3; 360 debug
-/// `get_no_instance_collision` accessor — note the dllcache and 360
-/// builds use different outer bits for the same semantic operation,
-/// so modeling the outer-flag space is unhelpful for our port; we
-/// just gate the instance walker directly).
-const SYSTEM_FLAG_NO_INSTANCE_COLLISION: u32 = 0x100;
-
-/// Top-level "skip ALL secondary work" gate at `0x1803996B0:212`.
-/// Engine: `if ((flags & 0x40) == 0 && (flags & 8) == 0 && (flags & 0x10) == 0)`
-const SYSTEM_FLAG_PRIMARY_ONLY: u32 = 0x40;
-/// Engine `0x1803996B0:212` — second of the three skip-secondary bits.
-const SYSTEM_FLAG_SKIP_INSTANCE_SECONDARY: u32 = 0x08;
-/// Engine `0x1803996B0:212` — third of the three skip-secondary bits.
-const SYSTEM_FLAG_SKIP_STRUCTURE_SECONDARY: u32 = 0x10;
-
-/// Engine `0x1803996B0:255` and `:402` — when set, the secondary cast
-/// must hit a surface with the SAME `material_index` as the primary;
-/// otherwise the secondary hit is dropped.
-const SYSTEM_FLAG_RESTRICT_TO_PRIMARY_MATERIAL: u32 = 0x20;
+// `decal_system.flags` bits the engine `c_decal_system::collide`
+// (`0x1803996B0`) consults — referenced via the typed `DecalSystemFlags`
+// variants. The bit↔engine-semantics map (schema authoring name → engine
+// collide use):
+//   DontCollideWithStructure  (bit 7, 0x80)  — :158-167 skip main-BSP cast.
+//   DontCollideWithInstances  (bit 8, 0x100) — :161-167 skip instance walk.
+//   UsePrimaryCollisionOnly   (bit 6, 0x40)  — :212 skip-all-secondary gate.
+//   ForceQuad                 (bit 3, 0x08)  — :212 skip-instance-secondary.
+//   ForcePlanar               (bit 4, 0x10)  — :212 skip-structure-secondary.
+//   RestrictToSingleMaterial  (bit 5, 0x20)  — :255/:402 secondary must hit
+//                                              the primary's material_index.
+// (Bits 3/4 carry authoring names `force quad`/`force planar`; the engine
+// reuses them as the secondary-skip gates above.)
 
 /// Maximum collisions per placement — `c_static_sized_dynamic_array<...,16>`.
 pub const K_MAX_DECAL_COLLISIONS: usize = 16;
@@ -179,7 +164,7 @@ pub fn collide(
             instances.len(), bsp.nodes.len(), bsp.edges.len(), bsp.surfaces.len(),
         );
     }
-    let def_flags = decal_system.flags;
+    let def_flags = &decal_system.flags;
     let cylinder_size = decal_system.runtime_max_radius;
     if cylinder_size <= 0.0 {
         return false;
@@ -195,8 +180,8 @@ pub fn collide(
     // flags stay fixed at `DECAL_DEFAULT` (the engine's outer→inner
     // remap result for the decal call site).
     let bsp_flags = flag::DECAL_DEFAULT;
-    let test_main_bsp = (def_flags & SYSTEM_FLAG_NO_STRUCTURE_COLLISION) == 0;
-    let test_instances = (def_flags & SYSTEM_FLAG_NO_INSTANCE_COLLISION) == 0;
+    let test_main_bsp = !def_flags.contains(DecalSystemFlags::DontCollideWithStructure);
+    let test_instances = !def_flags.contains(DecalSystemFlags::DontCollideWithInstances);
 
     // ---- Normalize velocity, nudge origin back by 0.01 ----
     let v = [world_velocity.i, world_velocity.j, world_velocity.k];
@@ -268,11 +253,11 @@ pub fn collide(
     world_projection.position = primary.point;
 
     // ---- Decide whether to do secondary tests (engine 0x1803996B0:212) ----
-    let do_secondary = (def_flags
-        & (SYSTEM_FLAG_PRIMARY_ONLY
-            | SYSTEM_FLAG_SKIP_INSTANCE_SECONDARY
-            | SYSTEM_FLAG_SKIP_STRUCTURE_SECONDARY))
-        == 0;
+    let do_secondary = !def_flags.test_any(&[
+        DecalSystemFlags::UsePrimaryCollisionOnly,
+        DecalSystemFlags::ForceQuad,
+        DecalSystemFlags::ForcePlanar,
+    ]);
     if !do_secondary {
         return true;
     }
@@ -634,8 +619,12 @@ fn point_from_t(origin: [f32; 3], vector: [f32; 3], t: f32) -> [f32; 3] {
 
 /// Engine `(def.flags & 0x20) == 0 || primary.material == hit.material`
 /// at lines 255 and 402. Centralizing for both secondary callers.
-fn material_match(def_flags: u32, primary_material: i16, hit_material: i16) -> bool {
-    if (def_flags & SYSTEM_FLAG_RESTRICT_TO_PRIMARY_MATERIAL) == 0 {
+fn material_match(
+    def_flags: &blam_tags::Flags<DecalSystemFlags, u32>,
+    primary_material: i16,
+    hit_material: i16,
+) -> bool {
+    if !def_flags.contains(DecalSystemFlags::RestrictToSingleMaterial) {
         return true;
     }
     primary_material == hit_material
@@ -662,7 +651,9 @@ fn material_match(def_flags: u32, primary_material: i16, hit_material: i16) -> b
 /// For instance hits the engine routes through the instance-aware
 /// overload at `0x18039FE50` — see [`decalable_surface_instance`].
 fn decalable_surface(result: &CollisionBspResult) -> bool {
-    (result.flags & 0x3B) == 0 && result.material_index != -1
+    use blam_tags::structure_bsp::CollisionSurfaceFlags::*;
+    !result.flags.test_any(&[TwoSided, Invisible, Breakable, Invalid, Conveyor])
+        && result.material_index != -1
 }
 
 /// Mirror of `s_decal_collision_result::decalable_surface() const

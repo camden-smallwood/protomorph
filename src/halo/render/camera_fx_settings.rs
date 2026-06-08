@@ -22,6 +22,12 @@
 
 use glam::Vec3;
 
+use blam_tags::camera_fx_settings::{
+    CameraFxAutoAdjustFlags, CameraFxBlingSpikesFlags, CameraFxParameterFlags,
+};
+use blam_tags::structure_bsp::CameraFxPaletteFlags;
+use blam_tags::Flags;
+
 // ---------------------------------------------------------------------------
 // s_scripted_exposure (52B) — global script-driven exposure override.
 // ---------------------------------------------------------------------------
@@ -195,30 +201,12 @@ impl ScriptedExposure {
 //
 // The cfxs nested parameter types (`s_real_parameter`,
 // `s_real_instant_parameter`, `s_color_parameter`, `s_word_parameter`,
-// `s_real_exposure_parameter`) all share the same 16-bit flag field
-// (`m_flags`). The shapes themselves live in `blam_tags::camera_fx_settings`
-// (`ScalarParameter`, `InstantScalarParameter`, etc.) — the L2/L3 update
-// helpers in this file consume those types directly.
-//
-// `ParameterFlags` is a unit-struct namespace for the bit constants.
-
-pub struct ParameterFlags;
-
-impl ParameterFlags {
-    /// Bit 0 — `use default (ignore these values)`. The 4-level fallback
-    /// chooser treats the parameter as absent and walks to the next source.
-    pub const USE_DEFAULT_BIT: u16 = 1 << 0;
-    /// Bit 1 — `s_real_parameter::calculate_new_value` scales `m_blend_limit`
-    /// by `|old|` (relative cap rather than absolute).
-    pub const BLEND_LIMIT_RELATIVE_BIT: u16 = 1 << 1;
-    /// Bit 2 — auto-adjust target. `s_real_exposure_parameter` reads the
-    /// auto-exposure sensor sample instead of using `m_target` directly.
-    pub const AUTO_BIT: u16 = 1 << 2;
-    /// Bit 3 — `double sided star` (bling cosmetic).
-    pub const DOUBLE_SIDED_STAR_BIT: u16 = 1 << 3;
-    /// Bit 4 — `fixed` (UI hint, not consumed by the runtime math).
-    pub const FIXED_BIT: u16 = 1 << 4;
-}
+// `s_real_exposure_parameter`) carry a `flags` field that is now decoded by
+// schema NAME into the typed `Flags<…>` wrappers in
+// `blam_tags::camera_fx_settings` — distinct types per block, since bit 2
+// means `auto-adjust target` on the exposure block but `(unused)` on the
+// rest. The helpers below query those typed flags with `.contains(…)` and
+// logical variant names rather than raw bit masks.
 
 // ---------------------------------------------------------------------------
 // c_exposure (304B) — autoexposure sliding-window history.
@@ -467,7 +455,7 @@ impl Exposure {
     pub fn calculate_new_value(
         &mut self,
         params: &blam_tags::camera_fx_settings::ExposureBlock,
-        flags: u16,
+        flags: &Flags<CameraFxAutoAdjustFlags, u16>,
         exposure_target: f32,
         auto_exposure_screen_brightness: f32,
         exposure_min: f32,
@@ -480,7 +468,7 @@ impl Exposure {
         // static target; with the AUTO_BIT set, replaced by
         // `prev + screen_brightness_target - actual_brightness`.
         let mut v9 = exposure_target;
-        if (flags & ParameterFlags::AUTO_BIT) != 0 {
+        if flags.contains(CameraFxAutoAdjustFlags::AutoAdjustTarget) {
             let v10 = actual_brightness.unwrap_or(0.0);
             v9 = self.prev_exposure + auto_exposure_screen_brightness - v10;
         }
@@ -535,7 +523,7 @@ impl Exposure {
             let t = TRACE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if t % 60 == 0 {
                 eprintln!(
-                    "[exposure-trace] flags=0x{:04x} target={:.3} auto_b={:.4} min={:.2} max={:.2} \
+                    "[exposure-trace] flags={:?} target={:.3} auto_b={:.4} min={:.2} max={:.2} \
                      blend_speed={:.4} delay={:.4} actual_b={:?} prev={:.4} m_exp={:.4} \
                      v9_pre={:.4} v9_clamped={:.4} hist_min={:.4} hist_max={:.4} blend={}",
                     flags,
@@ -620,7 +608,7 @@ pub fn calc_new_value(
         return new_value;
     }
 
-    let limit = if (param.flags & ParameterFlags::BLEND_LIMIT_RELATIVE_BIT) != 0 {
+    let limit = if param.flags.contains(CameraFxParameterFlags::MaxChangeIsRelative) {
         blend_limit_raw * old.abs()
     } else {
         blend_limit_raw
@@ -699,7 +687,7 @@ pub fn update_color(
 pub fn update_real_exposure(
     param: &blam_tags::camera_fx_settings::ExposureBlock,
     exposure: &mut Exposure,
-    flags: u16,
+    flags: &Flags<CameraFxAutoAdjustFlags, u16>,
     target: f32,
     auto_exposure_screen_brightness: f32,
     min: f32,
@@ -719,30 +707,28 @@ pub fn update_real_exposure(
 // parameter inside the engine's `c_camera_fx_values::update`).
 // ---------------------------------------------------------------------------
 
-/// Trait that abstracts the `flags` field common to every cfxs sub-parameter.
-/// Bit 0 (USE_DEFAULT_BIT) signals "ignore this source, fall to the next".
+/// Trait that abstracts the `UseDefault` bit common to every cfxs
+/// sub-parameter. When set it signals "ignore this source, fall to the
+/// next" in the 4-level chooser. Each block carries a different typed
+/// flag enum, so the bit is queried per-impl with `.contains(…)`.
 pub trait UseDefaultFlag {
-    fn flags_word(&self) -> u16;
-
-    fn use_default(&self) -> bool {
-        (self.flags_word() & ParameterFlags::USE_DEFAULT_BIT) != 0
-    }
+    fn use_default(&self) -> bool;
 }
 
 impl UseDefaultFlag for blam_tags::camera_fx_settings::ScalarParameter {
-    fn flags_word(&self) -> u16 { self.flags }
+    fn use_default(&self) -> bool { self.flags.contains(CameraFxParameterFlags::UseDefault) }
 }
 impl UseDefaultFlag for blam_tags::camera_fx_settings::InstantScalarParameter {
-    fn flags_word(&self) -> u16 { self.flags }
+    fn use_default(&self) -> bool { self.flags.contains(CameraFxParameterFlags::UseDefault) }
 }
 impl UseDefaultFlag for blam_tags::camera_fx_settings::ColorParameter {
-    fn flags_word(&self) -> u16 { self.flags }
+    fn use_default(&self) -> bool { self.flags.contains(CameraFxParameterFlags::UseDefault) }
 }
 impl UseDefaultFlag for blam_tags::camera_fx_settings::WordParameter {
-    fn flags_word(&self) -> u16 { self.flags }
+    fn use_default(&self) -> bool { self.flags.contains(CameraFxBlingSpikesFlags::UseDefault) }
 }
 impl UseDefaultFlag for blam_tags::camera_fx_settings::ExposureBlock {
-    fn flags_word(&self) -> u16 { self.flags }
+    fn use_default(&self) -> bool { self.flags.contains(CameraFxAutoAdjustFlags::UseDefault) }
 }
 
 /// 4-level fallback chooser, mirroring the inlined per-parameter walk in
@@ -799,20 +785,22 @@ pub fn choose_valid<'a, P: UseDefaultFlag>(
 /// matches the engine.
 #[derive(Debug, Clone)]
 pub struct ClusterCameraFxPaletteOverrides {
-    /// `flags` byte.
-    ///   Bit 0 (`flags & 1`) → `forced_exposure` overrides exposure target,
-    ///                         clears AUTO_BIT (becomes fixed-stops mode).
-    ///   Bit 1 (`flags & 2`) → `forced_auto_exposure_brightness` overrides
+    /// `flags`, schema-name-resolved into [`CameraFxPaletteFlags`].
+    ///   `ForceExposure` → `forced_exposure` overrides exposure target,
+    ///                     clears `AutoAdjustTarget` (fixed-stops mode).
+    ///   `ForceAutoExposure` → `forced_auto_exposure_brightness` overrides
     ///                         the auto-exposure screen-brightness target,
-    ///                         sets AUTO_BIT.
-    ///   Bit 2 (`flags & 4`) → `exposure_min` / `exposure_max` override the
-    ///                         clamp range.
-    ///   Bit 3 (`flags & 8`) → `inherent_bloom` + `bloom_intensity` override
-    ///                         the bloom params.
-    pub flags: u8,
-    /// Engine offset 0x18 — read on `flags & 1`.
+    ///                         sets `AutoAdjustTarget`.
+    ///   `OverrideExposureBounds` → `exposure_min` / `exposure_max` override
+    ///                              the clamp range.
+    ///   `OverrideInherentBloom` → `inherent_bloom` + `bloom_intensity`
+    ///                             override the bloom params (engine
+    ///                             0x180687CB0 gates BOTH on this one bit;
+    ///                             `OverrideBloomIntensity` is unconsumed).
+    pub flags: Flags<CameraFxPaletteFlags, u8>,
+    /// Engine offset 0x18 — read on `ForceExposure`.
     pub forced_exposure: f32,
-    /// Engine offset 0x1C — read on `flags & 2`. Distinct from
+    /// Engine offset 0x1C — read on `ForceAutoExposure`. Distinct from
     /// `forced_exposure`; both are present in the 48B palette entry as
     /// two separate floats. The previous protomorph version reused
     /// `forced_exposure` for both paths — fixed 2026-05-20.
@@ -835,44 +823,48 @@ pub struct ClusterCameraFxPaletteOverrides {
 pub fn defaulted_script_settings() -> blam_tags::camera_fx_settings::CameraFxSettings {
     use blam_tags::camera_fx_settings::*;
     let scalar_default = ScalarParameter {
-        flags: ParameterFlags::USE_DEFAULT_BIT,
+        flags: Flags::from_slice(&[CameraFxParameterFlags::UseDefault]),
         ..Default::default()
     };
     let instant_default = InstantScalarParameter {
-        flags: ParameterFlags::USE_DEFAULT_BIT,
+        flags: Flags::from_slice(&[CameraFxParameterFlags::UseDefault]),
         ..Default::default()
     };
     let color_default = ColorParameter {
-        flags: ParameterFlags::USE_DEFAULT_BIT,
+        flags: Flags::from_slice(&[CameraFxParameterFlags::UseDefault]),
         ..Default::default()
     };
     let word_default = WordParameter {
-        flags: ParameterFlags::USE_DEFAULT_BIT,
+        flags: Flags::from_slice(&[CameraFxBlingSpikesFlags::UseDefault]),
         ..Default::default()
     };
 
     let mut s = CameraFxSettings::default();
     // Engine `set_defaults` writes flags = `use_default | 6` for m_exposure
-    // (sets BLEND_LIMIT_RELATIVE + AUTO bits) and `use_default` (=1) for
-    // every other parameter.
-    s.exposure.flags = ParameterFlags::USE_DEFAULT_BIT
-        | ParameterFlags::BLEND_LIMIT_RELATIVE_BIT
-        | ParameterFlags::AUTO_BIT;
+    // (sets `MaxChangeIsRelative` + `AutoAdjustTarget` bits) and
+    // `use_default` (=1) for every other parameter.
+    s.exposure.flags = Flags::from_slice(&[
+        CameraFxAutoAdjustFlags::UseDefault,
+        CameraFxAutoAdjustFlags::MaxChangeIsRelative,
+        CameraFxAutoAdjustFlags::AutoAdjustTarget,
+    ]);
     s.exposure.blend_speed = 0.05;
     s.exposure.maximum_change = 0.05;
-    s.auto_exposure_sensitivity = instant_default;
+    // Blocks are no longer `Copy` (they carry typed `Flags`), so each reused
+    // default is cloned per assignment.
+    s.auto_exposure_sensitivity = instant_default.clone();
     s.auto_exposure_anti_bloom = instant_default;
-    s.bloom_point = scalar_default;
-    s.bloom_inherent = scalar_default;
-    s.bloom_intensity = scalar_default;
-    s.bloom_large_color = color_default;
-    s.bloom_medium_color = color_default;
+    s.bloom_point = scalar_default.clone();
+    s.bloom_inherent = scalar_default.clone();
+    s.bloom_intensity = scalar_default.clone();
+    s.bloom_large_color = color_default.clone();
+    s.bloom_medium_color = color_default.clone();
     s.bloom_small_color = color_default;
-    s.bling_intensity = scalar_default;
-    s.bling_size = scalar_default;
-    s.bling_angle_deg = scalar_default;
+    s.bling_intensity = scalar_default.clone();
+    s.bling_size = scalar_default.clone();
+    s.bling_angle_deg = scalar_default.clone();
     s.bling_count = word_default;
-    s.self_illum_preferred = scalar_default;
+    s.self_illum_preferred = scalar_default.clone();
     s.self_illum_scale = scalar_default;
     // ssao / lightshafts / color_grading: blam-tags walker shape is
     // `Option<...>`. Engine `set_defaults` populates these inline with
@@ -941,7 +933,7 @@ impl CameraFxValues {
             &script_settings.exposure as *const _,
         );
 
-        let mut flags = chosen_exp.flags;
+        let mut flags = chosen_exp.flags.clone();
         let mut target = chosen_exp.exposure;
         let mut auto_target = chosen_exp.auto_exposure_screen_brightness;
         let mut min = chosen_exp.minimum;
@@ -951,19 +943,21 @@ impl CameraFxValues {
         // `cluster_palette && v13 != script_settings`.
         if let Some(o) = cluster_palette_overrides {
             if chose_other_than_script {
-                if (o.flags & 1) != 0 {
-                    // Engine: `m_flags = m_flags & 0xFB` (clear AUTO_BIT = bit 2).
-                    flags &= !ParameterFlags::AUTO_BIT;
+                if o.flags.contains(CameraFxPaletteFlags::ForceExposure) {
+                    // Engine: `m_flags = m_flags & 0xFB` (clear bit 2 =
+                    // `AutoAdjustTarget`) — becomes fixed-stops mode.
+                    flags.set(CameraFxAutoAdjustFlags::AutoAdjustTarget, false);
                     target = o.forced_exposure;
                 }
-                if (o.flags & 2) != 0 {
-                    // Engine: `m_flags = m_flags | 4` (set AUTO_BIT).
-                    // Reads the SEPARATE float at offset 0x1C, not the
-                    // forced_exposure at 0x18 (engine struct has both).
-                    flags |= ParameterFlags::AUTO_BIT;
+                if o.flags.contains(CameraFxPaletteFlags::ForceAutoExposure) {
+                    // Engine: `m_flags = m_flags | 4` (set bit 2 =
+                    // `AutoAdjustTarget`). Reads the SEPARATE float at
+                    // offset 0x1C, not the forced_exposure at 0x18
+                    // (engine struct has both).
+                    flags.set(CameraFxAutoAdjustFlags::AutoAdjustTarget, true);
                     auto_target = o.forced_auto_exposure_brightness;
                 }
-                if (o.flags & 4) != 0 {
+                if o.flags.contains(CameraFxPaletteFlags::OverrideExposureBounds) {
                     min = o.exposure_min;
                     max = o.exposure_max;
                 }
@@ -971,7 +965,7 @@ impl CameraFxValues {
         }
 
         update_real_exposure(
-            chosen_exp, &mut self.exposure, flags, target, auto_target, min, max,
+            chosen_exp, &mut self.exposure, &flags, target, auto_target, min, max,
             actual_brightness, auto_exposure_lock, scripted,
         );
 
@@ -1011,13 +1005,16 @@ impl CameraFxValues {
         );
         let mut tgt = chosen.value;
         if let Some(o) = cluster_palette_overrides {
-            if chose_other_than_script && (o.flags & 8) != 0 {
+            if chose_other_than_script && o.flags.contains(CameraFxPaletteFlags::OverrideInherentBloom) {
                 tgt = o.inherent_bloom;
             }
         }
         update_real_with_override(chosen, &mut self.bloom_inherent, tgt);
 
-        // === bloom_intensity (engine lines 175-194) — has cluster_palette flag-8 override ===
+        // === bloom_intensity (engine lines 175-194) — cluster_palette override
+        //     gated on the SAME OverrideInherentBloom bit (engine 0x180687CB0
+        //     reuses bit 3 for both bloom params; OverrideBloomIntensity is
+        //     defined in the schema but not consumed by this engine rev) ===
         let chosen = choose_valid(
             &script_settings.bloom_intensity,
             cluster_settings.map(|c| &c.bloom_intensity),
@@ -1026,7 +1023,7 @@ impl CameraFxValues {
         );
         let mut tgt = chosen.value;
         if let Some(o) = cluster_palette_overrides {
-            if chose_other_than_script && (o.flags & 8) != 0 {
+            if chose_other_than_script && o.flags.contains(CameraFxPaletteFlags::OverrideInherentBloom) {
                 tgt = o.bloom_intensity;
             }
         }
@@ -1150,14 +1147,19 @@ mod tests {
     };
     use blam_tags::math::RealRgbColor;
 
-    fn rp(value: f32, max_change: f32, blend_speed: f32, flags: u16) -> ScalarParameter {
-        ScalarParameter { flags, value, max_change, blend_speed }
+    fn rp(
+        value: f32,
+        max_change: f32,
+        blend_speed: f32,
+        flags: &[CameraFxParameterFlags],
+    ) -> ScalarParameter {
+        ScalarParameter { flags: Flags::from_slice(flags), value, max_change, blend_speed }
     }
 
     #[test]
     fn calc_new_value_unclamped_when_blend_limit_negative() {
         // m_blend_limit < 0 → ignore the cap, plain lerp.
-        let p = rp(10.0, -1.0, 0.5, 0);
+        let p = rp(10.0, -1.0, 0.5, &[]);
         let v = calc_new_value(&p, 0.0, 10.0);
         assert!((v - 5.0).abs() < 1e-6);
     }
@@ -1166,7 +1168,7 @@ mod tests {
     fn calc_new_value_clamps_overstep() {
         // blend_speed=1.0 → new = target = 10.0; |delta| = 10 > limit 2.
         // Engine clamps to old + limit = 0 + 2 = 2.0.
-        let p = rp(10.0, 2.0, 1.0, 0);
+        let p = rp(10.0, 2.0, 1.0, &[]);
         let v = calc_new_value(&p, 0.0, 10.0);
         assert!((v - 2.0).abs() < 1e-6);
     }
@@ -1174,7 +1176,7 @@ mod tests {
     #[test]
     fn calc_new_value_clamps_negative_overstep() {
         // Going from 5.0 toward -10.0 with limit 1.5 → clamp to 5 - 1.5 = 3.5.
-        let p = rp(-10.0, 1.5, 1.0, 0);
+        let p = rp(-10.0, 1.5, 1.0, &[]);
         let v = calc_new_value(&p, 5.0, -10.0);
         assert!((v - 3.5).abs() < 1e-6);
     }
@@ -1183,7 +1185,7 @@ mod tests {
     fn calc_new_value_relative_blend_limit_scales_by_old_abs() {
         // BLEND_LIMIT_RELATIVE_BIT (=2) → limit *= |old|.
         // old=4, blend_limit_raw=0.25 → limit = 1.0.
-        let p = rp(20.0, 0.25, 1.0, ParameterFlags::BLEND_LIMIT_RELATIVE_BIT);
+        let p = rp(20.0, 0.25, 1.0, &[CameraFxParameterFlags::MaxChangeIsRelative]);
         let v = calc_new_value(&p, 4.0, 20.0);
         assert!((v - 5.0).abs() < 1e-6); // 4 + 1.0
     }
@@ -1191,14 +1193,14 @@ mod tests {
     #[test]
     fn calc_new_value_small_step_returns_lerp() {
         // |delta| <= limit → no clamping, return the lerp.
-        let p = rp(10.0, 100.0, 0.5, 0);
+        let p = rp(10.0, 100.0, 0.5, &[]);
         let v = calc_new_value(&p, 0.0, 10.0);
         assert!((v - 5.0).abs() < 1e-6);
     }
 
     #[test]
     fn update_real_uses_param_target() {
-        let p = rp(8.0, -1.0, 0.25, 0);
+        let p = rp(8.0, -1.0, 0.25, &[]);
         let mut v = 0.0;
         update_real(&p, &mut v);
         // (1 - 0.25) * 0 + 0.25 * 8 = 2.0
@@ -1207,7 +1209,7 @@ mod tests {
 
     #[test]
     fn update_real_with_override_ignores_param_target() {
-        let p = rp(99.0, -1.0, 0.5, 0);
+        let p = rp(99.0, -1.0, 0.5, &[]);
         let mut v = 0.0;
         update_real_with_override(&p, &mut v, 4.0);
         // (1 - 0.5) * 0 + 0.5 * 4 = 2.0  (would be 49.5 if param.value were used)
@@ -1216,7 +1218,7 @@ mod tests {
 
     #[test]
     fn update_instant_snaps() {
-        let p = InstantScalarParameter { flags: 0, value: 7.0 };
+        let p = InstantScalarParameter { flags: Flags::default(), value: 7.0 };
         let mut v = 1.5;
         update_instant(&p, &mut v);
         assert_eq!(v, 7.0);
@@ -1224,7 +1226,7 @@ mod tests {
 
     #[test]
     fn update_word_snaps() {
-        let p = TagWord { flags: 0, value: 4 };
+        let p = TagWord { flags: Flags::default(), value: 4 };
         let mut v: u16 = 0;
         update_word(&p, &mut v);
         assert_eq!(v, 4);
@@ -1233,7 +1235,7 @@ mod tests {
     #[test]
     fn update_color_5_95_lerp() {
         let p = TagColor {
-            flags: 0,
+            flags: Flags::default(),
             color: RealRgbColor { red: 1.0, green: 0.0, blue: 0.5 },
         };
         let mut v = Vec3::new(0.0, 0.4, 0.0);

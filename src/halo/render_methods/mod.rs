@@ -68,10 +68,28 @@ impl CategoryChoices {
         let mut pairs: Vec<(String, String)> = rmdf.categories.iter().enumerate()
             .filter_map(|(cat_idx, category)| {
                 if category.category_name.is_empty() { return None; }
-                let opt_idx = rm.options.get(cat_idx).copied().unwrap_or(0).max(0) as usize;
-                let option_name = category.options.get(opt_idx)
-                    .map(|o| o.option_name.clone())
-                    .unwrap_or_default();
+                let opt_idx = match rm.options.get(cat_idx).copied() {
+                    Some(idx) => idx.max(0) as usize,
+                    None => {
+                        eprintln!(
+                            "[render_method] rmsh has no option for category '{}' (#{cat_idx}) \
+                             — rmsh.options ({}) shorter than rmdf categories; using option 0",
+                            category.category_name, rm.options.len(),
+                        );
+                        0
+                    }
+                };
+                let option_name = match category.options.get(opt_idx) {
+                    Some(o) => o.option_name.clone(),
+                    None => {
+                        eprintln!(
+                            "[render_method] category '{}' option index {opt_idx} out of range \
+                             ({} options) — empty option name will fail the downstream option pick",
+                            category.category_name, category.options.len(),
+                        );
+                        String::new()
+                    }
+                };
                 Some((category.category_name.clone(), option_name))
             })
             .collect();
@@ -172,6 +190,17 @@ pub enum HaloEntryPoint {
     /// (single-probe)` AND meshes with `vertex_buffer_indices[3] !=
     /// 0xFFFF`. See `project_research_per_mesh_prt_2026_05_11.md`.
     StaticPrtAmbient,
+    /// HLSL `static_per_vertex_color_ps` (entry_points_fx.hlsl:836) —
+    /// engine `_entry_point_vertex_color_lighting`. `static_sh` math but
+    /// the diffuse LIGHTING term is the per-vertex baked `vert_color`
+    /// (interpolated from a SECONDARY VERTEX BUFFER, `SkyVertColorVertex`
+    /// at slot 1 / location 12) instead of the SH probe. Engine routes
+    /// sky `.render_model` mesh parts whose mesh has the
+    /// `_mesh_has_vertex_color_bit` (`mesh->flags & 1`) here
+    /// (`render_mesh_part_default @ 0x18069EBC0:64-82`). Diffuse-only
+    /// (no bump/spec/envmap/PRT); albedo + self-illum + fog + exposure +
+    /// per-blend-mode convert all identical to `static_sh`.
+    StaticVertexColor,
     /// HLSL `decal_fx.hlsl::default_ps`. Per-decal indexed draw, called
     /// by `c_decal::render @ 0x18039B100`. Vertex stream is
     /// `rasterizer_vertex_world` (44 B), NOT the standard ModelVertex.
@@ -631,6 +660,11 @@ pub fn assemble(
                 HaloEntryPoint::StaticPrtAmbient => include_str!(
                     "../../../assets/halo_shaders/entry_static_prt_ambient.wgsl"
                 ),
+                // Vertex-color lighting (sky meshes) — diffuse term is
+                // the per-vertex baked color from slot 1, not the SH probe.
+                HaloEntryPoint::StaticVertexColor => include_str!(
+                    "../../../assets/halo_shaders/entry_static_per_vertex_color.wgsl"
+                ),
                 HaloEntryPoint::Decal | HaloEntryPoint::DecalAlbedo | HaloEntryPoint::DecalObject => unreachable!(
                     "decal entry points are for rmd, not rmsh/rmcs/rmhg"
                 ),
@@ -643,7 +677,30 @@ pub fn assemble(
             // anywhere in the module, so we always include the helper.
             wgsl.push_str(SIMPLE_LIGHTS_FX);
             wgsl.push('\n');
-            wgsl.push_str(&apply_blend_fx_substitutions(entry, &blend_fx));
+            // `material_model == glass` defines BLEND_FRESNEL in the engine
+            // (material_models_fx.hlsl:180): the entry composes
+            //   out_rgb = diffuse·albedo·albedo.w + self_illum + env + specular
+            //   alpha   = saturate(specular.w/*fresnel*/ + albedo.w)
+            // i.e. the diffuse is PREMULTIPLIED by alpha (glass surface is
+            // coverage-weighted) while reflections add on top. Device blend
+            // stays the shader's blend_mode (alpha_blend) — BLEND_FRESNEL
+            // only changes the output color/alpha. Without this the glass
+            // diffuse shows at full strength (~4× too bright = white frost).
+            // BLEND_FRESNEL (engine glass output: premultiplied diffuse +
+            // `alpha = saturate(fresnel + albedo.w)`) is DISABLED for now.
+            // It's engine-faithful ONLY when the glass probe is correct; our
+            // per-instance baked lighting reads empty/dim for glass instances
+            // (atlas charts empty → bright fallback; per-vertex SH dim), and
+            // BLEND_FRESNEL amplifies that into blown-white / opaque-black.
+            // Until the per-instance lightmap read is fixed, fall back to the
+            // generic alpha_blend path (alpha = albedo.w) which is robust to
+            // the wrong probe (uniformly translucent glass). Re-enable by
+            // restoring `if mat_model == "glass" { "1.0" }` here. The branch
+            // is kept (gated off) in the entry_static_* WGSL.
+            let fresnel_enabled = "0.0";
+            let entry_sub = apply_blend_fx_substitutions(entry, &blend_fx)
+                .replace("__BLEND_FRESNEL_ENABLED__", fresnel_enabled);
+            wgsl.push_str(&entry_sub);
         }
         b"rmd " => {
             // Decals — port of `decal_fx.hlsl` per the rmd rmdf's 6

@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-blam-tags = { git = "https://github.com/camden-smallwood/blam-tags", rev = "e636fab09b95869d3ce3561cc044b7a1e76809f9" }
+# DEV: pointed at local checkout for the enum/flags-by-name refactor.
+# Re-pin to a git rev before merging (see task "Verify + re-pin blam-tags rev").
+blam-tags = { git = "https://github.com/camden-smallwood/blam-tags", rev = "af56bbed43afad8baff25023f26855adc918ec87" }
 bitflags = "2"
 bytemuck = { version = "1.24", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }

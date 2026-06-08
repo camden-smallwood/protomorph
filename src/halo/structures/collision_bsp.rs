@@ -95,7 +95,7 @@ pub struct CollisionBspResult {
     /// Canonical bit-31 designator (parser-normalized from i16 for
     /// SMALL collision_bsp schemas).
     pub plane_designator: i32,
-    pub flags: u8,
+    pub flags: blam_tags::Flags<blam_tags::structure_bsp::CollisionSurfaceFlags, u8>,
     pub material_index: i16,
 }
 
@@ -223,7 +223,11 @@ fn test_recursive(data: &mut TestData, mut child_index: i32, mut t0: f64, mut t1
             .bsp
             .leaves
             .get(li_usize)
-            .map(|l| (l.flags & 1) as u8)
+            .map(|l| {
+                l.flags.contains(
+                    blam_tags::structure_bsp::CollisionLeafFlags::ContainsDoubleSidedSurfaces,
+                ) as u8
+            })
             .unwrap_or(0u8);
         // contents = (flags & 1) + 1; engine encodes contents as 1, 2, or 3.
         (li, flags_bit + 1)
@@ -296,12 +300,16 @@ fn test_recursive(data: &mut TestData, mut child_index: i32, mut t0: f64, mut t1
         data.last_contents = contents;
         return false;
     };
-    // Surface-flag filter — engine rejects a hit when the surface is
-    // two-sided AND the caller asked to filter two-sided (decal case),
-    // or breakable AND the caller asked to filter breakable.
-    let sflags = surface.flags;
-    if ((sflags & 2) != 0 && (data.flags & flag::FILTER_TWO_SIDED) != 0)
-        || ((sflags & 8) != 0 && (data.flags & flag::FILTER_BREAKABLE) != 0)
+    // Surface-flag filter — engine rejects a hit on the `Invisible`
+    // surface bit (bit 1) when the caller set the matching decal-query
+    // flag, or on the `Breakable` bit (bit 3) when FILTER_BREAKABLE is
+    // set. (The `flag::*` query bits are the runtime decal namespace, not
+    // tag surface flags — left raw.)
+    use blam_tags::structure_bsp::CollisionSurfaceFlags;
+    if (surface.flags.contains(CollisionSurfaceFlags::Invisible)
+        && (data.flags & flag::FILTER_TWO_SIDED) != 0)
+        || (surface.flags.contains(CollisionSurfaceFlags::Breakable)
+            && (data.flags & flag::FILTER_BREAKABLE) != 0)
     {
         data.last_leaf_index = leaf_index;
         data.last_contents = contents;
@@ -336,7 +344,7 @@ fn test_recursive(data: &mut TestData, mut child_index: i32, mut t0: f64, mut t1
     data.result.leaf_index = chosen_leaf;
     data.result.surface_index = surface_idx;
     data.result.plane_designator = surface.plane_designator;
-    data.result.flags = surface.flags;
+    data.result.flags = surface.flags.clone();
     data.result.material_index = surface.material;
     data.hit = true;
     true

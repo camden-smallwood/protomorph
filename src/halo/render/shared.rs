@@ -25,7 +25,7 @@
 
 use crate::halo::camera::CameraUniforms;
 use crate::game::GameState;
-use crate::halo::animations::MAXIMUM_NUMBER_OF_MODEL_NODES;
+use crate::halo::geometry::MAXIMUM_NUMBER_OF_MODEL_NODES;
 use crate::halo::geometry::ModelUniforms;
 use crate::halo::lighting::{
     GpuEngineDominantLight, GpuEngineLightingPs, GpuSimpleLights,
@@ -78,6 +78,60 @@ pub const SIMPLE_LIGHTS_ENTRIES: u32 = 1024;
 /// any draw path that hasn't pre-computed its own per-cluster /
 /// per-instance lights.
 pub const SIMPLE_LIGHTS_DEFAULT_OFFSET: u32 = 0;
+
+// ---------------------------------------------------------------------------
+// Atmosphere table (per-render-method override)
+// ---------------------------------------------------------------------------
+//
+// Engine `render_method_submit_volatile_per_shader @ 0x180685cf0` rewrites the
+// single atmosphere cbuffer before EACH non-albedo/non-shadow draw, selected by
+// the render_method's flags:
+//   UseCustomSetting (bit1) → set_atmosphere_constants_by_index(custom_index)
+//                              (= accumulate ONE setting, weight 1.0)
+//   DontFogMe (bit0)        → disable_atmosphere (slot1.w = -1 sentinel)
+//   else                    → restore_default (the cluster-weighted blend)
+// We can't rewrite a uniform mid-pass, so `atmosphere_buffer` holds a per-frame
+// TABLE and `camera_bgl @ binding 2` is rebound per draw with a dynamic offset
+// — the same mechanism already used for per-instance lightprobes at binding 1.
+
+/// 256-byte stride per atmosphere table entry (`GpuAtmosphereData` is 176 B;
+/// dynamic-offset uniforms require 256-byte alignment).
+pub const ATMOSPHERE_STRIDE: u32 = 256;
+
+/// Offset of the frame-default (cluster-weighted) atmosphere. Used by every
+/// render_method WITHOUT `UseCustomSetting`/`DontFogMe` — the vast majority.
+pub const ATMOSPHERE_DEFAULT_OFFSET: u32 = 0;
+
+/// Offset of the "atmosphere disabled" entry (extinction=1, inscatter=0).
+/// Engine `disable_atmosphere`; selected by `DontFogMe`.
+pub const ATMOSPHERE_DISABLED_OFFSET: u32 = ATMOSPHERE_STRIDE;
+
+/// Offset of atmosphere setting 0 in the table. Setting `i` lives at
+/// `ATMOSPHERE_SETTING_BASE_OFFSET + i * ATMOSPHERE_STRIDE`. Selected by
+/// `UseCustomSetting` with `custom_fog_setting_index = i`.
+pub const ATMOSPHERE_SETTING_BASE_OFFSET: u32 = 2 * ATMOSPHERE_STRIDE;
+
+/// Max authored atmosphere settings the table holds (construct has 10).
+/// Settings beyond this index resolve to the default entry.
+pub const MAX_ATMOSPHERE_SETTINGS: u32 = 32;
+
+/// Total table entries: default + disabled + `MAX_ATMOSPHERE_SETTINGS`.
+pub const ATMOSPHERE_TABLE_ENTRIES: u32 = 2 + MAX_ATMOSPHERE_SETTINGS;
+
+/// Resolve a render_method's atmosphere table byte-offset from its
+/// `GlobalRenderMethodFlags` bits + `custom_fog_setting_index`. Mirrors the
+/// `render_method_submit_volatile_per_shader` flag dispatch.
+pub fn atmosphere_offset_for(flag_bits: u16, custom_fog_setting_index: i32) -> u32 {
+    // GlobalRenderMethodFlags: DontFogMe = bit0 (0x1), UseCustomSetting = bit1 (0x2).
+    if flag_bits & 0x2 != 0 {
+        let idx = custom_fog_setting_index.clamp(0, MAX_ATMOSPHERE_SETTINGS as i32 - 1) as u32;
+        ATMOSPHERE_SETTING_BASE_OFFSET + idx * ATMOSPHERE_STRIDE
+    } else if flag_bits & 0x1 != 0 {
+        ATMOSPHERE_DISABLED_OFFSET
+    } else {
+        ATMOSPHERE_DEFAULT_OFFSET
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Fullscreen Quad
@@ -479,6 +533,9 @@ pub struct FallbackTextures {
     pub white_view: wgpu::TextureView,
     pub default_normal_view: wgpu::TextureView,
     pub black_view: wgpu::TextureView,
+    /// Detail-neutral gray (0.218 linear = 1/DETAIL_MULTIPLIER) for
+    /// unbound detail maps — see creation site in `new`.
+    pub detail_view: wgpu::TextureView,
     /// 1×1×6 black cubemap. Materials whose `environment_map` option
     /// is `none` bind this so `calc_environment_map_none_ps` reads 0.
     pub black_cube_view: wgpu::TextureView,
@@ -534,18 +591,21 @@ impl FallbackTextures {
     /// Mirror of the engine's `c_rasterizer_globals` material-texture
     /// accessor for cook_torrance LUTs. Returns the loaded view for
     /// the requested [`blam_tags::rasterizer_globals::MaterialTexture`]
-    /// slot. Pre-scenario / load-failure path returns `white_view` —
-    /// cook_torrance specular will render with no distribution shape
-    /// (uniform white) instead of the engine's pre-integrated lobe.
+    /// slot. Panics if the slot isn't loaded: rasterizer_globals is always
+    /// present before any material draw, so a miss is a real load failure
+    /// we want to surface — not mask with a uniform-white LUT that gives
+    /// cook_torrance specular the wrong (flat) distribution shape.
     pub fn material_texture_view(
         &self,
         slot: blam_tags::rasterizer_globals::MaterialTexture,
     ) -> &wgpu::TextureView {
         let idx = slot as usize;
-        if let Some(view) = self.material_texture_views.get(idx) {
-            return view;
-        }
-        &self.white_view
+        self.material_texture_views.get(idx).unwrap_or_else(|| {
+            panic!(
+                "rasterizer_globals material texture slot {slot:?} (idx {idx}) not loaded — \
+                 cook_torrance LUTs must be present before drawing materials"
+            )
+        })
     }
 }
 
@@ -835,6 +895,25 @@ impl SharedResources {
         );
         let black_view = black_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Detail-neutral fallback for UNBOUND detail maps. The engine's
+        // `shaders\default_bitmaps\bitmaps\default_detail` is a 1×1
+        // mid-gray (stored 0.502, sRGB → ~0.218 linear = 1/DETAIL_MULTIPLIER).
+        // Albedo variants multiply detail maps by DETAIL_MULTIPLIER
+        // (4.59479; two_detail_overlay uses DETAIL_MULTIPLIER² with TWO
+        // detail factors), so an unbound detail map MUST be this neutral —
+        // binding `white_view` (1.0) instead made albedo ~5-7× too bright
+        // (blown white mottle on glass_activation, which leaves
+        // detail_map_overlay unbound). Stored 128 in an sRGB texture
+        // decodes to ~0.218 on sample, matching default_detail.
+        let detail_tex = create_1x1_texture(
+            &device,
+            &queue,
+            [128, 128, 128, 255],
+            "detail_neutral_fallback",
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let detail_view = detail_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
         // 1×1×6 black cube — used for materials whose env_map slot is
         // intentionally empty (e.g. material with no env-mapping option).
         // The "no per-cluster probe" path uses
@@ -873,6 +952,7 @@ impl SharedResources {
             white_view,
             default_normal_view,
             black_view,
+            detail_view,
             black_cube_view,
             // Populated by `Renderer::load_default_bitmaps_from_rasg`
             // after `rasterizer_globals` parses.
@@ -953,9 +1033,12 @@ impl SharedResources {
             mapped_at_creation: false,
         });
         
+        // Atmosphere TABLE: ATMOSPHERE_TABLE_ENTRIES entries at 256-byte
+        // stride (default + disabled + per-setting). Bound at camera_bgl
+        // binding 2 with a per-draw dynamic offset (see atmosphere_offset_for).
         let atmosphere_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("atmosphere_buffer"),
-            size: size_of::<GpuAtmosphereData>() as u64,
+            size: (ATMOSPHERE_TABLE_ENTRIES * ATMOSPHERE_STRIDE) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1332,11 +1415,15 @@ impl SharedResources {
                 // `compute_scattering` in BOTH stages — VS computes
                 // per-vertex extinction/inscatter and PS reads them
                 // for final composition.
+                // **Dynamic offset**: each draw selects its atmosphere table
+                // entry (default / disabled / per-setting) per the render_method
+                // flags — engine `render_method_submit_volatile_per_shader`'s
+                // per-shader atmosphere override. offset 0 = frame-default.
                 uniform_entry(
                     2,
                     size_of::<GpuAtmosphereData>() as u64,
                     wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    false,
+                    true,
                 ),
                 // Lightmap compression scalars (BSP terrain SH unpack).
                 // Halo `LightmapCompressPS` cbuffer — 3 vec4s of L-range
@@ -1618,7 +1705,16 @@ fn build_camera_bind_group(
                     ),
                 }),
             },
-            wgpu::BindGroupEntry { binding: 2, resource: atmosphere_buffer.as_entire_binding() },
+            // Bind ONE table entry's worth (dynamic offset selects which);
+            // the backing buffer holds ATMOSPHERE_TABLE_ENTRIES of them.
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: atmosphere_buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(size_of::<GpuAtmosphereData>() as u64),
+                }),
+            },
             wgpu::BindGroupEntry { binding: 3, resource: lightmap_compress_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(lightprobe_atlas_view) },
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(lightprobe_intensity_atlas_view) },

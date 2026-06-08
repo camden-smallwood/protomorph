@@ -59,9 +59,9 @@ pub struct CollisionBspTestVectorResult {
     /// Plane-designator (plane index + bit-31 negate flag). Engine
     /// `plane_designator` @ 0x18.
     pub plane_designator: i32,
-    /// Surface flags byte (bit 1 = invisible, bit 3 = two-sided). Engine
-    /// `flags` @ 0x1C.
-    pub flags: u8,
+    /// Surface flags (bit 1 = `Invisible`, bit 3 = `Breakable`), copied
+    /// from the hit surface. Engine `flags` @ 0x1C.
+    pub flags: blam_tags::Flags<blam_tags::structure_bsp::CollisionSurfaceFlags, u8>,
     /// Engine `breakable_surface_index` @ 0x1D.
     pub breakable_surface_index: u8,
     /// Engine `material_index` @ 0x1E (collision-material table).
@@ -84,7 +84,7 @@ impl Default for CollisionBspTestVectorResult {
             leaf_index: -1,
             surface_index: -1,
             plane_designator: -1,
-            flags: 0,
+            flags: blam_tags::Flags::default(),
             breakable_surface_index: 0,
             material_index: -1,
             leaf_count: 0,
@@ -349,7 +349,12 @@ fn test_vector_recursive(
         3
     } else {
         match data.bsp.bsp3d_leaf_flags(leaf_index_1 as u32) {
-            Some(flags) => ((flags & 1) as u8) + 1, // 1 → 2, 0 → 1
+            // bit 0 = ContainsDoubleSidedSurfaces → contents 2, else 1.
+            Some(flags) => {
+                (flags.contains(blam_tags::structure_bsp::CollisionLeafFlags::ContainsDoubleSidedSurfaces)
+                    as u8)
+                    + 1
+            }
             None => 3,
         }
     };
@@ -411,19 +416,21 @@ fn test_vector_recursive(
         );
         if let Some(surface_idx) = surface_index {
             // Surface hit. Engine filters by surface flags vs `data.flags`:
-            //   surface bit 1 (`& 2`, invisible) gated by data flag bit 3
-            //   surface bit 3 (`& 8`, breakable) gated by data flag bit 4
+            //   surface `Invisible` (bit 1) gated by IGNORE_INVISIBLE_SURFACES
+            //   surface `Breakable` (bit 3) gated by IGNORE_BREAKABLE_SURFACES
+            // Cloned out of the BSP so the immutable borrow releases before
+            // we write `data.result` below.
             let surface = data
                 .bsp
                 .surfaces()
                 .get(surface_idx as usize)
-                .copied();
+                .cloned();
             if let Some(s) = surface {
-                let f = s.flags;
-                let invisible_skip =
-                    (f & 0x02) != 0 && (data.flags & IGNORE_INVISIBLE_SURFACES) != 0;
-                let breakable_skip =
-                    (f & 0x08) != 0 && (data.flags & IGNORE_BREAKABLE_SURFACES) != 0;
+                use blam_tags::structure_bsp::CollisionSurfaceFlags;
+                let invisible_skip = s.flags.contains(CollisionSurfaceFlags::Invisible)
+                    && (data.flags & IGNORE_INVISIBLE_SURFACES) != 0;
+                let breakable_skip = s.flags.contains(CollisionSurfaceFlags::Breakable)
+                    && (data.flags & IGNORE_BREAKABLE_SURFACES) != 0;
                 if !invisible_skip && !breakable_skip {
                     // Populate result and signal hit.
                     data.result.t = t0;
@@ -607,7 +614,10 @@ impl CollisionBspView<'_> {
     fn surfaces(&self) -> &[blam_tags::structure_bsp::CollisionSurface] {
         &self.bsp3d.surfaces
     }
-    fn bsp3d_leaf_flags(&self, leaf_index: u32) -> Option<u16> {
-        self.bsp3d.leaves.get(leaf_index as usize).map(|l| l.flags)
+    fn bsp3d_leaf_flags(
+        &self,
+        leaf_index: u32,
+    ) -> Option<&blam_tags::Flags<blam_tags::structure_bsp::CollisionLeafFlags, u16>> {
+        self.bsp3d.leaves.get(leaf_index as usize).map(|l| &l.flags)
     }
 }

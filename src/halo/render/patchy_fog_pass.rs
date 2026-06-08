@@ -426,7 +426,9 @@ impl PatchyFogPass {
         // Linear sampling — engine `set_sampler_filter_mode(0,
         // _sampler_filter_bilinear)`. Force `linear=true` so even sRGB-
         // tagged greyscale noise reads as linear gray.
-        let format = crate::halo::render::inline_to_wgpu_format(inline.format, /*linear=*/ true);
+        let format = crate::halo::render::resolve_wgpu_format(
+            inline.format, inline.encoding, crate::halo::render::SampleIntent::ForceLinear,
+        );
         let texture = shared.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("patchy_fog_noise"),
             size: wgpu::Extent3d {

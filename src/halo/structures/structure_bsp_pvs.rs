@@ -59,8 +59,9 @@ pub fn structure_bsp_compute_cluster_active_pvs(
         Some(c) => c,
         None => return,
     };
-    let door_affected =
-        (cluster.flags & cluster_pvs_flags::PVS_AFFECTED_BY_DOOR_PORTAL) != 0;
+    let door_affected = cluster
+        .flags
+        .contains(blam_tags::structure_bsp::StructureClusterFlags::DoorPortal);
 
     // OPEN row — always required.
     scenario_zone_set_pvs_write_open_row(

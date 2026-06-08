@@ -528,6 +528,7 @@ pub fn submit_visibility_from_render_list(
     transparency: &mut crate::halo::render::render_transparents::TransparencyRenderer,
     render_list: &[(ObjectIndex, usize)],
     models: &[GpuModel],
+    objects: &crate::halo::objects::ObjectStore,
 ) {
     use crate::halo::render::render_transparents::{
         TransparentDispatch, TransparentSortLayer,
@@ -536,8 +537,23 @@ pub fn submit_visibility_from_render_list(
     renderer.reset();
     renderer.push_marker();
 
-    for (object_slot, &(_obj_idx, model_idx)) in render_list.iter().enumerate() {
+    for (object_slot, &(obj_idx, model_idx)) in render_list.iter().enumerate() {
         let Some(model) = models.get(model_idx) else { continue };
+        // Object world transform — MUST be the same transform the render path
+        // uses: `obj.header_index` → datum world matrix (NOT the object-STORE
+        // index `obj_idx.0`). `world_matrix()` is keyed by the header/datum
+        // index, where parent-marker attachment wrote the transform (e.g. the
+        // sky-marker-attached waterfall). Passing the store index read a
+        // DIFFERENT object's datum, so the sort centroid disagreed with the
+        // rendered geometry — the waterfall's centroid landed at ~[-178] while
+        // its geometry rendered ~200 units away, making it flip in front of the
+        // glass. Mirror `render_player_view`'s model-uniform world exactly.
+        let obj = objects.get(obj_idx);
+        let obj_world = Some(
+            obj.header_index
+                .and_then(crate::halo::objects::object_header_data::world_matrix)
+                .unwrap_or_else(|| obj.model_matrix()),
+        );
         renderer.begin_object_render_context();
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
             for (part_idx, part) in mesh.parts.iter().enumerate() {
@@ -574,10 +590,50 @@ pub fn submit_visibility_from_render_list(
                 // here so the transparency renderer dispatches them.
                 if flags == 0 || material_is_transparent {
                     if material_is_transparent {
+                        // Engine `submit_object_mesh_parts @ 0x1806E1BF0`:
+                        //   origin = global_origin3d;                       // CONSTANT
+                        //   if (sorting_index != -1 && !(mesh.flags & 2))   // 2=UseRegionIndexForSorting
+                        //       origin = sorting_position.position;
+                        //   ... offset = region_index * 0.1;
+                        // So meshes flagged UseRegionIndexForSorting (or lacking
+                        // a sorting position) collapse to a CONSTANT centroid
+                        // (global_origin3d → the object origin after the region
+                        // matrix) and order by region_index*0.1, while others use
+                        // their authored sorting position. This holds co-located
+                        // transparent layers (waterfall liquid/sheet/mist) in a
+                        // FIXED composite order instead of flipping as their
+                        // per-mesh centroids cross under camera motion.
+                        // `[0,0,0]` (model space) is global_origin3d → maps to the
+                        // object origin via `obj_world`.
+                        let model_centroid = if !mesh.use_region_index_for_sorting {
+                            part.sort_centroid.unwrap_or([0.0, 0.0, 0.0])
+                        } else {
+                            [0.0, 0.0, 0.0]
+                        };
+                        let world_centroid = match obj_world {
+                            Some(m) => m
+                                .transform_point3(glam::Vec3::from(model_centroid))
+                                .to_array(),
+                            None => model_centroid,
+                        };
+                        // Region tiebreak that orders co-located layers. Engine
+                        // value is `+region_index * 0.1`, but our transparent
+                        // sort resolves the polarity REVERSED (same compensation
+                        // the sky region-order needs, see
+                        // reference_transparent_sort_engine): NEGATIVE offset
+                        // makes the LOWER region draw on top. The waterfall's
+                        // regions are authored front-to-back (mist=0 front …
+                        // liquid=2 back), so `-region*0.1` keeps the frothy
+                        // mist/sheet composited OVER the liquid. (Root polarity
+                        // convention vs engine tracked for the Phase-2 sort pass.)
+                        let region_offset = -(mesh.region_index as f32) * 0.1;
                         transparency.add_element(
-                            [0.0, 0.0, 0.0],
+                            world_centroid,
+                            None,
                             0.0,
-                            TransparentSortLayer::Normal,
+                            region_offset,
+                            mat.map(|m| m.sort_layer)
+                                .unwrap_or(TransparentSortLayer::Normal),
                             TransparentDispatch::Object {
                                 object_slot: object_slot as u32,
                                 mesh_index: mesh_idx as u16,
@@ -735,6 +791,11 @@ impl ObjectRenderer {
                 camera_bg,
                 &[
                     lighting_offset,
+                    // atmosphere @ binding 2 — objects use the cluster default
+                    // (object rmsh shaders don't author per-shader fog overrides;
+                    // the override is sky/effect-side). The sky pass below
+                    // rebinds with each sky material's resolved offset.
+                    crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                     crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                     // dominant_light @ binding 13 mirrors `lighting_offset`.
                     lighting_offset,
@@ -991,6 +1052,9 @@ pub fn submit_and_render_sky<'rp>(
                 &ctx.shared.camera_bind_group_sl,
                 &[
                     crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                    // atmosphere @ binding 2 — default; rebound per sky material
+                    // below to honor its per-shader `Custom fog setting index`.
+                    crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                     crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                     crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
                 ],
@@ -1003,6 +1067,11 @@ pub fn submit_and_render_sky<'rp>(
             // submit_and_render_sky(2) via the transparency pool).
             for mesh in &sky_model.meshes {
                 rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                // Bind the per-vertex baked color stream at slot 1 when
+                // present (the `_entry_point_vertex_color_lighting` path).
+                if let Some(vc) = mesh.vert_color_buffer.as_ref() {
+                    rpass.set_vertex_buffer(1, vc.slice(..));
+                }
                 rpass.set_index_buffer(
                     mesh.index_buffer.slice(..),
                     wgpu::IndexFormat::Uint32,
@@ -1013,9 +1082,41 @@ pub fn submit_and_render_sky<'rp>(
                     if material.is_transparent {
                         continue;
                     }
-                    rpass.set_pipeline(&material.artifacts.pipeline);
-                    // Path B: cbuffer dynamic-offset, offset 0.
-                    rpass.set_bind_group(2, &material.bind_group, &[0u32]);
+                    // Per-shader atmosphere override (engine
+                    // `render_method_submit_volatile_per_shader`): rebind group 0
+                    // with THIS sky material's atmosphere-table offset. Construct's
+                    // skydome/clouds/planetoid/etc. resolve to `fog_waterfall`
+                    // (the bright daytime haze); without this they'd inherit the
+                    // dim cluster-default `fog_sky` (g=1 → mie inscatter zeroed).
+                    rpass.set_bind_group(
+                        0,
+                        &ctx.shared.camera_bind_group_sl,
+                        &[
+                            crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                            material.atmosphere_offset,
+                            crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
+                            crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                        ],
+                    );
+                    // Engine `render_mesh_part_default @ 0x18069EBC0:64-82`:
+                    // a vc-bit mesh routes to `_entry_point_vertex_color_lighting`
+                    // (`static_per_vertex_color_ps` = albedo×vert_color +
+                    // self_illum), NOT `static_lighting_sh`. Use it when the
+                    // mesh carries the vert_color stream AND the material
+                    // compiled the variant; else fall back to static_sh.
+                    let vc = mesh.vert_color_buffer.is_some();
+                    if let (true, Some(arts), Some(bg)) = (
+                        vc,
+                        material.artifacts_vertex_color.as_ref(),
+                        material.bind_group_vertex_color.as_ref(),
+                    ) {
+                        rpass.set_pipeline(&arts.pipeline);
+                        rpass.set_bind_group(2, bg, &[0u32]);
+                    } else {
+                        rpass.set_pipeline(&material.artifacts.pipeline);
+                        // Path B: cbuffer dynamic-offset, offset 0.
+                        rpass.set_bind_group(2, &material.bind_group, &[0u32]);
+                    }
                     rpass.draw_indexed(
                         part.index_start..part.index_start + part.index_count,
                         0, 0..1,
@@ -1031,18 +1132,80 @@ pub fn submit_and_render_sky<'rp>(
             use crate::halo::render::render_transparents::{
                 TransparentDispatch, TransparentSortLayer,
             };
+            let diag_sky = std::env::var_os("PROTOMORPH_DIAG_SKY_SORT").is_some() && {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static F: AtomicU32 = AtomicU32::new(0);
+                F.fetch_add(1, Ordering::Relaxed) == 0
+            };
+            let eye: glam::Vec3 = ctx.game.camera.position.into();
+            let fwd: glam::Vec3 = ctx.game.camera.forward.into();
+            // Engine `global_origin3d` — constant for all sky parts (see the
+            // add_element comment below). Using the camera position makes the
+            // view-forward depth term zero, so intra-sky order is driven
+            // purely by the per-region offset, exactly as the engine.
+            let sky_origin = eye.to_array();
+            // Diagnostic: PROTOMORPH_SKY_SKIP="8,9" skips those sky mesh
+            // indices in the transparent pass — used to isolate which mesh
+            // is occluding the planetoid (mesh 7).
+            let sky_skip: Vec<u16> = std::env::var("PROTOMORPH_SKY_SKIP")
+                .ok()
+                .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+                .unwrap_or_default();
             transparency_renderer.push_marker();
             for (mi, mesh) in sky_model.meshes.iter().enumerate() {
+                if sky_skip.contains(&(mi as u16)) {
+                    continue;
+                }
                 for (pi, part) in mesh.parts.iter().enumerate() {
                     let Some(material) = sky_model.materials.get(part.material_index)
                     else { continue };
                     if !material.is_transparent {
+                        if diag_sky {
+                            eprintln!(
+                                "[diag-sky-mat] mesh={mi} part={pi} mat={} blend={} OPAQUE(skip)",
+                                part.material_index, material.blend_mode
+                            );
+                        }
                         continue;
                     }
+                    // Sky meshes do NOT sort by their authored centroid.
+                    // Every sky mesh has the `has transparent sorting plane`
+                    // flag (mesh flags bit1) set, so engine
+                    // `submit_object_mesh_parts @ 0x1806E1BF0` leaves
+                    // `origin = *global_origin3d` (constant for all sky
+                    // parts) INSTEAD of reading the part's sorting position.
+                    // `add_transparent_mesh_part @ 0x1806E3EB0` then sets
+                    // z_sort = |dot(origin-cam, fwd)| - (region*0.1 + 100000).
+                    // With `origin` constant the depth term is identical for
+                    // every sky part, so the ONLY differentiator is
+                    // region_index*0.1 — the sky draws back-to-front in
+                    // REGION order, not 3D depth. This sky model's regions map
+                    // 1:1 to meshes in order (region i → mesh i), so
+                    // region_index == mi.
+                    //
+                    // We pass the constant `sky_origin` (depth term → 0) and
+                    // `offset = -mi*0.1`; sort() yields z_sort = +mi*0.1,
+                    // ordering HIGHER mesh index first (back) → mesh 0 last
+                    // (front). This puts matte_waypoint (mesh 9) BEHIND the
+                    // planetoid (mesh 7) so it stops drawing on top of the
+                    // other sky transparents (verified flying near the
+                    // skybox). [Reversed from region-ascending after visual
+                    // check — the engine's region/offset polarity for sky
+                    // draws higher regions first.]
+                    if diag_sky {
+                        eprintln!(
+                            "[diag-sky-mat] mesh={mi} part={pi} mat={} blend={} TRANSPARENT",
+                            part.material_index, material.blend_mode
+                        );
+                    }
+                    // Sky passes a NULL sort plane ⇒ point-only; the
+                    // -mi*0.1 offset gives the region-index ordering.
                     transparency_renderer.add_element(
-                        [0.0, 0.0, 0.0],
+                        sky_origin,
+                        None,
                         0.0,
-                        TransparentSortLayer::Normal,
+                        -(mi as f32) * 0.1,
+                        material.sort_layer,
                         TransparentDispatch::SkyMeshPart {
                             mesh_index: mi as u16,
                             part_index: pi as u16,
@@ -1050,7 +1213,14 @@ pub fn submit_and_render_sky<'rp>(
                     );
                 }
             }
-            transparency_renderer.sort();
+            transparency_renderer.sort(eye.to_array(), fwd.to_array());
+            if std::env::var_os("PROTOMORPH_DIAG_SKY_SORT").is_some() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) % 120 == 0 {
+                    transparency_renderer.debug_dump_sorted(eye.to_array(), "sky");
+                }
+            }
             transparency_renderer.render(rpass, ctx);
             transparency_renderer.pop_marker();
         }

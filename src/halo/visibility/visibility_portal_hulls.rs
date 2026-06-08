@@ -109,7 +109,9 @@ impl PortalHull {
 
 #[derive(Debug, Clone, Default)]
 pub struct TransformedPortal {
-    pub flags: i32,                   // 0x0
+    /// Copied from the source `BspClusterPortal.flags` (one-way / door /
+    /// no-way / AI sound occlusion). Engine stores it as an int @ 0x0.
+    pub flags: blam_tags::Flags<blam_tags::structure_bsp::StructureBspClusterPortalFlags, u32>, // 0x0
     pub facing: EPortalFacing,        // 0x4 (1B)
     // 1B padding @ 0x5
     pub cluster_indices: [i16; 2],    // 0x6 (back, front)

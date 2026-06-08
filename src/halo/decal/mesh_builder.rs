@@ -36,6 +36,7 @@
 //!    is drained or the BFS hits the work-buffer caps (1024
 //!    vertices, 1024 indices) → return false.
 
+use blam_tags::decal_system::DecalSystemFlags;
 use blam_tags::math::{RealPoint2d, RealPoint3d};
 use blam_tags::structure_bsp::{Bsp3d, BspCollisionMaterial};
 
@@ -51,7 +52,7 @@ use super::types::{
 /// Per-decal inputs the walker needs from the orchestrator. Mirrors
 /// the values the engine reads from `c_decal_definition` + the parent
 /// `c_decal_system_definition` at the start of every BFS step.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DecalBuildContext {
     /// `c_decal_definition::cull_angle` in radians (offset 100 in the
     /// engine's c_decal_definition). **Engine stores degrees on disk
@@ -70,7 +71,7 @@ pub struct DecalBuildContext {
     /// matches engine `c_decal::build_mesh_fragment_recursive @
     /// 0x18039C2D0` line 414 which reads `v106->m_flags` where
     /// `v106 = c_decal_system_definition`.
-    pub system_definition_flags: u32,
+    pub system_definition_flags: blam_tags::Flags<DecalSystemFlags, u32>,
     /// `((parent_system->m_flags >> 1) ^ (parent_system->m_flags >> 2))
     /// & 1` precomputed by the caller — controls the LEFT_HANDED bit
     /// on each new neighbor's projection.
@@ -117,7 +118,7 @@ pub fn build_mesh_fragment_recursive(
     // empty-fragment case is what we were missing: previously we ran
     // the full BFS walker for multi-collision force-quad placements
     // and emitted geometry the engine never produces.
-    if (ctx.system_definition_flags & 0b1000) != 0 {
+    if ctx.system_definition_flags.contains(DecalSystemFlags::ForceQuad) {
         return true;
     }
     if fragment_builder.neighbor_surface_count <= 0 {
@@ -330,8 +331,8 @@ pub fn build_mesh_fragment_recursive(
                     fragment_builder.can_be_quad = false;
 
                     let mut fold = Fold::default();
-                    let same_plane_only = (ctx.system_definition_flags & 0x10) != 0;
-                    let same_material_only = (ctx.system_definition_flags & 0x20) != 0;
+                    let same_plane_only = ctx.system_definition_flags.contains(DecalSystemFlags::ForcePlanar);
+                    let same_material_only = ctx.system_definition_flags.contains(DecalSystemFlags::RestrictToSingleMaterial);
                     if iter2.get_opposing_surface_fold(
                         bsp,
                         collision_materials,

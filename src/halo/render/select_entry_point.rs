@@ -102,7 +102,7 @@ pub fn select_instance_entry_point(
     bsp_lightmap_data: Option<&LightmapBspData>,
     structure_instance_index: i32,
     lightmap_texcoord_block_index: i16,
-    lightmapping_policy: i16,
+    lightmapping_policy: blam_tags::structure_bsp::InstancedGeometryLightmappingPolicy,
     mesh_has_prt_quadratic_stream: bool,
     has_per_instance_uv_stream: impl Fn(i16) -> bool,
     has_pervertex_runtime_buffer: impl Fn(i16) -> bool,
@@ -133,6 +133,16 @@ pub fn select_instance_entry_point(
         lbsp.instances.get(structure_instance_index as usize);
 
     let Some(entry) = entry else {
+        // No lightmap row for this instance. Empty `instances` = this BSP
+        // has no instance lightmap (expected). A *populated* table missing
+        // this index is an index-space mismatch worth surfacing.
+        if !lbsp.instances.is_empty() {
+            eprintln!(
+                "[lightmap] instance {structure_instance_index} has no lightmap entry \
+                 (table has {} rows) — falling back to default SH lighting",
+                lbsp.instances.len(),
+            );
+        }
         out.entry = HaloEntryPoint::StaticSh;
         out.default_lighting_fallback = true;
         return out;
@@ -151,7 +161,9 @@ pub fn select_instance_entry_point(
             // H3 corpus is 100% Ambient where present, so we emit
             // `StaticPrtAmbient` directly. Linear/Quadratic would need
             // their own entry-point variants + shaders.
-            out.prt_branch_taken = lightmapping_policy == 2 && mesh_has_prt_quadratic_stream;
+            out.prt_branch_taken = lightmapping_policy
+                == blam_tags::structure_bsp::InstancedGeometryLightmappingPolicy::SingleProbe
+                && mesh_has_prt_quadratic_stream;
             out.entry = if out.prt_branch_taken {
                 HaloEntryPoint::StaticPrtAmbient
             } else {

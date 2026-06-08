@@ -24,6 +24,7 @@
 //! `instance_count = placements.len()`.
 
 use bytemuck::{Pod, Zeroable};
+use crate::halo::render::SampleIntent;
 use glam::{Mat4, Quat, Vec3};
 use wgpu::util::DeviceExt;
 
@@ -1039,7 +1040,7 @@ impl DecoratorRenderer {
                     // vertex AABB to verify ferns light correctly when each
                     // variant samples its own true extent.
                     let subpart_aabb: crate::halo::decorators::light_placement::MeshBounds = {
-                        let _ = &rm.compression_info_0; // unused on this path
+                        let _ = &rm.render_geometry.compression_info; // unused on this path
                         let mut mn = Vec3::splat(f32::INFINITY);
                         let mut mx = Vec3::splat(f32::NEG_INFINITY);
                         for &i in subpart_tri_list.iter() {
@@ -1350,7 +1351,7 @@ impl DecoratorRenderer {
                              black_decoded={} dropped={} \
                              avg_bright=({:.4},{:.4},{:.4}) avg_albedo=({:.4},{:.4},{:.4}) \
                              avg_hits={:.2}/10 min_hits={} \
-                             render_flags=0x{:02X} vis_gate={} sample_pat={:?} \
+                             render_flags={:?} vis_gate={} sample_pat={:?} \
                              variant={} \
                              branches[pv={} pp={} single={} none={}]",
                             block_idx,
@@ -1367,10 +1368,10 @@ impl DecoratorRenderer {
                             avg_a.x, avg_a.y, avg_a.z,
                             avg_hits,
                             if hist_min_hits == 11 { 0 } else { hist_min_hits },
-                            loaded_set.render_flags,
+                            loaded_set.render_flags.get(),
                             loaded_set.dont_sample_lighting_through_geometry(),
-                            loaded_set.lighting_sample_pattern,
-                            render_shader_label(loaded_set.render_shader),
+                            loaded_set.lighting_sample_pattern.get(),
+                            render_shader_label(loaded_set.render_shader.get()),
                             pv, pp, sg, nl,
                         );
                     }
@@ -1409,7 +1410,7 @@ impl DecoratorRenderer {
                         crate::halo::structures::bsp_gpu::upload_inline_texture(
                             shared,
                             &inline_tex,
-                            /* linear = */ false,
+                            SampleIntent::FollowCurve,
                         )
                     })
                 };
@@ -1439,7 +1440,7 @@ impl DecoratorRenderer {
                 // identity-ish but not engine-faithful.
                 let set_uniforms = DecoratorSetUniforms {
                     knobs: [
-                        render_shader_index(loaded_set.render_shader) as f32,
+                        render_shader_index(loaded_set.render_shader.get()) as f32,
                         loaded_set.translucency,
                         loaded_set.shaded_dark,
                         loaded_set.shaded_bright,
@@ -1509,7 +1510,7 @@ impl DecoratorRenderer {
                 };
 
                 let _ = queue;
-                let render_shader = loaded_set.render_shader;
+                let render_shader = loaded_set.render_shader.get();
                 self.sets.push(LoadedDecoratorSet {
                     bind_group,
                     set_uniform_buffer,
@@ -1607,7 +1608,9 @@ impl DecoratorRenderer {
     ) {
         let device = &shared.device;
         let queue = &shared.queue;
-        let wgpu_format = crate::halo::render::inline_to_wgpu_format(tex.format, true);
+        let wgpu_format = crate::halo::render::resolve_wgpu_format(
+            tex.format, tex.encoding, SampleIntent::ForceLinear,
+        );
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("decorator_wind_noise"),
             size: wgpu::Extent3d {
@@ -1846,6 +1849,8 @@ impl DecoratorRenderer {
             &ctx.shared.camera_bind_group,
             &[
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                // atmosphere @ binding 2 — decorators use the cluster default.
+                crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                 crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                 // dominant_light @ binding 13 shares the ravi cursor.
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
@@ -1909,6 +1914,8 @@ impl DecoratorRenderer {
                             &ctx.shared.camera_bind_group,
                             &[
                                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                                // atmosphere @ binding 2 — cluster default.
+                                crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                                 simple_lights_offset,
                                 // dominant_light @ binding 13.
                                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,

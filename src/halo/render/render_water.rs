@@ -20,6 +20,7 @@
 //! to WGSL. Per `reference_water_fx_blueprint.md` already in memory.
 
 use crate::halo::render::render_objects::EntryPoint;
+use crate::halo::render::SampleIntent;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use wgpu::util::DeviceExt;
@@ -346,17 +347,17 @@ fn dump_water_texture_ppm(
         // converted inline so we don't need a round-trip through a Halo
         // BitmapFormat.
         let rgba_result: Result<Vec<u8>, String> = match tex.format {
-            F::Bc1RgbaUnormSrgb | F::Bc1RgbaUnorm => {
+            F::Bc1RgbaUnorm => {
                 blam_tags::bitmap::decode::decode_to_rgba8(
                     blam_tags::bitmap::BitmapFormat::Dxt1, w, h, mip0,
                 ).map_err(|e| format!("{e:?}"))
             }
-            F::Bc2RgbaUnormSrgb | F::Bc2RgbaUnorm => {
+            F::Bc2RgbaUnorm => {
                 blam_tags::bitmap::decode::decode_to_rgba8(
                     blam_tags::bitmap::BitmapFormat::Dxt3, w, h, mip0,
                 ).map_err(|e| format!("{e:?}"))
             }
-            F::Bc3RgbaUnormSrgb | F::Bc3RgbaUnorm => {
+            F::Bc3RgbaUnorm => {
                 blam_tags::bitmap::decode::decode_to_rgba8(
                     blam_tags::bitmap::BitmapFormat::Dxt5, w, h, mip0,
                 ).map_err(|e| format!("{e:?}"))
@@ -371,11 +372,11 @@ fn dump_water_texture_ppm(
                     blam_tags::bitmap::BitmapFormat::Dxn, w, h, mip0,
                 ).map_err(|e| format!("{e:?}"))
             }
-            F::Rgba8UnormSrgb | F::Rgba8Unorm => Ok(mip0.to_vec()),
+            F::Rgba8Unorm => Ok(mip0.to_vec()),
             F::Rgba8Snorm => Ok(mip0.iter()
                 .map(|&b| ((b as i8) as i32 + 128).clamp(0, 255) as u8)
                 .collect()),
-            F::Bgra8Unorm | F::Bgra8UnormSrgb => {
+            F::Bgra8Unorm => {
                 let mut out = Vec::with_capacity(mip0.len());
                 for px in mip0.chunks_exact(4) {
                     out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
@@ -573,6 +574,36 @@ fn patch_water_uv_debug(source: &'static str) -> String {
     out
 }
 
+/// Per-rmw-material GPU resources. One slot per distinct water shader
+/// on a BSP (docks: `dock_water_1` + `dock_water_2`). Each slot owns a
+/// variant-substituted shading + depth pipeline (the WGSL category
+/// branches — foam/global_shape/watercolor/waveshape — differ per
+/// material) and a `@group(3)` bind group with that material's env
+/// cubemap, wave/slope/foam/global_shape textures, and user cbuffer.
+/// The draw loops select the slot by each water part's `material_index`.
+#[derive(Debug)]
+pub struct WaterMaterialSlot {
+    /// Shading pipeline (sub-pass 1) — variant-substituted WGSL.
+    pub pipeline: wgpu::RenderPipeline,
+    /// Depth-only pipeline (sub-pass 2) — shares the VS substitutions
+    /// (displacement depends on the global_shape choice).
+    pub depth_pipeline: wgpu::RenderPipeline,
+    /// `@group(3)` bind group: env cube + samplers + this material's
+    /// user cbuffer + wave_displacement/slope arrays + 2D textures.
+    pub bind_group: wgpu::BindGroup,
+    /// rmt2 user cbuffer (engine PS slot 0x13), repacked to WGSL field
+    /// order. Re-uploaded each frame by [`WaterRenderer::update_constants`].
+    pub cbuf: wgpu::Buffer,
+    /// Cbuf size in bytes; bounds the per-frame re-resolve upload.
+    pub cbuf_size: u64,
+    /// Load-time repacked bytes — fallback for the per-frame re-resolve
+    /// so phantom slots (rmsh/rmop params the rmt2 didn't route, e.g.
+    /// `fresnel_curve_steepness`) keep their authored values.
+    pub cbuf_loaded_bytes: Vec<u8>,
+    /// rmw source for per-frame animated cbuffer re-resolve (time_warp).
+    pub source: Option<crate::halo::render_methods::materials::RenderMethodSource>,
+}
+
 /// `c_water_renderer` — namespace class. Pattern A: all-static
 /// methods. Owned by Renderer. Engine globals
 /// (`g_water_render_structure_part_indices[512]`,
@@ -607,21 +638,12 @@ pub struct WaterRenderer {
     /// VS interpolates the 3 control points (per-instance attrs) using
     /// these barycentrics to produce the rendered position.
     pub tessellation_vertex_buffer: wgpu::Buffer,
-    /// Water shading pipeline — single-material minimal port of
-    /// `water_shading()` (water_shading_fx.hlsl:658-1062). Built once
-    /// at `WaterRenderer::new`; consumed every frame by
-    /// [`Self::render_shading`]. Phase A4b/c will replace this single
-    /// pipeline with a per-rmw-material cache (option-driven WGSL
-    /// emission) when multi-material levels arrive.
-    pub water_pipeline: wgpu::RenderPipeline,
-    /// Sub-pass 2 — `_entry_point_shadow_generate` per IDA
-    /// `c_water_renderer::render_shading @ 0x180693e90`:
-    /// `set_color_write_enable(0, 0); set_z_buffer_mode(_z_buffer_mode_write);
-    /// render_cluster_parts(_entry_point_shadow_generate, 3);`.
-    /// Same VS as sub-pass 1, color writes disabled, depth write
-    /// enabled — writes water surface depth into gbuffer so
-    /// transparents drawn after water depth-test against it.
-    pub water_depth_pipeline: wgpu::RenderPipeline,
+    /// Per-rmw-material slots, keyed by `material_index` into the BSP's
+    /// `sbsp.materials` (the index each `WaterMeshPart` carries). Built
+    /// by [`Self::load_water_materials`]; the shading + depth draw loops
+    /// select the slot per water part. A BSP with N distinct water
+    /// shaders (docks = 2) builds N slots; riverworld = 1.
+    pub material_slots: std::collections::BTreeMap<u16, WaterMaterialSlot>,
     /// Empty `@group(2)` placeholder for the depth pipeline layout —
     /// avoids binding the real `water_extern_bind_group` (which
     /// references `scene_depth` as a sampled resource) at the same
@@ -722,20 +744,12 @@ pub struct WaterRenderer {
     /// bitmap, and rebuilds the bind group. Phase A4b promotes this
     /// to a per-rmw-material cache.
     pub water_material_bgl: wgpu::BindGroupLayout,
-    pub water_material_bind_group: wgpu::BindGroup,
     pub env_cubemap_sampler: wgpu::Sampler,
     pub wave_array_sampler: wgpu::Sampler,
     /// Linear+repeat sampler for watercolor / foam / global_shape
     /// 2D textures. Engine binds these via the rmt2 sampler routing;
     /// for protomorph's single-pipeline path we share one sampler.
     pub material_2d_sampler: wgpu::Sampler,
-    pub cbuf_water_material_ps: wgpu::Buffer,
-    /// Load-time repacked bytes (rmt2-emitted + phantom slots from
-    /// `loader::append_param_phantom_slots`, all in WGSL field order).
-    /// Used as the fallback in per-frame `update_constants` so phantom-
-    /// slot values (e.g. `fresnel_curve_steepness`) survive the
-    /// rmt2-only re-resolve.
-    pub cbuf_water_material_loaded_bytes: Vec<u8>,
     /// 1×1×1 black 2D array fallback view bound to slot 3 until a
     /// real wave_displacement_array loads. Lives on `WaterRenderer`
     /// so the texture stays alive for the lifetime of the renderer.
@@ -746,17 +760,6 @@ pub struct WaterRenderer {
     /// on `WaterRenderer` so the texture outlives any view of it.
     pub material_2d_fallback_texture: wgpu::Texture,
     pub material_2d_fallback_view: wgpu::TextureView,
-
-    /// Source tag data for re-resolving the rmw user cbuffer per-frame
-    /// (Phase A7c). Captured from the first rmw material's
-    /// [`MaterialData::render_method_source`] when
-    /// [`Self::load_water_material`] runs. Engine equivalent:
-    /// `update_constants @ 0x180685300` re-overlays animated
-    /// parameters each frame from the live `c_render_method`.
-    pub water_material_source: Option<crate::halo::render_methods::materials::RenderMethodSource>,
-    /// Cbuf size in bytes, captured at load. Used to bound the
-    /// per-frame upload to the buffer's actual capacity.
-    pub cbuf_water_material_size: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1200,18 +1203,10 @@ impl WaterRenderer {
                 ..Default::default()
             },
         );
-        // Initial 16-byte zeroed cbuf — `load_water_material`
-        // reallocates this to the rmw cbuffer's actual size (66 vec4 =
-        // 1056 bytes for riverworld) once the material is resolved.
-        // wgpu BGLs with `min_binding_size: None` accept any size
-        // ≥ 16 bytes, mirroring rmsh's `material_bgl` slot 5 (cbuffer
-        // size varies per VariantKey there too).
-        let cbuf_water_material_ps = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("water_cbuf_WaterMaterialPS"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Per-material cbuffers live on each `WaterMaterialSlot`, built
+        // in `load_water_materials`. The shared `water_material_bgl`
+        // uses `min_binding_size: None` so each slot's cbuffer can be a
+        // different size (rmt2 cbuffer size varies per shader).
         let water_material_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("water_material_bgl"),
             entries: &[
@@ -1356,34 +1351,12 @@ impl WaterRenderer {
                 },
             ],
         });
-        let water_material_bind_group = build_water_material_bind_group(
-            device,
-            &water_material_bgl,
-            &shared.fallback_textures.black_cube_view,
-            &env_cubemap_sampler,
-            &cbuf_water_material_ps,
-            &wave_array_fallback_view,
-            &wave_array_sampler,
-            &material_2d_fallback_view,
-            &material_2d_sampler,
-            &material_2d_fallback_view,
-            &material_2d_fallback_view,
-            &material_2d_fallback_view,
-            &wave_array_fallback_view,
-        );
-
-        // Build the debug pipeline AFTER the BGLs exist — its layout
-        // includes water_engine_bgl at @group(1), water_extern_bgl at
-        // @group(2), and water_material_bgl at @group(3) so the shader
-        // can reference all of them without a layout mismatch.
-        let water_pipeline = build_water_pipeline(
-            shared,
-            &water_engine_bgl,
-            &water_extern_bgl,
-            &water_material_bgl,
-            &WaterVariant::defaults_riverworld(),
-        );
-        let (water_depth_pipeline, depth_empty_bind_group) = build_water_depth_pipeline(
+        // Per-material shading + depth pipelines are built per slot in
+        // `load_water_materials`. Here we build the depth pipeline once
+        // with the riverworld-default variant ONLY to obtain the shared
+        // empty `@group(2)` placeholder bind group (`depth_empty_bind_group`);
+        // its pipeline is discarded.
+        let (_discard_depth_pipeline, depth_empty_bind_group) = build_water_depth_pipeline(
             shared,
             &water_engine_bgl,
             &water_extern_bgl,
@@ -1407,8 +1380,7 @@ impl WaterRenderer {
             render_structure_part_indices: Vec::with_capacity(512),
             tessellation_index_buffer,
             tessellation_vertex_buffer,
-            water_pipeline,
-            water_depth_pipeline,
+            material_slots: std::collections::BTreeMap::new(),
             depth_empty_bind_group,
             underwater_fog_pipeline,
             cbuf_water_ps,
@@ -1423,26 +1395,49 @@ impl WaterRenderer {
             cbuf_ldr_texture_size,
             cbuf_depth_constants,
             water_material_bgl,
-            water_material_bind_group,
             env_cubemap_sampler,
             wave_array_sampler,
             material_2d_sampler,
-            cbuf_water_material_ps,
-            cbuf_water_material_loaded_bytes: Vec::new(),
             wave_array_fallback_texture,
             wave_array_fallback_view,
             material_2d_fallback_texture,
             material_2d_fallback_view,
-            water_material_source: None,
-            cbuf_water_material_size: 16,
         }
     }
 
-    /// Swap in a real rmw material's resources — env cubemap +
-    /// rmw user cbuffer (the packed `mat.cbuffer.bytes` blob from
-    /// the rmsh→rmop→rmt2 walker). Phase A6a single-material path;
-    /// called once at scenario load with the first rmw material's
-    /// `MaterialData`. Phase A4b replaces this with a per-rmw cache.
+    /// Build a per-material slot for EVERY distinct rmw material on the
+    /// BSP (keyed by `material_index` into `sbsp.materials`), replacing
+    /// any previously-loaded slots. docks has two (`dock_water_1` +
+    /// `dock_water_2`); riverworld has one. The shading + depth draw
+    /// loops select the slot per water part via `WaterMeshPart::material_index`.
+    ///
+    /// NOTE: keyed scenario-globally by `material_index` — if a future
+    /// multi-BSP scenario carried water in more than one BSP with
+    /// colliding indices, the last loaded would win. No current scenario
+    /// does (matching the prior single-material assumption).
+    pub fn load_water_materials(
+        &mut self,
+        shared: &crate::halo::render::shared::SharedResources,
+        materials: &[(u16, crate::halo::render_methods::materials::MaterialData)],
+    ) {
+        // Mark lightmap as available — water BSPs carry a lightmap atlas
+        // alongside the rmw material. Engine `is_lightmap_available` is
+        // per-cluster; protomorph treats it as scenario-global.
+        self.lightmaps_available = true;
+        self.material_slots.clear();
+        for (material_index, mat) in materials {
+            // Build with an immutable borrow of `self` (shared BGLs /
+            // samplers / fallbacks), then insert — the borrow ends before
+            // the `&mut self` insert.
+            let slot = self.build_material_slot(shared, mat);
+            self.material_slots.insert(*material_index, slot);
+        }
+    }
+
+    /// Build one [`WaterMaterialSlot`] from a resolved rmw material:
+    /// env cubemap + wave/slope/foam/global_shape textures + the rmt2
+    /// user cbuffer (repacked to WGSL field order) + a variant-substituted
+    /// shading + depth pipeline.
     ///
     /// Engine equivalents (per `reference_dllcache_cbuffer_resolution.md`):
     /// - cubemap binding ← `submit_extern_texture` for the
@@ -1450,24 +1445,13 @@ impl WaterRenderer {
     /// - cbuffer upload ← `submit_static_ps_parameters @ 0x180685860`
     ///   which memcpy's `rmsh.postprocess.real_constants` (= our
     ///   `mat.cbuffer.bytes`) to PS slot 0x13.
-    ///
-    /// The shader's `WaterMaterialPS` WGSL struct must mirror the rmw
-    /// rmt2 cbuffer layout — one `vec4<f32>` per slot in the same
-    /// declaration order, mirroring how `submit_static_ps_parameters`
-    /// memcpys with no remapping.
-    pub fn load_water_material(
-        &mut self,
+    fn build_material_slot(
+        &self,
         shared: &crate::halo::render::shared::SharedResources,
         mat: &crate::halo::render_methods::materials::MaterialData,
-    ) {
+    ) -> WaterMaterialSlot {
         use crate::halo::render_methods::materials::MaterialTextureUsage;
         use wgpu::util::DeviceExt;
-
-        // Mark lightmap as available — riverworld BSPs always carry a
-        // lightmap atlas alongside the rmw material. Engine `is_lightmap_available`
-        // is per-cluster; protomorph's single-pipeline path treats it
-        // as scenario-global until A4b adds per-cluster routing.
-        self.lightmaps_available = true;
 
         // ---- env cubemap upload ----
         // Engine: `environment_map` is a Bitmap-typed rmt2 parameter
@@ -1493,7 +1477,7 @@ impl WaterRenderer {
                 // `reflection_coefficient = 600` was tuned against
                 // the dynamic per-cluster encoding, not z_cubemap_temp.
                 Some(crate::halo::structures::bsp_gpu::upload_inline_texture(
-                    shared, tex, false,
+                    shared, tex, SampleIntent::FollowCurve,
                 ))
             }
             Some(tex) => {
@@ -1524,7 +1508,7 @@ impl WaterRenderer {
                 );
                 dump_water_texture_ppm(&mat.name, "wave_displacement_array", tex);
                 Some(crate::halo::structures::bsp_gpu::upload_inline_texture(
-                    shared, tex, false,
+                    shared, tex, SampleIntent::FollowCurve,
                 ))
             }
             Some(tex) => {
@@ -1552,7 +1536,7 @@ impl WaterRenderer {
                 );
                 dump_water_texture_ppm(&mat.name, "watercolor_texture", tex);
                 Some(crate::halo::structures::bsp_gpu::upload_inline_texture(
-                    shared, tex, false,
+                    shared, tex, SampleIntent::FollowCurve,
                 ))
             }
             Some(tex) => {
@@ -1576,7 +1560,7 @@ impl WaterRenderer {
         //   foam_texture_detail : detail multiplier (with own xform).
         // Riverworld points foam_texture and foam_texture_detail at the
         // same bitmap; only the xforms differ.
-        let load_2d = |name: &str| -> Option<wgpu::TextureView> {
+        let load_2d = |name: &str, intent: SampleIntent| -> Option<wgpu::TextureView> {
             match mat.find_texture_by_name(name) {
                 Some(tex) if !tex.is_cube && tex.layers == 1 => {
                     eprintln!(
@@ -1585,7 +1569,7 @@ impl WaterRenderer {
                     );
                     dump_water_texture_ppm(&mat.name, name, tex);
                     Some(crate::halo::structures::bsp_gpu::upload_inline_texture(
-                        shared, tex, false,
+                        shared, tex, intent,
                     ))
                 }
                 Some(tex) => {
@@ -1601,9 +1585,14 @@ impl WaterRenderer {
                 }
             }
         };
-        let global_shape_view = load_2d("global_shape_texture");
-        let foam_view = load_2d("foam_texture");
-        let foam_detail_view = load_2d("foam_texture_detail");
+        // global_shape_texture is packed CONTROL data (R=height_scale,
+        // G=choppiness, B=foam_paint), NOT display color — it must be sampled
+        // LINEAR. Loading it FollowCurve on a gamma-tagged map (docks_multi_map
+        // = XrgbGamma2) sRGB-decoded it and crushed B 0.138→0.018, killing
+        // dock_water_2's paint-driven foam and over-attenuating wave height.
+        let global_shape_view = load_2d("global_shape_texture", SampleIntent::ForceLinear);
+        let foam_view = load_2d("foam_texture", SampleIntent::FollowCurve);
+        let foam_detail_view = load_2d("foam_texture_detail", SampleIntent::FollowCurve);
 
         // ---- wave_slope_array upload (Phase A6f) ----
         // Engine: PS-side rmt2 texture sampled by `compose_slope`
@@ -1620,7 +1609,7 @@ impl WaterRenderer {
                 );
                 dump_water_texture_ppm(&mat.name, "wave_slope_array", tex);
                 Some(crate::halo::structures::bsp_gpu::upload_inline_texture(
-                    shared, tex, false,
+                    shared, tex, SampleIntent::FollowCurve,
                 ))
             }
             Some(tex) => {
@@ -1653,8 +1642,8 @@ impl WaterRenderer {
             packed_bytes.len(),
             mat.cbuffer.bytes.len(),
         );
-        self.cbuf_water_material_size = packed_bytes.len() as u64;
-        self.cbuf_water_material_ps = shared.device.create_buffer_init(
+        let cbuf_size = packed_bytes.len() as u64;
+        let cbuf = shared.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("water_cbuf_WaterMaterialPS"),
                 contents: &packed_bytes,
@@ -1669,13 +1658,13 @@ impl WaterRenderer {
         // `fresnel_curve_steepness`). Without this cache, per-frame
         // repack zeroes the phantom slots → `fresnel_p = 0` → `pow(x, 0)
         // = 1` → fresnel saturates at 1.0 → mirror-finish lake.
-        self.cbuf_water_material_loaded_bytes = packed_bytes;
+        let cbuf_loaded_bytes = packed_bytes;
         // Capture the rmw source data so `update_constants` can
         // re-resolve the cbuffer per-frame for animated parameters
         // (`time_warp` etc., Phase A7c).
-        self.water_material_source = mat.render_method_source.clone();
+        let source = mat.render_method_source.clone();
 
-        // ---- rebuild the bind group with the new cube view + cbuf ----
+        // ---- build the bind group with this material's cube view + cbuf ----
         let cube_view_ref = env_view
             .as_ref()
             .unwrap_or(&shared.fallback_textures.black_cube_view);
@@ -1697,12 +1686,12 @@ impl WaterRenderer {
         let wave_slope_view_ref = wave_slope_view
             .as_ref()
             .unwrap_or(&self.wave_array_fallback_view);
-        self.water_material_bind_group = build_water_material_bind_group(
+        let bind_group = build_water_material_bind_group(
             &shared.device,
             &self.water_material_bgl,
             cube_view_ref,
             &self.env_cubemap_sampler,
-            &self.cbuf_water_material_ps,
+            &cbuf,
             wave_view_ref,
             &self.wave_array_sampler,
             watercolor_view_ref,
@@ -1713,20 +1702,19 @@ impl WaterRenderer {
             wave_slope_view_ref,
         );
 
-        // Phase W2 — rebuild the shading pipeline with this material's
+        // Phase W2 — build the shading pipeline with this material's
         // rmdf-resolved category choices so the engine HLSL category
         // branches resolve correctly (watercolor=pure/texture,
         // global_shape=none/paint/depth, bankalpha=none/depth/paint).
-        // The depth-only pipeline never reads these branches; keep it
-        // as built at init.
         let variant = WaterVariant::from_choices(&mat.category_choices);
         eprintln!(
-            "[water] variant: watercolor={} global_shape={} bankalpha={} \
+            "[water] material '{}' variant: watercolor={} global_shape={} bankalpha={} \
              waveshape={} foam={} reflection={} refraction={}",
+            mat.name,
             variant.watercolor, variant.global_shape, variant.bankalpha,
             variant.waveshape, variant.foam, variant.reflection, variant.refraction,
         );
-        self.water_pipeline = build_water_pipeline(
+        let pipeline = build_water_pipeline(
             shared,
             &self.water_engine_bgl,
             &self.water_extern_bgl,
@@ -1735,8 +1723,8 @@ impl WaterRenderer {
         );
         // Depth-only pipeline shares vs_main with the shading pipeline,
         // so it needs the same VS-side substitutions (height_scale_global
-        // depends on the global_shape choice). Bind group is identical
-        // (empty placeholder); discard the new one and keep the existing.
+        // depends on the global_shape choice). Its empty placeholder bind
+        // group is shared (built once at `new`); discard the new one.
         let (depth_pipeline, _new_bg) = build_water_depth_pipeline(
             shared,
             &self.water_engine_bgl,
@@ -1744,7 +1732,16 @@ impl WaterRenderer {
             &self.water_material_bgl,
             &variant,
         );
-        self.water_depth_pipeline = depth_pipeline;
+
+        WaterMaterialSlot {
+            pipeline,
+            depth_pipeline,
+            bind_group,
+            cbuf,
+            cbuf_size,
+            cbuf_loaded_bytes,
+            source,
+        }
     }
 
     /// Rebuild the `@group(2)` extern bind group after the underlying
@@ -1917,15 +1914,18 @@ impl WaterRenderer {
         // identity → t) which drives wave_displacement_array slice
         // selection in the VS, plus `*_texture` translation channels
         // used by the wave_slope_array / foam_texture sampling.
-        if let Some(src) = self.water_material_source.as_ref() {
-            // Water always loads with rmt2 populated (water_material_source
-            // is only set on the rmw+rmt2 path); rmt2 is None for
-            // author-format-only materials which water isn't. The unwrap
-            // is safe under that invariant; if a future rmw tag ships
-            // without an rmt2 it'll panic loudly here instead of
-            // silently freezing animation.
+        //
+        // Re-resolve PER material slot — each water shader (docks has
+        // two) has its own source, cbuffer, and animation.
+        for slot in self.material_slots.values() {
+            let Some(src) = slot.source.as_ref() else { continue };
+            // Water always loads with rmt2 populated (slot.source is only
+            // set on the rmw+rmt2 path); rmt2 is None for author-format-
+            // only materials which water isn't. The expect is safe under
+            // that invariant; a future rmw tag without an rmt2 panics
+            // loudly here instead of silently freezing animation.
             let rmt2 = src.rmt2.as_ref().expect(
-                "water_material_source carries an rmw material; rmt2 was loaded at scenario load",
+                "water material slot carries an rmw material; rmt2 was loaded at scenario load",
             );
             let ctx = blam_tags::render_method::DefaultEvalContext {
                 eval_time: game.total_time,
@@ -1940,10 +1940,10 @@ impl WaterRenderer {
             // `fresnel_curve_steepness`) keep their authored values.
             let packed = repack_water_cbuffer_to_wgsl_order(
                 &cb,
-                Some(&self.cbuf_water_material_loaded_bytes),
+                Some(&slot.cbuf_loaded_bytes),
             );
-            let n = (packed.len() as u64).min(self.cbuf_water_material_size) as usize;
-            queue.write_buffer(&self.cbuf_water_material_ps, 0, &packed[..n]);
+            let n = (packed.len() as u64).min(slot.cbuf_size) as usize;
+            queue.write_buffer(&slot.cbuf, 0, &packed[..n]);
         }
     }
 
@@ -2152,12 +2152,13 @@ impl WaterRenderer {
             }),
             ..Default::default()
         });
-        rpass.set_pipeline(&self.water_pipeline);
         rpass.set_bind_group(
             0,
             &ctx.shared.camera_bind_group_sl,
             &[
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                // atmosphere @ binding 2 — water uses the cluster default.
+                crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                 crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                 // dominant_light @ binding 13 shares the ravi cursor.
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
@@ -2171,10 +2172,6 @@ impl WaterRenderer {
         // 0x3C. Mirrors the dllcache extern dispatch in
         // `c_player_view::render_water @ 0x18068c120`.
         rpass.set_bind_group(2, &self.water_extern_bind_group, &[]);
-        // @group(3) = per-rmw-material resources: environment_map
-        // cubemap + sampler + WaterMaterialPS cbuf (reflection /
-        // fresnel coefficients, sunspot cut). Phase A6a — single slot.
-        rpass.set_bind_group(3, &self.water_material_bind_group, &[]);
         rpass.set_index_buffer(
             self.tessellation_index_buffer.slice(..),
             wgpu::IndexFormat::Uint16,
@@ -2186,10 +2183,10 @@ impl WaterRenderer {
         // Engine: `c_water_renderer::render_water_part` issues one
         // `draw_indexed_instanced` per water-flagged part — different
         // rmw materials in the same mesh route to different shader
-        // pipelines via `render_method_submit`. Phase A3 mirrors that
-        // dispatch granularity (per-part ranges); Phase A4 plumbs the
-        // material's option-driven pipeline lookup. Until A4 lands,
-        // every part draws through the same debug stub.
+        // pipelines via `render_method_submit`. We mirror that: each
+        // part selects its material slot by `material_index` and binds
+        // that slot's variant pipeline + `@group(3)` resources. (docks'
+        // two water shaders draw with their own wave/foam/reflection.)
         for bsp in &ctx.structure_renderer.bsps {
             for mesh in &bsp.meshes {
                 let Some(water) = mesh.water.as_ref() else { continue };
@@ -2202,6 +2199,13 @@ impl WaterRenderer {
                     if part.instance_count == 0 {
                         continue;
                     }
+                    let Some(slot) = self.material_slots.get(&part.material_index) else {
+                        continue;
+                    };
+                    rpass.set_pipeline(&slot.pipeline);
+                    // @group(3) = this material's env cubemap + sampler +
+                    // WaterMaterialPS cbuf + wave/foam/global_shape textures.
+                    rpass.set_bind_group(3, &slot.bind_group, &[]);
                     let start = part.instance_start;
                     let end = start + part.instance_count;
                     rpass.draw_indexed(0..675, 0, start..end);
@@ -2237,12 +2241,13 @@ impl WaterRenderer {
             }),
             ..Default::default()
         });
-        depth_pass.set_pipeline(&self.water_depth_pipeline);
         depth_pass.set_bind_group(
             0,
             &ctx.shared.camera_bind_group_sl,
             &[
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                // atmosphere @ binding 2 — water uses the cluster default.
+                crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                 crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                 // dominant_light @ binding 13 shares the ravi cursor.
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
@@ -2251,10 +2256,9 @@ impl WaterRenderer {
         depth_pass.set_bind_group(1, &self.water_engine_bind_group, &[]);
         // Slot 2 is an EMPTY placeholder (the real `water_extern_bind_group`
         // would re-expose scene_depth as a sampled resource that conflicts
-        // with the depth-write attachment). Material stays at @group(3)
-        // so the WGSL `@group(3) @binding(N)` declarations still resolve.
+        // with the depth-write attachment). Material (@group(3)) + pipeline
+        // are set per part below.
         depth_pass.set_bind_group(2, &self.depth_empty_bind_group, &[]);
-        depth_pass.set_bind_group(3, &self.water_material_bind_group, &[]);
         depth_pass.set_index_buffer(
             self.tessellation_index_buffer.slice(..),
             wgpu::IndexFormat::Uint16,
@@ -2272,6 +2276,11 @@ impl WaterRenderer {
                     if part.instance_count == 0 {
                         continue;
                     }
+                    let Some(slot) = self.material_slots.get(&part.material_index) else {
+                        continue;
+                    };
+                    depth_pass.set_pipeline(&slot.depth_pipeline);
+                    depth_pass.set_bind_group(3, &slot.bind_group, &[]);
                     let start = part.instance_start;
                     let end = start + part.instance_count;
                     depth_pass.draw_indexed(0..675, 0, start..end);
@@ -2333,6 +2342,8 @@ impl WaterRenderer {
             &ctx.shared.camera_bind_group_sl,
             &[
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                // atmosphere @ binding 2 — water uses the cluster default.
+                crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                 crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                 // dominant_light @ binding 13 shares the ravi cursor.
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,

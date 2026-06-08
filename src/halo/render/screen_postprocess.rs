@@ -1893,7 +1893,7 @@ impl ScreenPostprocess {
         static DUMPED: std::sync::Once = std::sync::Once::new();
         DUMPED.call_once(|| {
             eprintln!(
-                "[lightshafts] flags={:#06x} intensity={} intensity_clamp={} \
+                "[lightshafts] flags={:?} intensity={} intensity_clamp={} \
                  falloff_radius={} depth_clamp={} blur_radius={} \
                  tint=({:.3}, {:.3}, {:.3}) heading={}° pitch={}°",
                 ls.flags,

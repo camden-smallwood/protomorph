@@ -4,6 +4,7 @@
 //! mirrors what Halo's shader system exposes plus a few derived
 //! scalars the WGSL reads.
 
+use blam_tags::bitmap::BitmapCurve;
 use blam_tags::render_method::{
     RenderMethod, RenderMethodOptionParameter, RenderMethodTemplate,
     ResolvedCbuffer, ResolvedRenderMethod,
@@ -47,6 +48,34 @@ pub enum MaterialTextureUsage {
     Environment,
 }
 
+/// How a bitmap's stored texel values map to linear light, derived from
+/// its authored `BitmapCurve`. Kept as data on `InlineTexture` so the
+/// sRGB sampling decision is made in exactly one place
+/// (`resolve_wgpu_format`) rather than baked into the pixel format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TexelEncoding {
+    /// Gamma-encoded display color (curve `XrgbGamma2`/`Gamma2`/`Srgb`, or
+    /// `Unknown` — MCC defaults untagged color formats to sRGB).
+    Gamma,
+    /// Already-linear data (curve `Linear`/`OffsetLog`): normals, masks,
+    /// packed/physical values, HDR log.
+    Linear,
+}
+
+impl TexelEncoding {
+    /// Per-curve sRGB classification — the policy that used to live as the
+    /// inline `srgb` bool in `load_image_from_bitmap`.
+    pub fn from_curve(curve: BitmapCurve) -> Self {
+        match curve {
+            BitmapCurve::XrgbGamma2
+            | BitmapCurve::Gamma2
+            | BitmapCurve::Srgb
+            | BitmapCurve::Unknown => Self::Gamma,
+            BitmapCurve::Linear | BitmapCurve::OffsetLog => Self::Linear,
+        }
+    }
+}
+
 /// Pre-extracted texture from a Halo `bitm` tag with native format +
 /// mip pyramid intact. The renderer hands the bytes directly to wgpu
 /// without re-encoding.
@@ -62,22 +91,29 @@ pub struct InlineTexture {
     pub mip_count: u32,
     pub layers: u32,
     pub is_cube: bool,
+    /// Raw texel layout ONLY (no sRGB-vs-linear baked in).
     pub format: InlinePixelFormat,
+    /// How the stored values map to linear light. Combined with the call
+    /// site's `SampleIntent` in `resolve_wgpu_format` to pick the final
+    /// wgpu sRGB-vs-Unorm format.
+    pub encoding: TexelEncoding,
     pub data: Vec<u8>,
 }
 
-/// Subset of wgpu-native formats we actually emit from the bitmap
-/// loader. Halo formats with no clean wgpu equivalent (`DxnMonoAlpha`,
-/// `A4r4g4b4`, etc.) get pre-decoded to one of these on the loader side.
+/// Subset of wgpu-native formats we emit from the bitmap loader, describing
+/// ONLY the raw texel layout — sRGB-vs-linear is NOT encoded here (see
+/// [`TexelEncoding`] on [`InlineTexture`] + `resolve_wgpu_format`). Halo
+/// formats with no clean wgpu equivalent (`DxnMonoAlpha`, `A4r4g4b4`, etc.)
+/// get pre-decoded to one of these on the loader side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InlinePixelFormat {
-    Bc1RgbaUnormSrgb, Bc1RgbaUnorm,
-    Bc2RgbaUnormSrgb, Bc2RgbaUnorm,
-    Bc3RgbaUnormSrgb, Bc3RgbaUnorm,
+    Bc1RgbaUnorm,
+    Bc2RgbaUnorm,
+    Bc3RgbaUnorm,
     Bc4RUnorm, Bc4RSnorm,
     Bc5RgUnorm, Bc5RgSnorm,
-    Rgba8UnormSrgb, Rgba8Unorm, Rgba8Snorm,
-    Bgra8UnormSrgb, Bgra8Unorm,
+    Rgba8Unorm, Rgba8Snorm,
+    Bgra8Unorm,
     Rg8Unorm, Rg8Snorm,
     R8Unorm,
     Rgba16Float, Rgba16Unorm, Rgba16Snorm,
@@ -87,9 +123,9 @@ pub enum InlinePixelFormat {
 impl InlinePixelFormat {
     pub fn block_bytes(self) -> u32 {
         match self {
-            Self::Bc1RgbaUnormSrgb | Self::Bc1RgbaUnorm | Self::Bc4RUnorm | Self::Bc4RSnorm => 8,
-            Self::Bc2RgbaUnormSrgb | Self::Bc2RgbaUnorm
-            | Self::Bc3RgbaUnormSrgb | Self::Bc3RgbaUnorm
+            Self::Bc1RgbaUnorm | Self::Bc4RUnorm | Self::Bc4RSnorm => 8,
+            Self::Bc2RgbaUnorm
+            | Self::Bc3RgbaUnorm
             | Self::Bc5RgUnorm | Self::Bc5RgSnorm => 16,
             _ => 0,
         }
@@ -99,8 +135,7 @@ impl InlinePixelFormat {
         match self {
             Self::R8Unorm => 1,
             Self::Rg8Unorm | Self::Rg8Snorm => 2,
-            Self::Rgba8UnormSrgb | Self::Rgba8Unorm | Self::Rgba8Snorm
-            | Self::Bgra8UnormSrgb | Self::Bgra8Unorm => 4,
+            Self::Rgba8Unorm | Self::Rgba8Snorm | Self::Bgra8Unorm => 4,
             Self::Rgba16Float | Self::Rgba16Unorm | Self::Rgba16Snorm => 8,
             Self::Rgba32Float => 16,
             _ => 0,

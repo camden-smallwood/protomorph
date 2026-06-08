@@ -67,6 +67,13 @@ fn force_xform_slot(cb: &mut blam_tags::render_method::ResolvedCbuffer, name: &s
     const IDENTITY: [f32; 4] = [1.0, 1.0, 0.0, 0.0];
     if let Some(idx) = cb.slots.iter().position(|s| s.source_name == name) {
         if !cb.slots[idx].is_xform {
+            if cb.slots[idx].value != IDENTITY {
+                eprintln!(
+                    "[cbuffer] force_xform_slot overwriting authored non-xform value {:?} \
+                     for '{name}' with identity — tiling/scroll lost (fixed-WGSL shortcut)",
+                    cb.slots[idx].value,
+                );
+            }
             cb.slots[idx].is_xform = true;
             cb.slots[idx].value = IDENTITY;
             let off = cb.slots[idx].byte_offset as usize;

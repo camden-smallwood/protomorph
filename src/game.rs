@@ -1,4 +1,3 @@
-use crate::halo::animations::AnimationManager;
 use crate::halo::camera::FlyingCamera;
 use crate::halo::geometry::ModelData;
 use crate::halo::objects::{ObjectIndex, ObjectStore};
@@ -40,8 +39,24 @@ impl FpsCounter {
 // Game state — Phase 1 Halo viewer (flycam-only, no collision/physics)
 // ---------------------------------------------------------------------------
 
+/// A scenario placement parented to another object by name + marker,
+/// resolved after all placements load ([`GameState::resolve_pending_attachments`]).
+/// Engine equivalent: the `object_attach_to_marker` deferred until the
+/// parent (which may be the sky or a later-loaded placement) exists.
+struct PendingAttachment {
+    /// `object_index` (header) of the child to reposition.
+    child_header_index: u32,
+    /// `parent id.parent object` — index into `scenario.object_names`.
+    parent_name_index: i16,
+    /// `parent id.parent marker` — marker on the parent to snap to.
+    parent_marker: String,
+}
+
 pub struct GameState {
     pub objects: ObjectStore,
+    /// Collected during placement load; resolved into datum world transforms
+    /// by [`Self::resolve_pending_attachments`] once every object exists.
+    pending_attachments: Vec<PendingAttachment>,
     pub camera: FlyingCamera,
     pub model_data: Vec<ModelData>,
     pub fps_counter: FpsCounter,
@@ -93,6 +108,7 @@ impl GameState {
 
         let mut state = Self {
             objects: ObjectStore::new(),
+            pending_attachments: Vec::new(),
             camera,
             model_data: Vec::new(),
             fps_counter: FpsCounter::new(),
@@ -205,16 +221,22 @@ impl GameState {
                                     .and_then(|t| t.as_ref());
                                 let (verts, tris) = rm
                                     .map(|m| {
-                                        let v: u32 = m.meshes.iter().map(|x| x.vertices.len() as u32).sum();
-                                        let t: u32 = m
-                                            .meshes
+                                        let v: u32 = m
+                                            .render_geometry
+                                            .per_mesh_temporary
                                             .iter()
-                                            .map(|x| (x.indices.len() / 3) as u32)
+                                            .map(|x| x.raw_vertices.len() as u32)
+                                            .sum();
+                                        let t: u32 = m
+                                            .render_geometry
+                                            .per_mesh_temporary
+                                            .iter()
+                                            .map(|x| (x.raw_indices.len() / 3) as u32)
                                             .sum();
                                         (v, t)
                                     })
                                     .unwrap_or((0, 0));
-                                let meshes = rm.map(|m| m.meshes.len()).unwrap_or(0);
+                                let meshes = rm.map(|m| m.render_geometry.meshes.len()).unwrap_or(0);
                                 eprintln!(
                                     "[scenario]     set[{}] {} — {} placements, shader={}, {} types, mesh_blocks={}, {} verts, {} tris",
                                     si,
@@ -256,7 +278,6 @@ impl GameState {
                                 self.model_data.push(data);
                                 let slot = self.objects.get_mut(obj);
                                 slot.model_index = Some(model);
-                                self.init_animations(obj, model);
                                 self.sky_object = Some(obj);
                                 eprintln!(
                                     "[scenario]   sky: {} (model={})",
@@ -415,6 +436,11 @@ impl GameState {
                         |_| false,
                         Some(&control_offsets),
                     );
+
+                    // All placements loaded — resolve parent-marker
+                    // attachments now that every parent object (and the sky)
+                    // exists.
+                    self.resolve_pending_attachments(renderer, &loaded.scenario);
                 }
                 Err(e) => eprintln!("[scenario] load failed: {e}"),
             }
@@ -439,6 +465,92 @@ impl GameState {
     /// Per `feedback_wgsl_must_mirror_hlsl.md`: silent fallbacks hide
     /// what needs porting. Render-method dispatcher panics on
     /// unsupported shader options propagate up — no `catch_unwind`.
+    /// Resolve deferred parent-marker attachments ([`PendingAttachment`])
+    /// into datum world transforms. For each parented placement, the child's
+    /// world = parent's marker world matrix (engine
+    /// `object_attach_to_marker_immediate`): for a sky parent the sky is at
+    /// the world origin so it's the sky marker's object-local matrix; for an
+    /// object parent it's `parent.world_matrix × parent_marker_local`.
+    ///
+    /// Resolves in dependency order via a worklist — an attachment whose
+    /// parent is itself still pending is deferred to a later pass, so chains
+    /// (child → parent → … → sky) settle correctly. Unresolvable links
+    /// (missing parent / marker, or a cycle) are logged and dropped.
+    fn resolve_pending_attachments(
+        &mut self,
+        renderer: &Renderer,
+        scenario: &blam_tags::scenario::Scenario,
+    ) {
+        use crate::halo::objects::object_header_data as ohd;
+        if self.pending_attachments.is_empty() {
+            return;
+        }
+        // header_index → renderer model_index, for object-parent marker lookup.
+        let mut header_to_model: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+        for (_oi, obj) in self.objects.iter() {
+            if let (Some(h), Some(m)) = (obj.header_index, obj.model_index) {
+                header_to_model.insert(h, m);
+            }
+        }
+        let mut pending = std::mem::take(&mut self.pending_attachments);
+        loop {
+            // header indices still awaiting attachment — their world isn't final.
+            let unresolved: std::collections::HashSet<u32> =
+                pending.iter().map(|a| a.child_header_index).collect();
+            let mut next: Vec<PendingAttachment> = Vec::new();
+            let mut progressed = false;
+            for a in pending.drain(..) {
+                let is_sky = scenario
+                    .skies
+                    .iter()
+                    .any(|s| s.name_index == a.parent_name_index);
+                let world: Option<glam::Mat4> = if is_sky {
+                    renderer.sky_marker_transform(&a.parent_marker)
+                } else {
+                    match ohd::object_index_from_name_index(a.parent_name_index) {
+                        // Parent is itself still pending — defer to a later pass.
+                        Some(ph) if unresolved.contains(&ph) => {
+                            next.push(a);
+                            continue;
+                        }
+                        Some(ph) => match (ohd::world_matrix(ph), header_to_model.get(&ph)) {
+                            (Some(pw), Some(&pm)) => renderer
+                                .model_marker_transform(pm, &a.parent_marker)
+                                .map(|local| pw * local),
+                            _ => None,
+                        },
+                        None => None,
+                    }
+                };
+                match world {
+                    Some(w) => {
+                        ohd::set_world_transform(a.child_header_index, w);
+                        progressed = true;
+                    }
+                    None => {
+                        eprintln!(
+                            "[parent] unresolved attachment: child header {} parent name idx {} \
+                             marker '{}' — left at authored position",
+                            a.child_header_index, a.parent_name_index, a.parent_marker
+                        );
+                        progressed = true; // drop; don't spin
+                    }
+                }
+            }
+            pending = next;
+            if pending.is_empty() || !progressed {
+                break;
+            }
+        }
+        if !pending.is_empty() {
+            eprintln!(
+                "[parent] {} attachment(s) unresolved (parent cycle or missing)",
+                pending.len()
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn load_visible_placements(
         &mut self,
@@ -569,7 +681,21 @@ impl GameState {
                     }
                 }
             }
-            self.init_animations(obj, model_idx);
+
+            // Parent-marker attachment: defer to a post-load pass so the
+            // parent object (which may load in a later placement block, or be
+            // the sky) is available + already attached first. Engine path:
+            // object_new → object_attach_to_marker → ...marker_immediate snaps
+            // the child's frame to the parent marker's world matrix.
+            if let Some(pid) = p.object_data.parent_id.as_ref() {
+                if pid.parent_object_name_index >= 0 {
+                    self.pending_attachments.push(PendingAttachment {
+                        child_header_index: header_index,
+                        parent_name_index: pid.parent_object_name_index,
+                        parent_marker: pid.parent_marker.clone(),
+                    });
+                }
+            }
             loaded_count += 1;
         }
         let unique_loaded =
@@ -580,24 +706,9 @@ impl GameState {
         );
     }
 
-    fn init_animations(&mut self, obj_index: ObjectIndex, model_index: usize) {
-        let model = &self.model_data[model_index];
-        // Any model with nodes needs an AnimationManager so its
-        // bind-pose node matrices reach the GPU — even with zero
-        // animations. Skinned vertices sample `node_matrices` and
-        // would otherwise see zeros.
-        if model.nodes.is_empty() {
-            return;
-        }
-
-        let anim_mgr = AnimationManager::new(model);
-        self.objects.get_mut(obj_index).animations = Some(anim_mgr);
-    }
-
     pub fn update(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
         self.delta_time = dt;
         self.update_movement(keys, dt);
-        self.objects.update(&self.model_data, dt);
         // Mirrors Ares' `render_sky_modify_node_matrices(offset=camera)`:
         // translating the sky model to the camera keeps its dome
         // centered on the viewer so it appears infinitely far.

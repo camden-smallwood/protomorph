@@ -28,8 +28,8 @@
 //! when an authored cfxs would be visually incorrect.
 
 use blam_tags::camera_fx_settings::{
-    BrightnessContrast, CmybBand, ColorBalanceBlock, ColorGradingBlock, ColorizeBlock,
-    CurvesEditorBlock, HslvBlock, SelectiveColorBlock,
+    BrightnessContrast, CameraFxEnableFlags, CmybBand, ColGradCurvesEditorMode, ColorBalanceBlock,
+    ColorGradingBlock, ColorizeBlock, CurvesEditorBlock, HslvBlock, SelectiveColorBlock,
 };
 use blam_tags::tag_function::TagFunction;
 
@@ -138,14 +138,14 @@ pub fn evaluate(input: [f32; 3], cg: &ColorGradingBlock) -> [f32; 3] {
     // curve applied to all 3 channels; mode 0 = per-channel R/G/B
     // curves. Engine passes `range = 1.0` to evaluate_scalar (line 234).
     if let Some(ce) = cg.curves_editor.as_ref() {
-        if ce.flags != 0 {
+        if ce.flags.contains(CameraFxEnableFlags::Enable) {
             apply_curves_editor(&mut r, &mut g, &mut b, ce);
         }
     }
 
     // Brightness / contrast (decompile lines 272-318).
     if let Some(bc) = cg.brightness_contrast.as_ref() {
-        if bc.flags != 0 {
+        if bc.flags.contains(CameraFxEnableFlags::Enable) {
             apply_brightness_contrast(&mut r, &mut g, &mut b, bc);
         }
     }
@@ -154,7 +154,7 @@ pub fn evaluate(input: [f32; 3], cg: &ColorGradingBlock) -> [f32; 3] {
     // per LUT bake by `set_color_balance_params`; the per-texel work
     // here is just the 3-channel pow-remap.
     if let Some(cb) = cg.color_balance.as_ref() {
-        if cb.flags != 0 {
+        if cb.flags.contains(CameraFxEnableFlags::Enable) {
             let tones = set_color_balance_params(cb);
             r = apply_tones_channel(r, tones[0]);
             g = apply_tones_channel(g, tones[1]);
@@ -169,7 +169,7 @@ pub fn evaluate(input: [f32; 3], cg: &ColorGradingBlock) -> [f32; 3] {
 
     // HSLV (decompile lines 388-411).
     if let Some(hslv) = cg.hslv.as_ref() {
-        if hslv.flags != 0 {
+        if hslv.flags.contains(CameraFxEnableFlags::Enable) {
             apply_hslv(&mut h, &mut s, &mut l, hslv);
         }
     }
@@ -178,7 +178,7 @@ pub fn evaluate(input: [f32; 3], cg: &ColorGradingBlock) -> [f32; 3] {
     // the luminance term — engine takes them from v30/v31/v34 which
     // are post-brightness/contrast but pre-HSL.
     if let Some(cz) = cg.colorize.as_ref() {
-        if cz.flags != 0 {
+        if cz.flags.contains(CameraFxEnableFlags::Enable) {
             apply_colorize(&mut h, &mut s, &mut l, cz, [r, g, b]);
         }
     }
@@ -187,7 +187,7 @@ pub fn evaluate(input: [f32; 3], cg: &ColorGradingBlock) -> [f32; 3] {
 
     // Selective color (decompile lines 600-651).
     if let Some(sc) = cg.selective_color.as_ref() {
-        if sc.flags != 0 {
+        if sc.flags.contains(CameraFxEnableFlags::Enable) {
             let mut cmyk = rgb_to_naive_cmyk(rr, gg, bb);
             process_selective_color(&mut cmyk, [rr, gg, bb], sc);
             let (nr, ng, nb) = naive_cmyk_to_rgb(cmyk);
@@ -214,7 +214,7 @@ fn apply_curves_editor(r: &mut f32, g: &mut f32, b: &mut f32, ce: &CurvesEditorB
             None => x,
         }
     };
-    if ce.mode == 1 {
+    if ce.mode == ColGradCurvesEditorMode::Brightness {
         // Brightness mode: single curve applied to all 3 channels.
         *r = eval(&ce.brightness, *r);
         *g = eval(&ce.brightness, *g);

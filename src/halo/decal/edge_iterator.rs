@@ -167,7 +167,7 @@ impl CollisionSurfaceEdgeIterator {
         } else {
             edge.right_surface as i32
         };
-        let Some(opposing_surface) = bsp.surfaces.get(opposing_surface_idx as usize).copied()
+        let Some(opposing_surface) = bsp.surfaces.get(opposing_surface_idx as usize)
         else {
             return false;
         };
@@ -216,14 +216,14 @@ impl CollisionSurfaceEdgeIterator {
         // We resolved the opposing surface in THE SAME bsp as `self`
         // (cross-BSP path is stubbed, so this is always true). Re-load
         // it for the post-filter pass.
-        let Some(opposing) = bsp.surfaces.get(fold.surface_index as usize).copied() else {
+        let Some(opposing) = bsp.surfaces.get(fold.surface_index as usize) else {
             return false;
         };
 
-        // `decalable_surface` filter — engine line 317. Reject if any
-        // of bits 0/1/3/4/5 set (mask 0x3B): invisible, two-sided,
-        // breakable, sky, climbable.
-        if (opposing.flags & 0x3B) != 0 {
+        // `decalable_surface` filter — engine line 317. Reject the 0x3B
+        // set: TwoSided / Invisible / Breakable / Invalid / Conveyor.
+        use blam_tags::structure_bsp::CollisionSurfaceFlags::*;
+        if opposing.flags.test_any(&[TwoSided, Invisible, Breakable, Invalid, Conveyor]) {
             return false;
         }
         if opposing.material == -1 {

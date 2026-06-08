@@ -1,7 +1,5 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use blam_tags::animation::{Animation, NodeTransform, Skeleton};
 use blam_tags::math::{RealPoint3d, RealQuaternion, RealVector3d};
 use blam_tags::paths::{derive_tags_root, resolve_tag_path, tag_ref_path};
 use blam_tags::render_method::{
@@ -9,27 +7,17 @@ use blam_tags::render_method::{
     ParameterSource, RenderMethod, RenderMethodDefinition, RenderMethodOption,
     RenderMethodTemplate, ResolvedCbuffer, ResolvedRenderMethod, ResolvedValue,
 };
-use blam_tags::{RenderMesh, RenderModel, RenderModelError, RenderNode, RenderVertex, TagFile};
+use blam_tags::{RenderMesh, RenderModel, RenderModelError, RenderVertex, TagFile};
 use blam_tags::TagReadError;
 use glam::{Mat4, Quat, Vec3};
 use half::f16;
 
-use crate::halo::animations::{
-    AnimationChannel, AnimationChannelType, AnimationData, PositionKey, RotationKey, ScalingKey,
-};
 use crate::halo::bitmaps;
 use crate::halo::render_methods::materials::{MaterialData, MaterialTexture, MaterialTextureUsage};
 use crate::halo::geometry::{
-    decompose_transform, oct_encode_snorm8, pack_tangent_with_sign, pack_weights_unorm8,
-    ModelData, ModelMarker, ModelMesh, ModelMeshPart, ModelNode, ModelVertex,
+    oct_encode_snorm8, pack_tangent_with_sign, pack_weights_unorm8,
+    ModelData, ModelMesh, ModelMeshPart, ModelVertex,
 };
-
-/// Hardcoded playback rate for Halo animations. The jmad tag carries
-/// no frame_rate field — the engine assumes 30 fps universally. We
-/// emit `ticks_per_second = 30.0` and one key per frame at integer
-/// times so [`crate::halo::animations::AnimationManager`]'s tick-based clock
-/// advances at one frame per 1/30 s.
-const HALO_FPS: f32 = 30.0;
 
 /// Errors loading a Halo object as a [`ModelData`]. Carries the
 /// failing path or field so the renderer can log meaningful messages.
@@ -65,9 +53,7 @@ impl std::error::Error for HaloLoadError {}
 /// Load an object tag (`.crate`, `.scenery`, `.biped`, etc. — any
 /// tag that inherits `object` and carries a `model` ref) into
 /// protomorph's [`ModelData`]. Walks the chain → renders the first
-/// permutation of every region → stubs a default material per shader
-/// → decodes any animations from the referenced
-/// `.model_animation_graph`.
+/// permutation of every region → stubs a default material per shader.
 pub fn load_object(crate_path: &Path) -> Result<ModelData, HaloLoadError> {
     let tags_root = derive_tags_root(crate_path)
         .ok_or_else(|| HaloLoadError::MissingTagsRoot(crate_path.to_path_buf()))?;
@@ -100,9 +86,10 @@ pub fn load_object(crate_path: &Path) -> Result<ModelData, HaloLoadError> {
     let rm_tag = TagFile::read(&rm_path)
         .map_err(|e| HaloLoadError::ReadTag { path: rm_path.clone(), source: e })?;
     let rm = RenderModel::from_tag(&rm_tag).map_err(HaloLoadError::Extract)?;
+    let render_meshes = RenderModel::derive_render_meshes(&rm_tag).map_err(HaloLoadError::Extract)?;
 
     let materials = load_materials(&rm, &tags_root);
-    let mut model = convert(&rm, materials);
+    let mut model = convert(&rm, &render_meshes, materials);
     model.authored_bounding_sphere = if obj_def.has_authored_bounding_sphere() {
         let o = obj_def.bounding_offset;
         Some(glam::Vec4::new(o.x, o.y, o.z, obj_def.bounding_radius))
@@ -112,19 +99,6 @@ pub fn load_object(crate_path: &Path) -> Result<ModelData, HaloLoadError> {
         read_model_object_data_sphere(&model_tag)
     };
     model.casts_shadow = obj_def.casts_shadow_runtime();
-
-    // Optionally chase the .model's `animation` tag-ref. Empty refs
-    // (no animation graph) and inherited-only graphs (animations[]
-    // empty, parent set) both yield zero animations — same as an
-    // FBX with no anim tracks.
-    if let Some(jmad_rel) = tag_ref_path(&model_tag.root(), "animation") {
-        let jmad_path = resolve_tag_path(&tags_root, &jmad_rel, "model_animation_graph");
-        if jmad_path.exists() {
-            let jmad_tag = TagFile::read(&jmad_path)
-                .map_err(|e| HaloLoadError::ReadTag { path: jmad_path.clone(), source: e })?;
-            model.animations = convert_animations(&jmad_tag, &model.nodes);
-        }
-    }
 
     Ok(model)
 }
@@ -155,39 +129,68 @@ fn read_model_object_data_sphere(model_tag: &TagFile) -> Option<glam::Vec4> {
     Some(glam::Vec4::new(off.x, off.y, off.z, radius))
 }
 
-fn convert(rm: &RenderModel, materials: Vec<MaterialData>) -> ModelData {
+fn convert(rm: &RenderModel, render_meshes: &[RenderMesh], materials: Vec<MaterialData>) -> ModelData {
     // v1 mesh selection: first permutation of each region. For damage
     // states / color variants, this picks the "intact" / "default"
     // entry. Most static scenery has 1 region × 1 perm so it's a no-op.
-    let selected = select_meshes(rm);
+    let selected = select_meshes(rm, render_meshes.len());
 
-    let mut model = ModelData {
-        materials,
-        meshes: Vec::with_capacity(selected.len()),
-        nodes: Vec::with_capacity(rm.nodes.len()),
-        markers: Vec::with_capacity(rm.markers.len()),
-        animations: Vec::new(),
-        root_inverse_transform: Mat4::IDENTITY,
-        authored_bounding_sphere: None,
-        // Default to true; load_object overrides via read_casts_shadow_flag
-        // after reading the object tag. Non-object loaders (FBX path) leave
-        // this true since they don't carry the obje gate fields.
-        casts_shadow: true,
+    // Object-local node-**world** bind-pose matrices. Halo stores nodes
+    // parent-before-child with parent-relative TRS, so one forward pass
+    // composes each node's world matrix from its parent chain. Rigid
+    // render_model verts are node-local and the object shader applies
+    // `model_u × node × vertex`. The engine-faithful per-node matrix is the
+    // SKINNING PALETTE: `node_world[i] × node_inverse_bind[i]` (engine
+    // `model_skinning_matrix_from_real_matrix4x3s` / `render_model_build_
+    // skinning_for_base_nodes`). At bind pose this is identity for a
+    // well-formed node (render_model verts are stored in model/bind space),
+    // and becomes real skinning when an animation system drives node_world.
+    // `inverse_bind` comes from the render_model Node's stored inverse fields
+    // (blam-tags corrects their "Old Mistakes Die Hard" 1-float shift), as a
+    // matrix4x3: cols = inverse forward/left/up (× inverse_scale) + inverse
+    // position. The serves rigid (1 node) and skinned (palette) meshes with
+    // one buffer + the unified shader.
+    //
+    // `node_world_matrices` (parent-composed default TRS) is kept separately
+    // for marker placement — markers need the node's WORLD transform, not the
+    // skinning matrix.
+    let mut node_world_matrices: Vec<Mat4> = Vec::with_capacity(rm.nodes.len());
+    let node_local_matrices: Vec<Mat4> = {
+        let mut out: Vec<Mat4> = Vec::with_capacity(rm.nodes.len());
+        for n in &rm.nodes {
+            let local = Mat4::from_rotation_translation(
+                quat_from_real(n.default_rotation),
+                real_point_to_vec3(n.default_translation),
+            );
+            let world = if n.parent_node < 0 || (n.parent_node as usize) >= node_world_matrices.len() {
+                local
+            } else {
+                node_world_matrices[n.parent_node as usize] * local
+            };
+            node_world_matrices.push(world);
+            let s = if n.inverse_scale.abs() > 1e-6 { n.inverse_scale } else { 1.0 };
+            let v = |w: blam_tags::math::RealVector3d| Vec3::new(w.i, w.j, w.k);
+            let inverse_bind = Mat4::from_cols(
+                (v(n.inverse_forward) * s).extend(0.0),
+                (v(n.inverse_left) * s).extend(0.0),
+                (v(n.inverse_up) * s).extend(0.0),
+                real_point_to_vec3(n.inverse_position).extend(1.0),
+            );
+            out.push(world * inverse_bind);
+        }
+        out
     };
 
-    convert_nodes(&rm.nodes, &mut model);
+    let meshes: Vec<ModelMesh> =
+        selected.iter().map(|&(mi, ri)| convert_mesh(&render_meshes[mi], ri)).collect();
 
-    for &mi in &selected {
-        model.meshes.push(convert_mesh(&rm.meshes[mi]));
-    }
-
-    // Diag: bone-index range vs node count. If max_idx >= nodes.len(),
+    // Diag: bone-index range vs node count. If max_idx >= node count,
     // vertex skinning samples uninitialized GPU bone matrices and
     // produces the exploded-mesh look.
-    let node_count = model.nodes.len();
+    let node_count = node_local_matrices.len();
     let mut max_bone_idx: u8 = 0;
     let mut total_verts = 0usize;
-    for mesh in &model.meshes {
+    for mesh in &meshes {
         for v in &mesh.vertices {
             total_verts += 1;
             for &i in &v.node_indices {
@@ -201,16 +204,33 @@ fn convert(rm: &RenderModel, materials: Vec<MaterialData>) -> ModelData {
         if max_bone_idx as usize >= node_count { " ⚠ OUT OF RANGE" } else { "" },
     );
 
-    for marker in &rm.markers {
-        model.markers.push(ModelMarker {
-            name: marker.name.clone(),
-            node_index: marker.node_index as i32,
-            position: real_point_to_vec3(marker.translation),
-            rotation: Vec3::ZERO,
-        });
+    // Marker name → object-local marker world matrix
+    // (`node_world[marker.node] × marker.local`).
+    let mut marker_transforms: Vec<(String, Mat4)> = Vec::new();
+    for group in &rm.marker_groups {
+        for marker in &group.markers {
+            let node = (marker.node_index.max(0) as usize)
+                .min(node_world_matrices.len().saturating_sub(1));
+            let nw = node_world_matrices.get(node).copied().unwrap_or(Mat4::IDENTITY);
+            let local = Mat4::from_rotation_translation(
+                quat_from_real(marker.rotation),
+                real_point_to_vec3(marker.translation),
+            );
+            marker_transforms.push((group.name.clone(), nw * local));
+        }
     }
 
-    model
+    ModelData {
+        materials,
+        meshes,
+        node_local_matrices,
+        marker_transforms,
+        authored_bounding_sphere: None,
+        // Default to true; load_object overrides via casts_shadow_runtime
+        // after reading the object tag. Non-object loaders (FBX path) leave
+        // this true since they don't carry the obje gate fields.
+        casts_shadow: true,
+    }
 }
 
 /// Build a [`MaterialData`] per render_model material slot. Each slot
@@ -224,19 +244,20 @@ fn convert(rm: &RenderModel, materials: Vec<MaterialData>) -> ModelData {
 /// no-op case (the slot is genuinely unauthored at tag time).
 fn load_materials(rm: &RenderModel, tags_root: &Path) -> Vec<MaterialData> {
     rm.materials.iter().map(|m| {
-        if m.shader_path.is_empty() {
-            return MaterialData::stub_for_shader(&m.shader_name);
+        let shader_name = m.shader_name();
+        if m.render_method.is_empty() {
+            return MaterialData::stub_for_shader(&shader_name);
         }
         // Use the actual group-tag-derived extension (rmsh→shader,
         // rmtr→shader_terrain, etc.).
-        let shader_abs = resolve_tag_path(tags_root, &m.shader_path, m.shader_extension());
-        load_shader_material(&shader_abs, tags_root, &m.shader_name)
+        let shader_abs = resolve_tag_path(tags_root, &m.render_method, m.shader_extension());
+        load_shader_material(&shader_abs, tags_root, &shader_name)
             .unwrap_or_else(|| panic!(
                 "[protomorph] failed to load shader material '{}' at {}: \
                  render-method walker returned None. Per \
                  `feedback_wgsl_must_mirror_hlsl.md` we don't substitute \
                  stubs — fix the loader or the tag.",
-                m.shader_name, shader_abs.display(),
+                shader_name, shader_abs.display(),
             ))
     }).collect()
 }
@@ -929,59 +950,33 @@ fn push_bitmap(
     }
 }
 
-fn select_meshes(rm: &RenderModel) -> Vec<usize> {
-    let mut out: Vec<usize> = Vec::new();
-    for region in &rm.regions {
+/// Returns `(mesh_index, region_index)` — the region index is the engine's
+/// `region_index` sort key (the region-loop counter in
+/// `submit_object_mesh_parts`), threaded onto each mesh for region-ordered
+/// transparent sorting.
+fn select_meshes(rm: &RenderModel, mesh_count: usize) -> Vec<(usize, u8)> {
+    let mut out: Vec<(usize, u8)> = Vec::new();
+    for (ri, region) in rm.regions.iter().enumerate() {
         let Some(perm) = region.permutations.first() else { continue };
         if perm.mesh_index < 0 || perm.mesh_count <= 0 { continue; }
         for off in 0..perm.mesh_count as i32 {
             let mi = perm.mesh_index as i32 + off;
-            if mi < 0 || (mi as usize) >= rm.meshes.len() { continue; }
+            if mi < 0 || (mi as usize) >= mesh_count { continue; }
             let mi = mi as usize;
-            if !out.contains(&mi) { out.push(mi); }
+            if !out.iter().any(|(m, _)| *m == mi) {
+                out.push((mi, ri as u8));
+            }
         }
     }
     if out.is_empty() {
         // Some tags omit regions/permutations entirely (unusual but
         // legal) — fall back to all meshes so we still see something.
-        out = (0..rm.meshes.len()).collect();
+        out = (0..mesh_count).map(|m| (m, 0u8)).collect();
     }
     out
 }
 
-fn convert_nodes(nodes: &[RenderNode], model: &mut ModelData) {
-    // Halo stores nodes parent-before-child with parent-relative TRS.
-    // World-space bind-pose is the chain of locals through parents;
-    // its inverse is the GPU `offset_matrix` (vertex-to-bone-local).
-    let locals: Vec<Mat4> = nodes.iter()
-        .map(|n| Mat4::from_rotation_translation(quat_from_real(n.default_rotation), real_point_to_vec3(n.default_translation)))
-        .collect();
-    let mut worlds: Vec<Mat4> = Vec::with_capacity(nodes.len());
-    for (i, n) in nodes.iter().enumerate() {
-        let world = if n.parent_index < 0 || (n.parent_index as usize) >= worlds.len() {
-            locals[i]
-        } else {
-            worlds[n.parent_index as usize] * locals[i]
-        };
-        worlds.push(world);
-    }
-
-    for (i, n) in nodes.iter().enumerate() {
-        let local = locals[i];
-        let model_node = ModelNode {
-            name: n.name.clone(),
-            parent_index: -1,
-            first_child_index: -1,
-            next_sibling_index: -1,
-            offset_matrix: worlds[i].inverse(),
-            default_transform: local,
-            default_decomposed: decompose_transform(&local),
-        };
-        model.add_child_node(n.parent_index as i32, model_node);
-    }
-}
-
-fn convert_mesh(mesh: &RenderMesh) -> ModelMesh {
+fn convert_mesh(mesh: &RenderMesh, region_index: u8) -> ModelMesh {
     let vertices: Vec<ModelVertex> = mesh.vertices.iter().map(convert_vertex).collect();
     let indices: Vec<u32> = mesh.indices.clone();
     let parts: Vec<ModelMeshPart> = mesh.parts.iter().map(|p| ModelMeshPart {
@@ -989,31 +984,33 @@ fn convert_mesh(mesh: &RenderMesh) -> ModelMesh {
         index_start: p.index_start,
         index_count: p.index_count,
         part_type: p.part_type,
+        // Transparent sort centroid from the part's authored SortingPosition
+        // (engine's back-to-front sort key). `None` for parts with none.
+        sort_centroid: p.sort_position.map(|sp| [sp.position.x, sp.position.y, sp.position.z]),
     }).collect();
-    // Per-vertex baked color — populated when the engine sets
-    // `_mesh_has_vertex_color_bit` on the source mesh (sky `.render_model`
-    // meshes are the canonical user).
+    // Per-vertex baked color — populated when the source mesh has the
+    // engine `_mesh_has_vertex_color_bit` (`mesh->flags & 1`), i.e.
+    // blam-tags `RenderMesh.has_vertex_color`. Sky `.render_model`
+    // meshes are the canonical user; the engine routes these through
+    // `_entry_point_vertex_color_lighting` (`static_per_vertex_color_ps`)
+    // where this stream IS the diffuse lighting term.
     //
-    // BUG WORKAROUND: blam-tags currently reads vert_color from the
-    // `raw_vertex` block's "vertex color" field. For Halo 3 MCC sky
-    // dome meshes the real per-vertex baked sky gradient lives in a
-    // SEPARATE vertex buffer at `vertex_buffer_indices[2]` (engine
-    // `_vertex_buffer_usage_vert_color`) which blam-tags doesn't yet
-    // surface. Two failure modes the workaround handles:
+    // TAG FORMAT: vert_color comes from `raw_vertex.vertex color`
+    // (the `per_mesh_raw_data_block`), which blam-tags decodes into
+    // `RenderVertex.vert_color`. (The cache path's separate
+    // `_vertex_buffer_usage_vert_color` stream at `vertex_buffer_indices[2]`
+    // does NOT exist in loose tags — the raw block is the source of truth.
+    // Earlier comments claiming this was "data-blocked" were wrong for
+    // tag format.) Construct's skydome carries a real blue gradient here.
     //
-    //   1. Whole-stream zero (e.g. riverworld mesh 0): raw_vertex
-    //      field is absent → blam-tags returns ZERO for every
-    //      vertex. Heuristic: `max < 1/255`.
-    //
-    //   2. Partial data (e.g. guardian mesh 0 with min ~0.001 max
-    //      ~0.92): some vertices have real values, others are zero
-    //      placeholders. The black-vert triangles render solid black
-    //      via the sky shader (`vert_color × g_exposure = 0`).
-    //      Heuristic: `min < 0.01` flags the partial-data case.
-    //
-    // When dropped the dispatcher routes the mesh through Pass B
-    // (engine's `_entry_point_static_lighting_sh` fallback per
-    // `render_mesh_part_default @ 0x18069EBC0:64-82`).
+    // The engine applies NO per-vertex heuristic — if the bit is set it
+    // uses the stream verbatim. We only guard the genuinely-empty case
+    // (`max < 1/255` ⇒ the block decoded to all-zero), where binding it
+    // would render the whole mesh black. A legitimate gradient that
+    // reaches 0 at some vertices (the skydome zenith) is NOT dropped.
+    // When dropped the dispatcher routes the mesh through the
+    // `_entry_point_static_lighting_sh` fallback (`render_mesh_part_default
+    // @ 0x18069EBC0:64-82`).
     let vert_color_stream: Vec<[f32; 3]> = if mesh.has_vertex_color {
         let stream: Vec<[f32; 3]> = mesh
             .vertices
@@ -1028,9 +1025,7 @@ fn convert_mesh(mesh: &RenderMesh) -> ModelMesh {
                 if c[k] < min_seen { min_seen = c[k]; }
             }
         }
-        let drop_zero_stream = max_seen < 1.0 / 255.0;
-        let drop_partial_stream = min_seen < 0.01;
-        let drop = drop_zero_stream || drop_partial_stream;
+        let drop = max_seen < 1.0 / 255.0;
         if std::env::var_os("PROTOMORPH_TRACE_SKY_VC").is_some() {
             let n = stream.len() as f32;
             if n > 0.0 {
@@ -1038,11 +1033,7 @@ fn convert_mesh(mesh: &RenderMesh) -> ModelMesh {
                 for c in &stream {
                     for k in 0..3 { sum[k] += c[k]; }
                 }
-                let tag = if drop_zero_stream {
-                    "[DROPPED — zero stream]"
-                } else if drop_partial_stream {
-                    "[DROPPED — partial data: some vertices near-zero]"
-                } else { "" };
+                let tag = if drop { "[DROPPED — all-zero stream]" } else { "" };
                 eprintln!(
                     "[sky/vc-stats] {} verts: avg=({:.4},{:.4},{:.4}) min={:.4} max={:.4} {}",
                     stream.len(),
@@ -1061,6 +1052,8 @@ fn convert_mesh(mesh: &RenderMesh) -> ModelMesh {
         parts,
         prt_ambient_stream: mesh.prt_ambient_stream.clone(),
         vert_color_stream,
+        use_region_index_for_sorting: mesh.use_region_index_for_sorting,
+        region_index,
     }
 }
 
@@ -1117,143 +1110,6 @@ fn convert_vertex(v: &RenderVertex) -> ModelVertex {
 fn arbitrary_tangent(normal: Vec3) -> Vec3 {
     let basis = if normal.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
     (basis - normal * basis.dot(normal)).normalize_or_zero()
-}
-
-/// Decode every animation in a `.model_animation_graph` and convert
-/// to protomorph's per-bone keyed [`AnimationData`]. Bones that don't
-/// match a [`ModelNode`] by name are silently dropped (jmad bones are
-/// typically a superset — collision-only or attachment bones the
-/// render_model doesn't carry). Returns an empty vec for jmads that
-/// inherit all their animations from a parent (out of scope for v1)
-/// or whose decode fails entirely.
-fn convert_animations(jmad_tag: &TagFile, render_model_nodes: &[ModelNode]) -> Vec<AnimationData> {
-    let animation = match Animation::new(jmad_tag) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("[halo] Animation::new failed: {e}");
-            return Vec::new();
-        }
-    };
-    if animation.is_empty() {
-        if let Some(parent) = animation.parent() {
-            eprintln!("[halo] jmad inherits from {parent} — inherited animations not loaded (v1)");
-        }
-        return Vec::new();
-    }
-
-    let skeleton = Skeleton::from_tag(jmad_tag);
-    if skeleton.is_empty() {
-        return Vec::new();
-    }
-
-    // Map jmad bone name → protomorph node index (None when the
-    // render_model doesn't have a bone of that name).
-    let pm_index_by_name: HashMap<&str, usize> = render_model_nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.name.as_str(), i))
-        .collect();
-    let bone_to_pm: Vec<Option<usize>> = skeleton.nodes.iter()
-        .map(|n| pm_index_by_name.get(n.name.as_str()).copied())
-        .collect();
-
-    // Defaults for `clip.pose` — for any jmad bone not flagged static
-    // or animated by the codec, the composer falls back to this. The
-    // canonical default is the render_model's per-bone bind pose
-    // (matches TagTool's AnimationDefaultNodeHelper).
-    let defaults: Vec<NodeTransform> = skeleton.nodes.iter()
-        .map(|n| match pm_index_by_name.get(n.name.as_str()) {
-            Some(&pm_idx) => {
-                let (s, r, t) = render_model_nodes[pm_idx].default_decomposed;
-                NodeTransform {
-                    translation: RealPoint3d { x: t.x, y: t.y, z: t.z },
-                    rotation: RealQuaternion { i: r.x, j: r.y, k: r.z, w: r.w },
-                    scale: s.x.max(0.001), // assume uniform — Halo bones don't shear
-                }
-            }
-            None => NodeTransform::IDENTITY,
-        })
-        .collect();
-
-    let pm_node_count = render_model_nodes.len();
-    let mut out = Vec::new();
-    let mut decode_failures = 0usize;
-
-    for group in animation.iter() {
-        let clip = match group.decode() {
-            Ok(c) => c,
-            Err(_) => { decode_failures += 1; continue; }
-        };
-        let pose = clip.pose(&skeleton, Some(&defaults));
-        let frame_count = pose.frames.len();
-        if frame_count == 0 { continue; }
-
-        let name = group.name.clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("anim_{}", group.index));
-
-        let mut channels: Vec<AnimationChannel> = Vec::with_capacity(skeleton.len());
-        for (bone_idx, &maybe_pm) in bone_to_pm.iter().enumerate() {
-            let Some(pm_idx) = maybe_pm else { continue };
-            let mut position_keys = Vec::with_capacity(frame_count);
-            let mut rotation_keys = Vec::with_capacity(frame_count);
-            let mut scaling_keys = Vec::with_capacity(frame_count);
-            let mut times = Vec::with_capacity(frame_count);
-            for f in 0..frame_count {
-                let nt = pose.frames[f][bone_idx];
-                let t = f as f32;
-                position_keys.push(PositionKey {
-                    time: t,
-                    position: Vec3::new(nt.translation.x, nt.translation.y, nt.translation.z),
-                });
-                rotation_keys.push(RotationKey {
-                    time: t,
-                    rotation: Quat::from_xyzw(nt.rotation.i, nt.rotation.j, nt.rotation.k, nt.rotation.w),
-                });
-                scaling_keys.push(ScalingKey {
-                    time: t,
-                    scaling: Vec3::splat(nt.scale.max(0.001)),
-                });
-                times.push(t);
-            }
-            channels.push(AnimationChannel {
-                channel_type: AnimationChannelType::Node,
-                target_index: pm_idx as i32,
-                position_keys,
-                rotation_keys,
-                scaling_keys,
-                mesh_keys: Vec::new(),
-                morph_keys: Vec::new(),
-                position_times: times.clone(),
-                rotation_times: times.clone(),
-                scaling_times: times,
-            });
-        }
-
-        let mut node_channel_map: Vec<Vec<usize>> = vec![Vec::new(); pm_node_count];
-        for (ci, ch) in channels.iter().enumerate() {
-            if ch.target_index >= 0 && (ch.target_index as usize) < pm_node_count {
-                node_channel_map[ch.target_index as usize].push(ci);
-            }
-        }
-
-        out.push(AnimationData {
-            name,
-            // One key per frame at integer times → duration = frame_count
-            // ticks. ticks_per_second = HALO_FPS so the AnimationManager
-            // tick clock advances 30 ticks per second of real time.
-            duration: frame_count as f32,
-            ticks_per_second: HALO_FPS,
-            channels,
-            node_channel_map,
-        });
-    }
-
-    if decode_failures > 0 {
-        eprintln!("[halo] {decode_failures} jmad animations failed to decode (likely SharedStatic codec or corrupt blob)");
-    }
-
-    out
 }
 
 fn quat_from_real(q: RealQuaternion) -> Quat {

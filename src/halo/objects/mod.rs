@@ -35,9 +35,7 @@ pub mod object_type_compute_function_value;
 #[inline]
 pub fn warn_unported_compute(_type_function: &str, _object_index: u32, _requested: &str) {}
 
-use crate::halo::animations::AnimationManager;
-use crate::halo::geometry::ModelData;
-use glam::{EulerRot, Mat4, Vec3};
+use glam::{Mat4, Vec3};
 
 // ---------------------------------------------------------------------------
 // Object data
@@ -66,7 +64,6 @@ pub struct ObjectData {
     /// `load_visible_placements` time via
     /// `objects::object_header_data::header_index_for_placement`.
     pub header_index: Option<u32>,
-    pub animations: Option<AnimationManager>,
     /// L4 — `engine_lighting_buffer` byte offset for this object's
     /// per-placement SH probe (resolved at scenario load via
     /// `Renderer::bake_scenery_lighting_offsets` from the lightmap's
@@ -81,22 +78,52 @@ pub struct ObjectData {
     /// upload. We pre-bake at load time (probes are static) and bind via
     /// dynamic offset — equivalent under the static-probe assumption.
     pub engine_lighting_offset: Option<u32>,
+    /// When set, [`Self::model_matrix`] returns this verbatim instead of
+    /// composing `position`/`rotation`/`scale`. Used for objects whose
+    /// world transform comes from a parent-marker attachment
+    /// (`scenario.object placement parent id` → engine
+    /// `object_attach_to_marker @0x1807D7F70`), e.g. construct's waterfall
+    /// scenery snapped to the sky's `"waterfall"` marker. `None` for the
+    /// normal placement-transform path.
+    pub model_matrix_override: Option<Mat4>,
 }
 
 impl ObjectData {
-    /// Construct the model matrix using Halo's rotation convention:
-    ///   rotation_matrix = Yaw(Z) * Pitch(Y) * Roll(X)   (intrinsic ZYX)
-    ///   model_matrix    = Translation * rotation_matrix * Scale
+    /// Construct the model matrix the **engine** way — from the
+    /// `forward`/`up` basis the engine derives from the placement euler
+    /// (`matrix4x3_rotation_from_angles`), assembled per
+    /// `matrix4x3_from_point_and_vectors @0x1802c42b0`: rows are
+    /// `forward`, `left = cross(up, forward)`, `up`, translation = position.
+    /// In glam column-major that is `from_cols(forward, left, up, position)`
+    /// (local X→forward, Y→left, Z→up), with uniform scale folded into the
+    /// basis. This replaces the earlier glam-euler `Quat::from_euler(ZYX)`
+    /// compose, which produced a *different* rotation than the engine
+    /// (verified numerically: Y-sign/basis mismatch). Matching the engine
+    /// convention here means the object datum's `forward`/`up` and this
+    /// matrix agree, so the upcoming datum convergence is a neutral swap.
     pub fn model_matrix(&self) -> Mat4 {
-        Mat4::from_scale_rotation_translation(
-            self.scale,
-            glam::Quat::from_euler(
-                EulerRot::ZYX,
-                self.rotation.x.to_radians(), // yaw (Z)
-                self.rotation.y.to_radians(), // pitch (Y)
-                self.rotation.z.to_radians(), // roll (X)
-            ),
-            self.position,
+        // Parent-marker attachment (e.g. sky-attached waterfall) supplies a
+        // ready-made world matrix; bypass the placement compose.
+        if let Some(m) = self.model_matrix_override {
+            return m;
+        }
+        let (yaw, pitch, roll) = (
+            self.rotation.x.to_radians(), // yaw (around Z)
+            self.rotation.y.to_radians(), // pitch (Y)
+            self.rotation.z.to_radians(), // roll (X)
+        );
+        let (cy, sy) = (yaw.cos(), yaw.sin());
+        let (cp, sp) = (pitch.cos(), pitch.sin());
+        let (cr, sr) = (roll.cos(), roll.sin());
+        // Engine `matrix4x3_rotation_from_angles` rows 0 + 2.
+        let forward = Vec3::new(cy * cp, sy * cr - sp * sr * cy, sp * cr * cy + sy * sr);
+        let up = Vec3::new(-sp, -cp * sr, cp * cr);
+        let left = up.cross(forward); // engine row1 = cross(up, forward)
+        Mat4::from_cols(
+            (forward * self.scale.x).extend(0.0),
+            (left * self.scale.y).extend(0.0),
+            (up * self.scale.z).extend(0.0),
+            self.position.extend(1.0),
         )
     }
 }
@@ -134,8 +161,8 @@ impl ObjectStore {
                     model_index: None,
                     instance_within_model: 0,
                     header_index: None,
-                    animations: None,
                     engine_lighting_offset: None,
+                    model_matrix_override: None,
                 });
 
                 return ObjectIndex(i);
@@ -152,8 +179,8 @@ impl ObjectStore {
             model_index: None,
             instance_within_model: 0,
             header_index: None,
-            animations: None,
             engine_lighting_offset: None,
+            model_matrix_override: None,
         }));
 
         ObjectIndex(index)
@@ -180,13 +207,5 @@ impl ObjectStore {
             .iter()
             .enumerate()
             .filter_map(|(i, slot)| slot.as_ref().map(|data| (ObjectIndex(i), data)))
-    }
-
-    pub fn update(&mut self, model_data_list: &[ModelData], delta_seconds: f32) {
-        for slot in self.objects.iter_mut().flatten() {
-            if let (Some(model_idx), Some(anim_mgr)) = (slot.model_index, slot.animations.as_mut()) {
-                anim_mgr.update(&model_data_list[model_idx], delta_seconds);
-            }
-        }
     }
 }

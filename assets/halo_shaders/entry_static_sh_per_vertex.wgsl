@@ -265,14 +265,26 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
 
     const BLEND_MULTIPLICATIVE_ENABLED: f32 = __BLEND_MULTIPLICATIVE_ENABLED__;
     const BLEND_MULTIPLICATIVE_FACTOR:  f32 = __BLEND_MULTIPLICATIVE_FACTOR__;
+    const BLEND_FRESNEL_ENABLED: f32 = __BLEND_FRESNEL_ENABLED__;
 
     // Simple lights are evaluated INSIDE the material model now —
     // `mat.diffuse_radiance` + `mat.specular_color` already include them.
 
     // Cascade shadow gating reserved for dynamic objects.
     var out_rgb: vec3<f32>;
+    var alpha_out: f32 = __ALPHA_CHANNEL_OUTPUT__;
     if (BLEND_MULTIPLICATIVE_ENABLED > 0.5) {
         out_rgb = (albedo_for_illum + self_illum_radiance) * BLEND_MULTIPLICATIVE_FACTOR;
+    } else if (BLEND_FRESNEL_ENABLED > 0.5) {
+        // glass BLEND_FRESNEL (entry_points_fx.hlsl:258) — diffuse
+        // premultiplied by albedo.w; reflections additive; alpha =
+        // saturate(fresnel + albedo.w). See entry_static_sh.wgsl.
+        out_rgb = mat.diffuse_radiance * albedo_for_illum * albedo.w
+            + self_illum_radiance
+            + envmap_radiance
+            + mat.specular_color.xyz;
+        out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
+        alpha_out = saturate(mat.specular_color.w + albedo.w);
     } else {
         out_rgb = mat.diffuse_radiance * albedo_for_illum
             + mat.specular_color.xyz
@@ -286,7 +298,6 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // the fog when underwater. Match the engine-faithful `entry_static_sh`
     // / `entry_static_per_pixel` paths — leave fog to the fullscreen pass.
 
-    let alpha_out: f32 = __ALPHA_CHANNEL_OUTPUT__;
     out_rgb = out_rgb * __ALPHA_PREMULTIPLY__;
 
     // Engine `convert_to_render_target` clamps RGB ≥ 0 before RT write

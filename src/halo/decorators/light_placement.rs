@@ -476,7 +476,7 @@ pub fn light_placement(
     let alpha = (placement.ground_tint as i32 & 0xFF) as f32 / 255.0;
 
     // Engine lines 151-158: pick sample table by lighting_sample_pattern.
-    let table = match set.lighting_sample_pattern {
+    let table = match set.lighting_sample_pattern.get() {
         LightingSamplePattern::Hanging => &HANGING_TABLE,
         LightingSamplePattern::Ground => &GROUND_TABLE,
     };

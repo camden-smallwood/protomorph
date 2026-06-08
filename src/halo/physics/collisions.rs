@@ -123,8 +123,8 @@ pub struct CollisionResult {
     pub surface_index: i32,
     /// Engine `plane_designator` @ 0x5C (low 31 = plane_idx, bit 31 = negate).
     pub plane_designator: i32,
-    /// Engine `flags` @ 0x60 (collision-surface flags byte).
-    pub flags: u8,
+    /// Engine `flags` @ 0x60 (collision-surface flags).
+    pub flags: blam_tags::Flags<blam_tags::structure_bsp::CollisionSurfaceFlags, u8>,
     /// Engine `breakable_surface_index` @ 0x61.
     pub breakable_surface_index: u8,
     /// Engine `material_index` @ 0x62 (collision-material table).
@@ -154,7 +154,7 @@ impl Default for CollisionResult {
             leaf_index: -1,
             surface_index: -1,
             plane_designator: -1,
-            flags: 0,
+            flags: blam_tags::Flags::default(),
             breakable_surface_index: 0,
             material_index: -1,
             breakable_surface_set_index: 0xFF,
@@ -262,7 +262,7 @@ pub fn build_collision_result_from_bsp_result(
     collision.leaf_index = bsp_result.leaf_index;
     collision.surface_index = bsp_result.surface_index;
     collision.plane_designator = bsp_result.plane_designator;
-    collision.flags = bsp_result.flags;
+    collision.flags = bsp_result.flags.clone();
     collision.breakable_surface_set_index = bsp_result.breakable_surface_set_index;
     collision.breakable_surface_index = bsp_result.breakable_surface_index;
     collision.material_index = bsp_result.material_index;
@@ -433,13 +433,17 @@ pub fn instanced_geometry_test_vector_internal(
     };
 
     // 2. Engine instance-flag filter.
-    //    - bit 1 (`& 2`) = disabled.
-    //    - bit 2 (`& 4`) gated by collision-test flag 0x400 (render-only mode).
-    let inst_flags = instance.flags;
-    if (inst_flags & 0x2) != 0 {
+    //    - bit 1 (`render only`) = disabled for collision.
+    //    - bit 2 (`does not block aoe damage`) gated by collision-test flag
+    //      0x400 (render-only mode).
+    use blam_tags::structure_bsp::InstancedGeometryFlags;
+    let inst_flags = &instance.flags;
+    if inst_flags.contains(InstancedGeometryFlags::RenderOnly) {
         return false;
     }
-    if (flags.collision_flags.bits() & 0x0400) != 0 && (inst_flags & 0x4) != 0 {
+    if (flags.collision_flags.bits() & 0x0400) != 0
+        && inst_flags.contains(InstancedGeometryFlags::DoesNotBlockAoeDamage)
+    {
         return false;
     }
 

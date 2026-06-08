@@ -294,6 +294,7 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // table, all substituted by render_methods/mod.rs at WGSL assembly.
     const BLEND_MULTIPLICATIVE_ENABLED: f32 = __BLEND_MULTIPLICATIVE_ENABLED__;
     const BLEND_MULTIPLICATIVE_FACTOR:  f32 = __BLEND_MULTIPLICATIVE_FACTOR__;
+    const BLEND_FRESNEL_ENABLED: f32 = __BLEND_FRESNEL_ENABLED__;
 
     // Simple lights are now evaluated INSIDE the material model
     // (engine pattern — single_lobe_phong_fx.hlsl:111, cook_torrance_fx.hlsl:1084,
@@ -314,8 +315,19 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // when dynamic-object rendering ships; static geometry is left
     // alone here to match dllcache.
     var out_rgb: vec3<f32>;
+    var alpha_out: f32 = __ALPHA_CHANNEL_OUTPUT__;
     if (BLEND_MULTIPLICATIVE_ENABLED > 0.5) {
         out_rgb = (albedo_for_illum + self_illum_radiance) * BLEND_MULTIPLICATIVE_FACTOR;
+    } else if (BLEND_FRESNEL_ENABLED > 0.5) {
+        // glass BLEND_FRESNEL (entry_points_fx.hlsl:258) — diffuse
+        // PREMULTIPLIED by albedo.w; reflections add on top; output alpha
+        // = saturate(fresnel + albedo.w). See entry_static_sh.wgsl.
+        out_rgb = mat.diffuse_radiance * albedo_for_illum * albedo.w
+            + self_illum_radiance
+            + envmap_radiance
+            + mat.specular_color.xyz;
+        out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
+        alpha_out = saturate(mat.specular_color.w + albedo.w);
     } else {
         // HLSL umbrella composition (entry_points_fx.hlsl):
         //   final = diffuse_radiance × albedo + specular_color + self_illum + envmap
@@ -331,7 +343,6 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // fullscreen post-pass (engine `c_water_renderer::render_underwater_fog
     // @ 0x180694080`). Don't apply here — would double-fog when underwater.
 
-    let alpha_out: f32 = __ALPHA_CHANNEL_OUTPUT__;
     out_rgb = out_rgb * __ALPHA_PREMULTIPLY__;
 
     // Engine `convert_to_render_target` clamps RGB ≥ 0 before RT write

@@ -249,6 +249,8 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // out cleanly — equivalent to HLSL preprocessor's `#ifdef`.
     const BLEND_MULTIPLICATIVE_ENABLED: f32 = __BLEND_MULTIPLICATIVE_ENABLED__;
     const BLEND_MULTIPLICATIVE_FACTOR:  f32 = __BLEND_MULTIPLICATIVE_FACTOR__;
+    // glass material_model → BLEND_FRESNEL (material_models_fx.hlsl:180).
+    const BLEND_FRESNEL_ENABLED: f32 = __BLEND_FRESNEL_ENABLED__;
 
     // Simple lights are evaluated INSIDE the material model (engine
     // pattern). `mat.diffuse_radiance` and `mat.specular_color` already
@@ -257,10 +259,24 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // Cascade shadow gating reserved for dynamic objects (see
     // entry_static_per_pixel.wgsl for the rationale).
     var out_rgb: vec3<f32>;
+    var alpha_out: f32 = __ALPHA_CHANNEL_OUTPUT__;
     if (BLEND_MULTIPLICATIVE_ENABLED > 0.5) {
         // HLSL `#ifdef BLEND_MULTIPLICATIVE` — no lighting, no fog, no exposure.
         // APPLY_OVERLAYS not yet ported (no decal-overlay materials shipped).
         out_rgb = (albedo_for_illum + self_illum_radiance) * BLEND_MULTIPLICATIVE_FACTOR;
+    } else if (BLEND_FRESNEL_ENABLED > 0.5) {
+        // HLSL `#elif defined(BLEND_FRESNEL)` (entry_points_fx.hlsl:258) —
+        // glass. Diffuse is PREMULTIPLIED by albedo.w (coverage-weighted
+        // glass surface); reflections (env + specular) add on top. Output
+        // alpha = saturate(fresnel + albedo.w) — specular_color.w carries
+        // the fresnel from calc_material_glass. Device blend stays
+        // alpha_blend (SrcAlpha,1-SrcAlpha) per the shader's blend_mode.
+        out_rgb = mat.diffuse_radiance * albedo_for_illum * albedo.w
+            + self_illum_radiance
+            + envmap_radiance
+            + mat.specular_color.xyz;
+        out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
+        alpha_out = saturate(mat.specular_color.w + albedo.w);
     } else {
         // HLSL default branch.
         out_rgb = mat.diffuse_radiance * albedo_for_illum
@@ -276,7 +292,6 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // `convert_to_render_target_premultiplied_alpha` premultiplies rgb by alpha
     // before render-target convert (render_target_fx.hlsl:1-4). For other modes
     // ALPHA_PREMULTIPLY substitutes to 1.0 (no-op).
-    let alpha_out: f32 = __ALPHA_CHANNEL_OUTPUT__;
     out_rgb = out_rgb * __ALPHA_PREMULTIPLY__;
 
     let accum = vec4<f32>(max(out_rgb, vec3<f32>(0.0)), alpha_out);

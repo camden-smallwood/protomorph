@@ -501,7 +501,7 @@ mod tests {
             atmosphere_index: -1,
             camera_fx_index: -1,
             mesh_index: -1,
-            flags: 0,
+            flags: blam_tags::Flags::default(),
             portals,
         }
     }
@@ -515,7 +515,7 @@ mod tests {
             plane_index,
             centroid: RealPoint3d { x: 0.0, y: 0.0, z: 0.0 }, // set per scenario below
             bounding_radius: std::f32::consts::SQRT_2 * 0.5 + 0.001,
-            flags: 0,
+            flags: blam_tags::Flags::default(),
             vertices: vec![
                 RealPoint3d { x: 0.0, y: -0.5, z: -0.5 },
                 RealPoint3d { x: 0.0, y: 0.5, z: -0.5 },

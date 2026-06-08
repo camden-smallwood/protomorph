@@ -31,15 +31,7 @@
 //! 8. **Final clamp** — magnitude clamped to [0, 1]; if result==false
 //!    AND flag 0x10 (`always_emit_magnitude`) is clear, force 0.
 
-use blam_tags::object::{
-    ObjectFunctionDefinition,
-    FN_FLAG_INVERT,
-    FN_FLAG_ADDITIVE,
-    FN_FLAG_ALWAYS_ACTIVE,
-    FN_FLAG_RANDOM_TIME_OFFSET,
-    FN_FLAG_ALWAYS_EMIT_MAGNITUDE,
-    FN_FLAG_TURN_OFF_REQUIRES_NONZERO,
-};
+use blam_tags::object::{ObjectFunctionDefinition, ObjectFunctionFlags};
 use blam_tags::tag_function::FunctionType;
 
 use crate::halo::objects::object_get_function_value::object_get_function_value;
@@ -71,7 +63,7 @@ pub fn object_function_get_function_value(
         .map(|f| f.function_type())
         .unwrap_or(FunctionType::Identity);
     let is_periodic = function_type == FunctionType::Periodic;
-    let additive_clear = (function.flags & FN_FLAG_ADDITIVE) == 0;
+    let additive_clear = !function.flags.contains(ObjectFunctionFlags::MappingDoesNotControlsActive);
 
     // Stage 2 — recurse to resolve the entry's `import_name`. May land
     // back on the same `functions[]` block (e.g. marinebeacon's
@@ -99,7 +91,7 @@ pub fn object_function_get_function_value(
         //   magnitude = v20 * magnitude;
         *deterministic = false;
         let mut time = eval_time;
-        if (function.flags & FN_FLAG_RANDOM_TIME_OFFSET) != 0 {
+        if function.flags.contains(ObjectFunctionFlags::RandomTimeOffset) {
             // Per-object random time offset — LCG hash of object_index,
             // high 16 bits scaled to [0,1). Lets a scene of identical
             // objects animate out-of-phase without authored variance.
@@ -122,7 +114,7 @@ pub fn object_function_get_function_value(
         //   v19 = evaluate_scalar(function_value, magnitude, 1.0);
         //   magnitude = v19;
         //   if (additive_clear) function_value = v19 > 0;
-        if (function.flags & FN_FLAG_INVERT) != 0 {
+        if function.flags.contains(ObjectFunctionFlags::Invert) {
             magnitude = 1.0 - magnitude;
         }
         let curve = function
@@ -191,7 +183,7 @@ pub fn object_function_get_function_value(
 
     // Stage 6 — always_active (flag 4) overrides everything.
     let mut result = function_value;
-    if (function.flags & FN_FLAG_ALWAYS_ACTIVE) != 0 {
+    if function.flags.contains(ObjectFunctionFlags::AlwaysActive) {
         result = true;
     }
 
@@ -217,7 +209,7 @@ pub fn object_function_get_function_value(
             &mut t_det,
         );
         let nonzero_required =
-            (function.flags & FN_FLAG_TURN_OFF_REQUIRES_NONZERO) != 0;
+            function.flags.contains(ObjectFunctionFlags::TurnOffWithUsesMagnitude);
         result = t_active && (!nonzero_required || t_mag != 0.0);
         output_magnitude = magnitude;
         if !*deterministic || !t_det {
@@ -231,7 +223,7 @@ pub fn object_function_get_function_value(
     //   if (v19 > 0.0) { if (v19 >= 1.0) v19 = 1.0; }
     //   else v19 = 0.0;
     //   *out = v19;
-    let always_emit = (function.flags & FN_FLAG_ALWAYS_EMIT_MAGNITUDE) != 0;
+    let always_emit = function.flags.contains(ObjectFunctionFlags::AlwaysExportsValue);
     if !result && !always_emit {
         output_magnitude = 0.0;
     } else if output_magnitude > 0.0 {

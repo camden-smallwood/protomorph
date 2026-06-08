@@ -13,7 +13,8 @@
 //! folds the cbuffer write path (`set_constant`) onto this struct.
 
 use blam_tags::math::{RealRgbColor, RealVector3d};
-use blam_tags::sky_atmosphere::SkyAtmosphere;
+use blam_tags::sky_atmosphere::{AtmosphereFlags, SkyAtmosphere};
+use blam_tags::Flags;
 use blam_tags::structure_bsp::BspAtmospherePaletteEntry;
 
 use crate::halo::structures::clusters::ClusterReference;
@@ -193,11 +194,9 @@ impl AtmosphereFogInterface {
         setting: &blam_tags::sky_atmosphere::AtmosphereSettings,
         accum: &mut WeightedAtmosphereParameters,
         weight: f32,
-        sky_sun: Option<[f32; 3]>,
+        sky_sun: Option<crate::halo::render::env_probe_pass::SkySun>,
     ) {
-        const FLAG_ENABLE_ATMOSPHERE: u16 = 0x0001;
-        const FLAG_PATCHY_FOG: u16 = 0x0004;
-        if (setting.flags & FLAG_ENABLE_ATMOSPHERE) == 0 {
+        if !setting.flags.contains(AtmosphereFlags::EnableAtmosphere) {
             return;
         }
         if weight > 0.0 {
@@ -244,7 +243,7 @@ impl AtmosphereFogInterface {
         accum.beta_p_angular.k += weight * beta_p_ang[2];
 
         // Patchy fog — gated on flag bit 2.
-        if (setting.flags & FLAG_PATCHY_FOG) != 0 {
+        if setting.flags.contains(AtmosphereFlags::PatchyFog) {
             accum.patchy_fog_density += weight * setting.patchy_fog_density;
             accum.full_intensity_height += weight * setting.full_intensity_height;
             accum.half_intensity_height += weight * setting.half_intensity_height;
@@ -268,7 +267,7 @@ impl AtmosphereFogInterface {
         &self,
         sky_atm: &blam_tags::sky_atmosphere::SkyAtmosphere,
         accum: &mut WeightedAtmosphereParameters,
-        sky_sun: Option<[f32; 3]>,
+        sky_sun: Option<crate::halo::render::env_probe_pass::SkySun>,
     ) {
         for setting in &sky_atm.atmosphere_settings {
             self.accumulate_atmosphere_settings(setting, accum, setting.weight, sky_sun);
@@ -366,6 +365,11 @@ pub(crate) fn resolve_atmosphere_setting_index(
     }
     let palette_idx = cluster_atmosphere_index as usize;
     let Some(palette_entry) = atmosphere_palette.get(palette_idx) else {
+        eprintln!(
+            "[atmosphere] cluster atmosphere palette index {palette_idx} out of range \
+             ({} entries) — falling back to setting 0",
+            atmosphere_palette.len(),
+        );
         return Some(0);
     };
     if palette_entry.atmosphere_setting_index < 0 {
@@ -373,6 +377,10 @@ pub(crate) fn resolve_atmosphere_setting_index(
     }
     let setting_idx = palette_entry.atmosphere_setting_index as usize;
     if setting_idx >= setting_count {
+        eprintln!(
+            "[atmosphere] palette setting index {setting_idx} out of range \
+             ({setting_count} settings) — falling back to setting 0",
+        );
         Some(0)
     } else {
         Some(setting_idx)
@@ -388,7 +396,7 @@ mod tests {
         let mut s = SkyAtmosphere::default();
         for i in 0..n {
             let mut setting = AtmosphereSettings::default();
-            setting.flags = 0x0001; // Enable Atmosphere
+            setting.flags = Flags::from_slice(&[AtmosphereFlags::EnableAtmosphere]);
             setting.name = format!("setting_{}", i);
             s.atmosphere_settings.push(setting);
         }
@@ -479,7 +487,11 @@ mod tests {
         // [[reference_riverworld_atmosphere_settings]] family). Picked
         // for non-zero outputs across all accumulator fields.
         let mut s = AtmosphereSettings::default();
-        s.flags = 0x0007; // enable + override + patchy fog
+        s.flags = Flags::from_slice(&[
+            AtmosphereFlags::EnableAtmosphere,
+            AtmosphereFlags::OverrideRealSunValues,
+            AtmosphereFlags::PatchyFog,
+        ]);
         s.sun_pitch = 30.0;
         s.sun_heading = 45.0;
         s.color = RealRgbColor { red: 1.0, green: 0.9, blue: 0.8 };
@@ -504,7 +516,7 @@ mod tests {
     fn accumulate_disabled_setting_is_noop() {
         let interface = AtmosphereFogInterface::default();
         let mut s = make_enabled_setting_with_betas();
-        s.flags = 0; // disabled
+        s.flags = Flags::default(); // disabled
         let mut accum = WeightedAtmosphereParameters::default();
         interface.accumulate_atmosphere_settings(&s, &mut accum, 1.0, None);
         assert_eq!(accum.atmosphere_enabled, 0);
@@ -555,7 +567,7 @@ mod tests {
     fn accumulate_no_patchy_when_flag_unset() {
         let interface = AtmosphereFogInterface::default();
         let mut s = make_enabled_setting_with_betas();
-        s.flags = 0x0001; // enable only — no patchy fog
+        s.flags = Flags::from_slice(&[AtmosphereFlags::EnableAtmosphere]); // enable only — no patchy fog
         let mut accum = WeightedAtmosphereParameters::default();
         interface.accumulate_atmosphere_settings(&s, &mut accum, 1.0, None);
         assert_eq!(accum.patchy_fog_density, 0.0);
@@ -570,10 +582,10 @@ mod tests {
         let interface = AtmosphereFogInterface::default();
         let mut a = make_enabled_setting_with_betas();
         a.distance_bias = 1.0;
-        a.flags = 0x0001; // no patchy on a
+        a.flags = Flags::from_slice(&[AtmosphereFlags::EnableAtmosphere]); // no patchy on a
         let mut b = make_enabled_setting_with_betas();
         b.distance_bias = 3.0;
-        b.flags = 0x0001;
+        b.flags = Flags::from_slice(&[AtmosphereFlags::EnableAtmosphere]);
         let mut accum = WeightedAtmosphereParameters::default();
         interface.accumulate_atmosphere_settings(&a, &mut accum, 0.25, None);
         interface.accumulate_atmosphere_settings(&b, &mut accum, 0.75, None);
@@ -588,11 +600,11 @@ mod tests {
         let mut a = make_enabled_setting_with_betas();
         a.weight = 1.0;
         a.distance_bias = 2.0;
-        a.flags = 0x0001;
+        a.flags = Flags::from_slice(&[AtmosphereFlags::EnableAtmosphere]);
         let mut b = make_enabled_setting_with_betas();
         b.weight = 0.0; // zero-weight should contribute nothing
         b.distance_bias = 99.0;
-        b.flags = 0x0001;
+        b.flags = Flags::from_slice(&[AtmosphereFlags::EnableAtmosphere]);
         sky_atm.atmosphere_settings.push(a);
         sky_atm.atmosphere_settings.push(b);
         let mut accum = WeightedAtmosphereParameters::default();

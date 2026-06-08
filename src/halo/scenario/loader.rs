@@ -194,6 +194,28 @@ pub struct LoadedScenario {
     pub decal_renderer: crate::halo::render::render_decals::DecalRenderer,
 }
 
+/// SH3 default lightprobe (9 coefficients per channel) as protomorph
+/// consumes it. blam-tags' `render_model::DefaultLightprobe` now carries
+/// the full 16-coefficient on-disk form (the trailing 7 past SH3's 9
+/// are zero); we truncate to the SH3 9 the lighting pipeline expects.
+#[derive(Debug, Clone, Default)]
+pub struct SkyProbe {
+    pub r: [f32; 9],
+    pub g: [f32; 9],
+    pub b: [f32; 9],
+}
+
+impl From<&blam_tags::render_model::DefaultLightprobe> for SkyProbe {
+    fn from(p: &blam_tags::render_model::DefaultLightprobe) -> Self {
+        let take9 = |a: &[f32; 16]| -> [f32; 9] {
+            let mut out = [0.0f32; 9];
+            out.copy_from_slice(&a[..9]);
+            out
+        };
+        SkyProbe { r: take9(&p.r), g: take9(&p.g), b: take9(&p.b) }
+    }
+}
+
 /// Decoded default lighting from the scenario's primary sky tag.
 /// Mirrors what dllcache's `get_sun_constants_from_sky` +
 /// `setup_default_lighting` extract from `sky.render_model`.
@@ -209,7 +231,7 @@ pub struct SkyLighting {
     pub sun_intensity: blam_tags::math::RealVector3d,
     /// SH3 probe (9 floats per channel) baked into the sky's render_model.
     /// Read directly from `default lightprobe r/g/b`.
-    pub probe: blam_tags::render_model::DefaultLightprobe,
+    pub probe: SkyProbe,
     /// Engine `get_sun_constants_from_sky @ 0x1803adcb0` → atmosphere
     /// path. Computed as `sky_lights[count-1].intensity × solid_angle ×
     /// 0.2 × g_render_light_intensity` (we use g_render_light_intensity=1).
@@ -464,14 +486,15 @@ impl LoadedScenario {
                     "[exposure-palette] bsp_idx={i} entries={}",
                     sbsp.camera_fx_palette.len(),
                 );
+                use blam_tags::structure_bsp::CameraFxPaletteFlags;
                 for (pi, entry) in sbsp.camera_fx_palette.iter().enumerate() {
-                    let bit0 = (entry.flags & 0x01) != 0;
-                    let bit1 = (entry.flags & 0x02) != 0;
-                    let bit2 = (entry.flags & 0x04) != 0;
-                    let bit3 = (entry.flags & 0x08) != 0;
+                    let force_exp = entry.flags.contains(CameraFxPaletteFlags::ForceExposure);
+                    let force_auto = entry.flags.contains(CameraFxPaletteFlags::ForceAutoExposure);
+                    let minmax = entry.flags.contains(CameraFxPaletteFlags::OverrideExposureBounds);
+                    let bloom = entry.flags.contains(CameraFxPaletteFlags::OverrideInherentBloom);
                     eprintln!(
-                        "[exposure-palette]   #{pi:02} \"{}\" flags=0x{:02x} \
-                         (b0_force_exp={bit0} b1_force_auto_b={bit1} b2_minmax={bit2} b3_bloom={bit3}) \
+                        "[exposure-palette]   #{pi:02} \"{}\" flags={:?} \
+                         (force_exp={force_exp} force_auto_b={force_auto} minmax={minmax} bloom={bloom}) \
                          exp={:.3} auto_b={:.3} min/max=[{:.3},{:.3}] inh={:.3} bi={:.3}",
                         entry.name, entry.flags,
                         entry.forced_exposure, entry.forced_auto_exposure_brightness,
@@ -1101,13 +1124,20 @@ impl LoadedScenario {
                     clamp_angle_radians: decal_def.clamp_angle_degrees.to_radians(),
                     texture_scale_x: (radius * bitmap_aspect).max(0.0001),
                     texture_scale_y: radius,
-                    system_definition_flags: decal_system.flags,
-                    left_handed: (((decal_system.flags >> 1) ^ (decal_system.flags >> 2)) & 1) != 0,
+                    system_definition_flags: decal_system.flags.clone(),
+                    // Engine: left-handed projection when exactly one of the
+                    // two random-mirror bits is set (`(>>1 ^ >>2) & 1`).
+                    left_handed: decal_system
+                        .flags
+                        .contains(blam_tags::decal_system::DecalSystemFlags::RandomUMirror)
+                        ^ decal_system
+                            .flags
+                            .contains(blam_tags::decal_system::DecalSystemFlags::RandomVMirror),
                     decal_definition_flags: decal_def.flags,
                 };
                 let params = DecalParams {
                     local_to_world: world_projection,
-                    context: ctx,
+                    context: ctx.clone(),
                 };
                 fragments.clear();
                 fragments.resize(collisions.len(), DecalFragment::default());
@@ -1492,7 +1522,7 @@ fn load_sky_lighting(
         })
         .map(|(i, d)| (Some(i), Some(d)))
         .unwrap_or((None, None));
-    let probe = render_model.default_lightprobe?;
+    let probe = SkyProbe::from(&render_model.default_lightprobe?);
 
     // Extract dominant light from the SH probe (dllcache
     // `calculate_dominant_light_from_lightprobe`).

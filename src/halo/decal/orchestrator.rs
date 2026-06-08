@@ -70,7 +70,7 @@ pub struct DecalCollisionResult {
 /// the `.decal_system` tag's first definition (cull_angle,
 /// clamp_angle, texture_scale, flags) and the parent system's
 /// handedness bit.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DecalParams {
     /// Decal-system local-to-world matrix — the engine's
     /// `c_decal_system` carries this at offset 24 of the runtime

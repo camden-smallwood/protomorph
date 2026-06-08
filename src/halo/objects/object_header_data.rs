@@ -74,6 +74,46 @@ pub struct ObjectHeaderDatum {
 /// Populated by scenario load; cleared between scenarios.
 static OBJECT_HEADER_DATA: RwLock<Vec<ObjectHeaderDatum>> = RwLock::new(Vec::new());
 
+/// Runtime `object name index → object index` map. Engine equivalent:
+/// the `g_object_name_list` the engine fills via
+/// `object_set_object_index_for_name_index` (and reads via
+/// `object_index_from_name_index`). Indexed by a scenario `object names`
+/// block index; value is the object's header index (lower-16 handle), or
+/// `-1` for an unbound name. Populated at scenario load from each
+/// placement's `name_index` and from `create_sky_object`'s sky-name
+/// registration. Used to resolve a placement's `parent_id.
+/// parent_object_name_index` to its parent object.
+static OBJECT_NAME_MAP: RwLock<Vec<i32>> = RwLock::new(Vec::new());
+
+/// Bind `name_index → object_index` (engine
+/// `object_set_object_index_for_name_index`). Grows the map as needed;
+/// no-op for `name_index < 0`.
+pub fn object_set_object_index_for_name_index(name_index: i16, object_index: u32) {
+    if name_index < 0 {
+        return;
+    }
+    let mut guard = OBJECT_NAME_MAP.write().unwrap();
+    let ni = name_index as usize;
+    if ni >= guard.len() {
+        guard.resize(ni + 1, -1);
+    }
+    guard[ni] = object_index as i32;
+}
+
+/// Resolve `name_index → object_index` (engine
+/// `object_index_from_name_index`). `None` for an out-of-range or
+/// unbound name.
+pub fn object_index_from_name_index(name_index: i16) -> Option<u32> {
+    if name_index < 0 {
+        return None;
+    }
+    let guard = OBJECT_NAME_MAP.read().unwrap();
+    match guard.get(name_index as usize).copied() {
+        Some(v) if v >= 0 => Some(v as u32),
+        _ => None,
+    }
+}
+
 /// Replace the global table with `entries`. Called by the renderer's
 /// scenario-load path AFTER all placement Vecs have been resolved.
 pub fn replace(entries: Vec<ObjectHeaderDatum>) {
@@ -81,10 +121,10 @@ pub fn replace(entries: Vec<ObjectHeaderDatum>) {
     *guard = entries;
 }
 
-/// Wipe the global table (e.g. before loading a new scenario).
+/// Wipe the global table + name map (e.g. before loading a new scenario).
 pub fn clear() {
-    let mut guard = OBJECT_HEADER_DATA.write().unwrap();
-    guard.clear();
+    OBJECT_HEADER_DATA.write().unwrap().clear();
+    OBJECT_NAME_MAP.write().unwrap().clear();
 }
 
 /// Engine `(object_header_data->data + index * size)->object_type`
@@ -116,6 +156,43 @@ pub fn get_object_type(object_index: u32) -> ObjectType {
 /// `false` (engine-equivalent: `object_header_data == NULL` early-out).
 pub fn is_populated() -> bool {
     !OBJECT_HEADER_DATA.read().unwrap().is_empty()
+}
+
+/// World matrix of `object_index` from its datum (the instance) — port of
+/// `object_get_world_matrix @0x1807d9650`. Rendering reads this instead of
+/// the per-object `ObjectData.model_matrix`, making the datum the single
+/// transform authority. `None` if the index is out of range. See
+/// [`ObjectDatum::world_matrix`].
+pub fn world_matrix(object_index: u32) -> Option<glam::Mat4> {
+    let guard = OBJECT_HEADER_DATA.read().unwrap();
+    let idx = (object_index & 0xFFFF) as usize;
+    let entry = guard.get(idx)?;
+    let datum = entry.object_datum.read().unwrap();
+    Some(datum.world_matrix())
+}
+
+/// Overwrite `object_index`'s datum frame so its [`world_matrix`] equals
+/// `world`. Decomposes `world` (engine `from_cols(forward,left,up,pos)`)
+/// into the datum's `forward`/`up`/`relative_position`/`scale` — the same
+/// thing the engine's `object_attach_to_marker_immediate` does via
+/// `object_set_position_internal` when snapping a child to a parent marker.
+/// Used by parent-marker attachment (e.g. construct's waterfall scenery →
+/// the sky's `"waterfall"` marker). No-op if the index is out of range.
+pub fn set_world_transform(object_index: u32, world: glam::Mat4) {
+    use blam_tags::math::{RealPoint3d, RealVector3d};
+    let guard = OBJECT_HEADER_DATA.read().unwrap();
+    let idx = (object_index & 0xFFFF) as usize;
+    let Some(entry) = guard.get(idx) else { return };
+    let mut d = entry.object_datum.write().unwrap();
+    let (c0, c2, p) = (world.x_axis, world.z_axis, world.w_axis);
+    let fwd = glam::Vec3::new(c0.x, c0.y, c0.z);
+    let s = fwd.length();
+    let fwd_n = if s > 1e-6 { fwd / s } else { glam::Vec3::X };
+    let up_n = glam::Vec3::new(c2.x, c2.y, c2.z).normalize_or_zero();
+    d.object.forward = RealVector3d { i: fwd_n.x, j: fwd_n.y, k: fwd_n.z };
+    d.object.up = RealVector3d { i: up_n.x, j: up_n.y, k: up_n.z };
+    d.object.relative_position = RealPoint3d { x: p.x, y: p.y, z: p.z };
+    d.object.scale = if s > 1e-6 { s } else { 1.0 };
 }
 
 /// Compute the engine `object_index` for `(object_type,
@@ -356,6 +433,22 @@ pub fn populate_from_scenario(
         authored_variant_name,
         nonzero_variant,
     );
+
+    // Bind every named placement into the name→object map (engine
+    // `object_set_object_index_for_name_index`, called per object as it
+    // spawns). The sky object registers separately in `create_sky_object`.
+    {
+        let mut name_map = OBJECT_NAME_MAP.write().unwrap();
+        name_map.clear();
+        name_map.resize(scenario.object_names.len(), -1);
+        for (header_index, e) in entries.iter().enumerate() {
+            let ni = e.object_datum.read().unwrap().object.name_index;
+            if ni >= 0 && (ni as usize) < name_map.len() {
+                name_map[ni as usize] = header_index as i32;
+            }
+        }
+    }
+
     replace(entries);
 }
 
@@ -447,11 +540,13 @@ pub fn bounding_sphere_radius(object_index: u32) -> f32 {
 /// no resolved tag (empty palette entry) — bit 1 unset by default, so
 /// default-branch dispatch is the safe fallback (`v28 = 0.4` formula
 /// floor handles missing radius).
-pub fn object_definition_flags(object_index: u32) -> u16 {
+pub fn object_definition_flags(
+    object_index: u32,
+) -> blam_tags::Flags<blam_tags::object::ObjectDefinitionFlags, u16> {
     let guard = OBJECT_HEADER_DATA.read().unwrap();
     let idx = (object_index & 0xFFFF) as usize;
     guard
         .get(idx)
-        .map(|entry| entry.object_definition.flags)
-        .unwrap_or(0)
+        .map(|entry| entry.object_definition.flags.clone())
+        .unwrap_or_default()
 }

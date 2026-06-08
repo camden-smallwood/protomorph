@@ -46,6 +46,7 @@
 use crate::halo::objects::object_type::ObjectType;
 use blam_tags::math::{RealPoint3d, RealVector3d};
 use blam_tags::scenario::ObjectPlacement;
+use glam::{Mat4, Vec3};
 
 // ---------------------------------------------------------------------------
 // Helper substructs (small, used inline)
@@ -453,6 +454,39 @@ pub struct ObjectDatum {
 }
 
 impl ObjectDatum {
+    /// The object's world transform — port of `object_get_world_matrix
+    /// @0x1807d9650`. Builds the root frame from this datum's
+    /// `forward`/`up`/`relative_position` (engine
+    /// `matrix4x3_from_point_and_vectors`: rows forward / left=cross(up,
+    /// forward) / up → glam `from_cols(forward,left,up,pos)`), with uniform
+    /// `scale` folded into the basis. This is the single source of an
+    /// object's world matrix — rendering reads it instead of the old
+    /// per-object `ObjectData.model_matrix`.
+    ///
+    /// Phase 3 will compose the parent attachment here: when
+    /// `object.parent_object_index != -1`, the engine returns
+    /// `object_get_node_matrix(parent, parent_node) * frame`. That hook is
+    /// left for the parent-marker work (parents are unset today, so the
+    /// own-frame is the result).
+    pub fn world_matrix(&self) -> Mat4 {
+        let b = &self.object;
+        let fwd = Vec3::new(b.forward.i, b.forward.j, b.forward.k);
+        let up = Vec3::new(b.up.i, b.up.j, b.up.k);
+        let pos = Vec3::new(
+            b.relative_position.x,
+            b.relative_position.y,
+            b.relative_position.z,
+        );
+        let left = up.cross(fwd); // engine matrix4x3_from_point_and_vectors row1
+        let s = if b.scale > 0.0 { b.scale } else { 1.0 };
+        Mat4::from_cols(
+            (fwd * s).extend(0.0),
+            (left * s).extend(0.0),
+            (up * s).extend(0.0),
+            pos.extend(1.0),
+        )
+    }
+
     /// Construct a default-state datum for `object_type`. Engine
     /// equivalent: `c_object::initialize` on a freshly-allocated slot
     /// in `object_data` pool — protomorph mirrors the

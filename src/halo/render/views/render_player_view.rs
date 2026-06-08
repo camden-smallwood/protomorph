@@ -9,7 +9,7 @@
 
 use crate::halo::camera::CameraUniforms;
 use crate::game::GameState;
-use crate::halo::geometry::ModelUniforms;
+use crate::halo::geometry::{ModelUniforms, MAXIMUM_NUMBER_OF_MODEL_NODES};
 use crate::halo::rasterizer::{SplitscreenRes, Surface};
 use crate::halo::render::env_probe_pass::GpuSkyParams;
 use crate::halo::render::render_cameras::RealRectangle2d;
@@ -290,13 +290,36 @@ impl PlayerView {
         let object_in_frustum =
             |obj: &crate::halo::objects::ObjectData, model_idx: usize| -> bool {
                 let Some(model) = renderer.models.get(model_idx) else { return true };
+                // Never view-frustum-cull an object that carries transparent
+                // parts. The engine submits object transparents via PVS-region
+                // visibility (`submit_object_mesh_parts @ 0x1806E1BF0`), not the
+                // view frustum — culling here would pop glass / FX scenery
+                // (waterfalls, man cannons) as the bounding sphere center
+                // crosses a frustum plane while geometry is still on screen.
+                if model.materials.iter().any(|m| m.is_transparent) {
+                    return true;
+                }
+                // World transform from the DATUM (engine `object_get_world_matrix`),
+                // NOT the stale authored `obj.position`/`obj.scale`. For
+                // parent-marker-attached objects (sky-attached scenery — the
+                // bunkerworld dish, etc.) `set_world_transform` writes the
+                // datum but never `obj.position`, so the store transform is the
+                // pre-attachment placement and culling on it pops the object.
+                // Fall back to the placement compose only for datum-less objects
+                // (sky/test). Mirrors the model-uniform + shadow-caster paths.
+                let world = obj
+                    .header_index
+                    .and_then(crate::halo::objects::object_header_data::world_matrix)
+                    .unwrap_or_else(|| obj.model_matrix());
                 let local_center = model.bounding_sphere.truncate();
-                // Transform center to world: rotate by object rotation +
-                // scale, then translate by position. The rotation only
-                // affects an offset center — for centered models (most
-                // scenery) it's negligible; just apply scale + position.
-                let scale_max = obj.scale.x.max(obj.scale.y).max(obj.scale.z);
-                let world_center = obj.position + local_center * scale_max;
+                let world_center = world.transform_point3(local_center);
+                let scale_max = world
+                    .x_axis
+                    .truncate()
+                    .length()
+                    .max(world.y_axis.truncate().length())
+                    .max(world.z_axis.truncate().length())
+                    .max(1e-3);
                 let world_radius = model.bounding_sphere.w * scale_max;
                 for plane in &render_list_frustum {
                     let s = plane.x * world_center.x
@@ -334,6 +357,7 @@ impl PlayerView {
             0,
             bytemuck::bytes_of(&cam_uniforms),
         );
+
 
         // ============================================================
         // Phase I0c — engine-faithful per-frame visibility computation.
@@ -431,8 +455,14 @@ impl PlayerView {
         // Upload model uniforms + bone matrices
         for (i, &(obj_idx, _model_idx)) in render_list.iter().enumerate() {
             let obj = game.objects.get(obj_idx);
+            // Datum is the transform authority (engine object_get_world_matrix);
+            // fall back to the placement compose for any header-less object.
+            let world = obj
+                .header_index
+                .and_then(crate::halo::objects::object_header_data::world_matrix)
+                .unwrap_or_else(|| obj.model_matrix());
             let model_u = ModelUniforms {
-                model: obj.model_matrix().to_cols_array_2d(),
+                model: world.to_cols_array_2d(),
             };
             let offset = (i * renderer.shared.model_stride) as u64;
             renderer.shared.queue.write_buffer(
@@ -441,23 +471,35 @@ impl PlayerView {
                 bytemuck::bytes_of(&model_u),
             );
 
-            if let Some(anim_mgr) = &obj.animations {
-                if anim_mgr.matrices_dirty {
-                    let mat_count = anim_mgr.node_matrices.len();
-                    let byte_len = mat_count * std::mem::size_of::<[[f32; 4]; 4]>();
-                    for (j, mat) in anim_mgr.node_matrices.iter().enumerate() {
-                        let offset = j * 64;
-                        let cols = mat.to_cols_array();
-                        renderer.node_matrix_staging[offset..offset + 64]
-                            .copy_from_slice(bytemuck::cast_slice(&cols));
+            // Per-object node (bone) bind-pose matrices come from the
+            // model spec now (no animation system). Pack the model's
+            // `node_local_matrices` (object-local node-world bind pose)
+            // into the scratch staging buffer, then upload into this
+            // object's slot in `node_matrices_buffer`. Skinned vertices
+            // sample these via `model_u × node × vertex`.
+            //
+            // Borrow note: `renderer.models` (immut) and
+            // `renderer.node_matrix_staging` (mut) are disjoint fields, so
+            // the pack loop accesses both via the field paths directly.
+            let mut nm_byte_len = 0usize;
+            if let Some(mi) = obj.model_index {
+                if let Some(gm) = renderer.models.get(mi) {
+                    let nm = &gm.node_local_matrices;
+                    nm_byte_len = nm.len().min(MAXIMUM_NUMBER_OF_MODEL_NODES) * 64;
+                    for (j, mat) in nm.iter().take(MAXIMUM_NUMBER_OF_MODEL_NODES).enumerate() {
+                        let off = j * 64;
+                        renderer.node_matrix_staging[off..off + 64]
+                            .copy_from_slice(bytemuck::cast_slice(&mat.to_cols_array()));
                     }
-                    let nm_offset = (i * renderer.shared.node_matrices_stride) as u64;
-                    renderer.shared.queue.write_buffer(
-                        &renderer.shared.node_matrices_buffer,
-                        nm_offset,
-                        &renderer.node_matrix_staging[..byte_len],
-                    );
                 }
+            }
+            if nm_byte_len > 0 {
+                let nm_offset = (i * renderer.shared.node_matrices_stride) as u64;
+                renderer.shared.queue.write_buffer(
+                    &renderer.shared.node_matrices_buffer,
+                    nm_offset,
+                    &renderer.node_matrix_staging[..nm_byte_len],
+                );
             }
         }
 
@@ -550,11 +592,68 @@ impl PlayerView {
                 _ => crate::halo::render::env_probe_pass::GpuAtmosphereData::neutral(),
             }
         };
-        renderer.shared.queue.write_buffer(
-            &renderer.shared.atmosphere_buffer,
-            0,
-            bytemuck::bytes_of(&atmosphere_payload),
-        );
+        // Build the per-render-method atmosphere TABLE and upload it in one
+        // write. Entry layout (256-B stride):
+        //   [0]    default — the cluster-weighted blend computed above.
+        //   [1]    disabled — slot1.w<0 sentinel (extinction=1, inscatter=0);
+        //          engine `disable_atmosphere`, selected by `DontFogMe`.
+        //   [2+i]  setting i = engine `set_atmosphere_constants_by_index(i)`:
+        //          accumulate ONLY that setting at weight 1.0, derive cbuffer.
+        // Sky meshes with `UseCustomSetting`/`DontFogMe` select entries via the
+        // per-draw dynamic offset at camera_bgl binding 2 (see
+        // `shared::atmosphere_offset_for`). This mirrors the engine's per-shader
+        // atmosphere override in `render_method_submit_volatile_per_shader`.
+        {
+            use crate::halo::render::atmosphere_fog_interface::WeightedAtmosphereParameters;
+            use crate::halo::render::env_probe_pass::GpuAtmosphereData;
+            use crate::halo::render::shared::{
+                ATMOSPHERE_DISABLED_OFFSET, ATMOSPHERE_SETTING_BASE_OFFSET, ATMOSPHERE_STRIDE,
+                ATMOSPHERE_TABLE_ENTRIES, MAX_ATMOSPHERE_SETTINGS,
+            };
+
+            let n = std::mem::size_of::<GpuAtmosphereData>();
+            let mut table = vec![0u8; (ATMOSPHERE_TABLE_ENTRIES * ATMOSPHERE_STRIDE) as usize];
+
+            // [0] default.
+            table[0..n].copy_from_slice(bytemuck::bytes_of(&atmosphere_payload));
+            // [1] disabled.
+            let mut disabled = atmosphere_payload;
+            disabled.slot1_sun_int_norm_thickness[3] = -1.0;
+            let d = ATMOSPHERE_DISABLED_OFFSET as usize;
+            table[d..d + n].copy_from_slice(bytemuck::bytes_of(&disabled));
+
+            // [2+i] per-setting. Out-of-range / absent → default.
+            let view_exposure = renderer.scenario_view_exposure;
+            let sky_sun = renderer.scenario_sky_sun;
+            for i in 0..MAX_ATMOSPHERE_SETTINGS {
+                let entry = renderer
+                    .scenario_sky_atmosphere
+                    .as_ref()
+                    .and_then(|sky_atm| sky_atm.atmosphere_settings.get(i as usize))
+                    .map(|setting| {
+                        let mut accum = WeightedAtmosphereParameters::default();
+                        renderer.atmosphere_fog_interface.accumulate_atmosphere_settings(
+                            setting,
+                            &mut accum,
+                            1.0,
+                            sky_sun,
+                        );
+                        GpuAtmosphereData::from_weighted_parameters(
+                            &accum,
+                            Some(setting),
+                            view_exposure,
+                        )
+                    })
+                    .unwrap_or(atmosphere_payload);
+                let o = (ATMOSPHERE_SETTING_BASE_OFFSET + i * ATMOSPHERE_STRIDE) as usize;
+                table[o..o + n].copy_from_slice(bytemuck::bytes_of(&entry));
+            }
+
+            renderer
+                .shared
+                .queue
+                .write_buffer(&renderer.shared.atmosphere_buffer, 0, &table);
+        }
 
         // Upload sky params for merged lighting+sky pass
         {
@@ -628,7 +727,9 @@ impl PlayerView {
             &mut renderer.transparency_renderer,
             &render_list,
             &renderer.models,
+            &game.objects,
         );
+
 
         // Sky transparents are NOT queued here — engine-faithful path
         // queues them inside `c_player_view::render_transparents` via
@@ -962,7 +1063,10 @@ impl PlayerView {
                 // overwhelming majority), this collapses to (M·offset,
                 // radius).
                 let obj = game.objects.get(obj_idx);
-                let model_matrix = obj.model_matrix();
+                let model_matrix = obj
+                    .header_index
+                    .and_then(crate::halo::objects::object_header_data::world_matrix)
+                    .unwrap_or_else(|| obj.model_matrix());
                 let bs_local = model.bounding_sphere;
                 let local_center = glam::Vec3::new(bs_local.x, bs_local.y, bs_local.z);
                 let caster_center =
@@ -1635,6 +1739,9 @@ impl PlayerView {
             &ctx.shared.camera_bind_group,
             &[
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                // atmosphere @ binding 2 — albedo pass is fog-exempt (engine
+                // gates entry_point==albedo out of the override); use default.
+                crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                 crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                 // dominant_light @ binding 13.
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
@@ -1689,10 +1796,12 @@ impl PlayerView {
         // pick `artifacts_albedo` per material).
         ctx.structure_renderer.render_albedo(&mut rpass, ctx);
 
-        // `c_object_renderer::submit_and_render_sky(0, …)` — sky
-        // meshes also write the G-buffer. Engine call site:
-        // `c_player_view::render_albedo @ 0x18068abc0` immediately
-        // after `c_structure_renderer::render_albedo`.
+        // `c_object_renderer::submit_and_render_sky(0, …)` — the engine
+        // draws sky into the G-buffer here (`render_albedo @ 0x18068abc0`,
+        // right after `c_structure_renderer::render_albedo`) with
+        // `_z_buffer_mode_write`.
+        //
+        // Engine-faithful: sky writes the G-buffer + depth here.
         crate::halo::render::render_objects::submit_and_render_sky(
             0,
             0,
@@ -1879,6 +1988,9 @@ impl PlayerView {
             &ctx.shared.camera_bind_group_sl,
             &[
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                // atmosphere @ binding 2 — SL pass setup default; per-draw
+                // sites (BSP/objects/sky) rebind with their own offset.
+                crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                 crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                 // dominant_light @ binding 13.
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
@@ -2050,7 +2162,12 @@ impl PlayerView {
         // already-submitted entries. Engine renders this AFTER
         // implicit_geometry_submit + effects_render(_pass_transparent),
         // both stubbed.
-        transparency_renderer.sort();
+        let eye: glam::Vec3 = ctx.game.camera.position.into();
+        let fwd: glam::Vec3 = ctx.game.camera.forward.into();
+        transparency_renderer.sort(eye.to_array(), fwd.to_array());
+        if std::env::var_os("PROTOMORPH_DIAG_SORT_DUMP").is_some() {
+            transparency_renderer.debug_dump_sorted(eye.to_array(), "regular");
+        }
         transparency_renderer.render(&mut rpass, ctx);
     }
 

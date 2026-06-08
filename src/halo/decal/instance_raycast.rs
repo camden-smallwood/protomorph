@@ -40,10 +40,6 @@ use blam_tags::math::RealMatrix4x3;
 
 use super::mesh_builder::matrix4x3_inverse_transform_point;
 
-/// Per-instance bit `_instanced_geometry_render_only_bit` (Ares
-/// `structures/instanced_geometry_definitions.h:15`).
-const INSTANCE_FLAG_RENDER_ONLY: u16 = 0x2;
-
 /// Result of a successful instance-geometry raycast.
 #[derive(Debug, Clone)]
 pub struct InstanceHit {
@@ -133,7 +129,7 @@ pub fn try_single_instance_hit(
     max_t: f32,
     world_projection: &RealMatrix4x3,
 ) -> Option<InstanceHit> {
-    if (inst.flags & INSTANCE_FLAG_RENDER_ONLY) != 0 {
+    if inst.flags.contains(blam_tags::structure_bsp::InstancedGeometryFlags::RenderOnly) {
         return None;
     }
     if !fast_vector_intersects_sphere(

@@ -25,13 +25,13 @@ pub mod atlas_decode;
 
 use std::path::Path;
 
-use blam_tags::bitmap::{Bitmap, BitmapCurve, BitmapFormat};
+use blam_tags::bitmap::{Bitmap, BitmapFormat};
 use blam_tags::bitmap::decode::decode_to_rgba8;
 use blam_tags::TagFile;
 use blam_tags::math::{RealArgbColor, RealPoint2d};
 use glam::Vec2;
 
-use crate::halo::render_methods::materials::{InlinePixelFormat, InlineTexture};
+use crate::halo::render_methods::materials::{InlinePixelFormat, InlineTexture, TexelEncoding};
 
 /// Read a Halo `.bitmap` tag from disk and return an [`InlineTexture`]
 /// ready for the renderer to upload. Handles both 2D and cube bitmaps;
@@ -78,34 +78,12 @@ fn load_image_from_bitmap(
     let mip_count = img.mipmap_levels().max(1);
     let layers = img.layer_count();
     let is_cube = img.is_cube();
-    // Curve → sRGB-decode classification.
-    //
-    // `XrgbGamma2` (= 1) is the Xenon/PC sRGB-equivalent curve most
-    // diffuse maps ship with. `Srgb` (= 5) is the canonical γ2.2 sRGB
-    // curve used by some MCC re-bake outputs. `Gamma2` (= 2) is a
-    // γ2.0 approximation — close enough that engine's PC path samples
-    // it through the same `_SRGB` SRV (the γ2.0 vs γ2.2 mismatch is
-    // invisible at typical bit depths and matches the engine's
-    // behavior on cache-built bitmaps).
-    //
-    // `Linear` (= 3) bytes are already in linear space — sampling
-    // through an `_SRGB` SRV double-darkens (shrine `stone_edge_dif`
-    // visible-bug 2026-05-17).
-    //
-    // `OffsetLog` (= 4) is log-encoded HDR-ish data, NEVER sRGB.
-    //
-    // `Unknown` (= 0) typically means the cache builder didn't tag the
-    // curve — engine MCC defaults to sRGB for color formats, so we do
-    // the same to preserve prior behavior. Bump/spec/mask consumers
-    // override via `is_linear_param_name`, so this only affects color
-    // params.
-    let srgb = match img.curve() {
-        BitmapCurve::XrgbGamma2
-        | BitmapCurve::Gamma2
-        | BitmapCurve::Srgb
-        | BitmapCurve::Unknown => true,
-        BitmapCurve::Linear | BitmapCurve::OffsetLog => false,
-    };
+    // Record the authored encoding as data (curve → Gamma/Linear is in
+    // `TexelEncoding::from_curve`). The sRGB-vs-linear *sampling* decision
+    // is deferred to `resolve_wgpu_format` (encoding + call-site intent) so
+    // it's made in exactly one place; bump/spec/mask consumers request
+    // `ForceLinear` there via `is_linear_param_name`.
+    let encoding = TexelEncoding::from_curve(img.curve());
     let raw = img.pixel_bytes().ok()?;
 
     // Total surface = (per-layer mip pyramid) × layer_count. For 2D
@@ -130,15 +108,17 @@ fn load_image_from_bitmap(
         return Some(InlineTexture {
             width, height, mip_count, layers, is_cube,
             format: InlinePixelFormat::Bc5RgSnorm,
+            encoding: TexelEncoding::Linear,
             data: surface_bytes.to_vec(),
         });
     }
 
     // Native passthrough where wgpu has the format.
-    if let Some(inline_fmt) = native_passthrough(format, srgb) {
+    if let Some(inline_fmt) = native_passthrough(format) {
         return Some(InlineTexture {
             width, height, mip_count, layers, is_cube,
             format: inline_fmt,
+            encoding,
             data: surface_bytes.to_vec(),
         });
     }
@@ -167,7 +147,8 @@ fn load_image_from_bitmap(
     Some(InlineTexture {
         width, height,
         mip_count: 1, layers, is_cube,
-        format: if srgb { InlinePixelFormat::Rgba8UnormSrgb } else { InlinePixelFormat::Rgba8Unorm },
+        format: InlinePixelFormat::Rgba8Unorm,
+        encoding,
         data: rgba8,
     })
 }
@@ -180,13 +161,13 @@ fn load_image_from_bitmap(
 /// `R8Unorm` — wgpu has no native A8. Shaders that sample these get
 /// the byte in `.r`; "alpha-only" semantics is the consumer's problem
 /// to swizzle.
-fn native_passthrough(fmt: BitmapFormat, srgb: bool) -> Option<InlinePixelFormat> {
+fn native_passthrough(fmt: BitmapFormat) -> Option<InlinePixelFormat> {
     use BitmapFormat as B;
     use InlinePixelFormat as I;
     Some(match fmt {
-        B::Dxt1 => if srgb { I::Bc1RgbaUnormSrgb } else { I::Bc1RgbaUnorm },
-        B::Dxt3 => if srgb { I::Bc2RgbaUnormSrgb } else { I::Bc2RgbaUnorm },
-        B::Dxt5 => if srgb { I::Bc3RgbaUnormSrgb } else { I::Bc3RgbaUnorm },
+        B::Dxt1 => I::Bc1RgbaUnorm,
+        B::Dxt3 => I::Bc2RgbaUnorm,
+        B::Dxt5 => I::Bc3RgbaUnorm,
         B::Dxt5a => I::Bc4RUnorm,
         // `B::Dxn` is intentionally NOT mapped here — it's handled
         // earlier in `load_image_from_bitmap` as `Bc5RgSnorm` (Halo MCC
@@ -196,7 +177,7 @@ fn native_passthrough(fmt: BitmapFormat, srgb: bool) -> Option<InlinePixelFormat
         // every bump map by 128 units — better to fail loudly via the
         // `_ => None` catch-all + `decode_to_rgba8` than to ship broken
         // normals.
-        B::A8r8g8b8 | B::X8r8g8b8 => if srgb { I::Bgra8UnormSrgb } else { I::Bgra8Unorm },
+        B::A8r8g8b8 | B::X8r8g8b8 => I::Bgra8Unorm,
         B::A16b16g16r16 => I::Rgba16Unorm,
         B::Signedr16g16b16a16 => I::Rgba16Snorm,
         B::Abgrfp16 => I::Rgba16Float,

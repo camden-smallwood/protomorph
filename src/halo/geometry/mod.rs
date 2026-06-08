@@ -1,13 +1,15 @@
-pub mod geometry_constants;
 pub mod geometry_sampling;
-pub mod lightprobe;
-pub mod render_geometry;
-pub mod triangle_strip_utilities;
 
-use crate::halo::animations::AnimationData;
 use crate::halo::render_methods::materials::MaterialData;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
+
+/// Maximum per-object node (bone) count — sizes the GPU
+/// `node_matrices` storage buffer (one `Mat4` slot per node). Mirrors
+/// the engine's fixed `MAXIMUM_NODES_PER_MODEL`. Relocated here from
+/// the (now-deleted) animations module since it's purely a geometry/GPU
+/// buffer-sizing constant.
+pub const MAXIMUM_NUMBER_OF_MODEL_NODES: usize = 256;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -235,6 +237,7 @@ pub(crate) fn pack_weights_unorm8(weights: [f32; 4]) -> [u8; 4] {
 }
 
 /// Decompose a 4×4 transform into (scale, rotation, translation).
+#[allow(dead_code)]
 pub(crate) fn decompose_transform(m: &Mat4) -> (Vec3, Quat, Vec3) {
     let (scale, rotation, translation) = m.to_scale_rotation_translation();
     (scale, rotation, translation)
@@ -253,6 +256,13 @@ pub struct ModelMeshPart {
     /// 0=opaque_not_drawn, 1=opaque_shadow_only, 2=opaque_shadow_casting,
     /// 3=opaque_non_shadowing, 4=transparent, 5=lightmap_only.
     pub part_type: i8,
+    /// Model-space transparent sort centroid — `RenderMeshPart.sort_position
+    /// .position` (the part's authored `SortingPosition`). `None` for parts
+    /// with no authored sort position (opaque / `transparent_sorting_index<0`).
+    /// The transparent dispatch transforms this by the part's world matrix and
+    /// derives `z_sort` (camera distance) for the back-to-front sort — engine
+    /// `c_transparency_renderer::add_element`.
+    pub sort_centroid: Option<[f32; 3]>,
 }
 
 pub struct ModelMesh {
@@ -272,33 +282,32 @@ pub struct ModelMesh {
     /// `_vertex_buffer_usage_vert_color` stream consumed by
     /// `_entry_point_vertex_color_lighting` (idx=14).
     pub vert_color_stream: Vec<[f32; 3]>,
-}
-
-pub struct ModelNode {
-    pub name: String,
-    pub parent_index: i32,
-    pub first_child_index: i32,
-    pub next_sibling_index: i32,
-    pub offset_matrix: Mat4,
-    pub default_transform: Mat4,
-    /// Cached decomposition of default_transform: (scale, rotation, translation)
-    pub default_decomposed: (Vec3, Quat, Vec3),
-}
-
-pub struct ModelMarker {
-    pub name: String,
-    pub node_index: i32,
-    pub position: Vec3,
-    pub rotation: Vec3,
+    /// `MeshFlags::UseRegionIndexForSorting` (`mesh->flags & 2`). When set,
+    /// transparent parts of this mesh sort by `region_index` (constant
+    /// `global_origin3d` centroid + `region*0.1` offset) per engine
+    /// `submit_object_mesh_parts`, so co-located transparent layers (waterfall
+    /// liquid/sheet/mist) hold a fixed composite order under camera motion.
+    pub use_region_index_for_sorting: bool,
+    /// The render-model region this mesh belongs to (the engine's
+    /// `region_index` sort key). Assigned during `select_meshes`.
+    pub region_index: u8,
 }
 
 pub struct ModelData {
     pub materials: Vec<MaterialData>,
+    /// GPU mesh data (`ModelVertex` format).
     pub meshes: Vec<ModelMesh>,
-    pub nodes: Vec<ModelNode>,
-    pub markers: Vec<ModelMarker>,
-    pub animations: Vec<AnimationData>,
-    pub root_inverse_transform: Mat4,
+    /// Object-local node-**world** bind-pose matrices (one per node).
+    /// Precomputed at load from `render_model.nodes` (parent chain of
+    /// `default_transform`s). The renderer uploads these as the
+    /// per-object `node_matrices` (`model_u × node × vertex`). Static
+    /// per model until the real animation system lands.
+    pub node_local_matrices: Vec<Mat4>,
+    /// Marker name → object-local marker **world** matrix
+    /// (`node_world[marker.node] × marker.local`). The attach point for
+    /// parented children (engine
+    /// `internal_object_get_markers_by_string_id`).
+    pub marker_transforms: Vec<(String, Mat4)>,
     /// Authored model-space bounding sphere `(center.xyz, radius)`,
     /// pulled from the object tag's `bounding offset` + `bounding
     /// radius` fields (or the .model's `model object data[0]` as
@@ -327,29 +336,16 @@ pub struct ModelData {
 }
 
 impl ModelData {
-    pub fn find_animation_by_name(&self, name: &str) -> Option<usize> {
-        self.animations.iter().position(|a| a.name == name)
-    }
-
-    pub fn add_child_node(&mut self, parent_index: i32, node: ModelNode) -> usize {
-        let new_index = self.nodes.len();
-        self.nodes.push(node);
-        self.nodes[new_index].parent_index = parent_index;
-        self.nodes[new_index].first_child_index = -1;
-        self.nodes[new_index].next_sibling_index = -1;
-
-        if parent_index >= 0 {
-            let parent = parent_index as usize;
-            if self.nodes[parent].first_child_index == -1 {
-                self.nodes[parent].first_child_index = new_index as i32;
-            } else {
-                let mut sibling = self.nodes[parent].first_child_index as usize;
-                while self.nodes[sibling].next_sibling_index != -1 {
-                    sibling = self.nodes[sibling].next_sibling_index as usize;
-                }
-                self.nodes[sibling].next_sibling_index = new_index as i32;
-            }
-        }
-        new_index
+    /// Object-local world matrix of a named marker (precomputed at load
+    /// into `marker_transforms`). Compose with the object's world matrix
+    /// to get the marker's world transform — the attach point for
+    /// parented children (engine
+    /// `internal_object_get_markers_by_string_id`). `None` if no marker
+    /// matches `name`.
+    pub fn marker_transform(&self, name: &str) -> Option<Mat4> {
+        self.marker_transforms
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, m)| *m)
     }
 }

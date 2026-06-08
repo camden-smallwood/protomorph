@@ -182,6 +182,17 @@ fn convert_rgb_to_xyy(rgb: blam_tags::math::RealRgbColor) -> ColorXyY {
     }
 }
 
+/// Scenario-sky sun pulled from `get_sun_constants_from_sky @ 0x1803ADCB0`
+/// (sky model's `lightgen_lights[last]`). Threaded into the non-override
+/// branch of [`get_sun_parameters`]. `intensity` is linear RGB already
+/// scaled by `solid_angle × 0.2 × g_render_light_intensity` in the loader;
+/// `direction` is the z-up unit vector read verbatim from the lightgen light.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SkySun {
+    pub intensity: [f32; 3],
+    pub direction: [f32; 3],
+}
+
 /// `c_atmosphere_fog_interface::get_sun_parameters @ 0x1803AF990` —
 /// verbatim port of the `flags & 2` ("Override Real Sun Values") branch.
 /// Writes `sun_intensity` (linear RGB) and `sun_direction` (z-up unit
@@ -192,10 +203,10 @@ fn convert_rgb_to_xyy(rgb: blam_tags::math::RealRgbColor) -> ColorXyY {
 #[allow(non_snake_case)]
 pub(crate) fn get_sun_parameters(
     parameters: &blam_tags::sky_atmosphere::AtmosphereSettings,
-    sky_sun: Option<[f32; 3]>,
+    sky_sun: Option<SkySun>,
 ) -> ([f32; 3], [f32; 3]) {
-    const FLAG_OVERRIDE_REAL_SUN: u16 = 0x0002;
-    if (parameters.flags & FLAG_OVERRIDE_REAL_SUN) != 0 {
+    use blam_tags::sky_atmosphere::AtmosphereFlags;
+    if parameters.flags.contains(AtmosphereFlags::OverrideRealSunValues) {
         // override_color = parameters->m_dominant_light_color;
         let override_color = parameters.color;
         // convert_RGB_to_xyY(&override_color, &temp);
@@ -230,23 +241,27 @@ pub(crate) fn get_sun_parameters(
         ];
         (sun_intensity, sun_direction)
     } else {
-        // Engine's `get_sun_constants_from_sky @ 0x1803ADCB0` reads the
-        // active scenario sky's `lightgen_lights[last]` (offline-baked).
-        // Until that path lands, callers supply `sky_sun` from outside.
-        let intensity = sky_sun.unwrap_or([0.0, 0.0, 0.0]);
-        // Direction in the non-override branch comes from sky's
-        // lightgen too; we don't have that yet, so reuse the setting's
-        // pitch/heading as a stand-in.
-        let phi_rad   = (0.0055555557_f32 * parameters.sun_heading) * std::f32::consts::PI;
-        let theta_rad = (0.0055555557_f32 * parameters.sun_pitch)   * std::f32::consts::PI;
-        let v12 = phi_rad.cos();
-        let v13 = phi_rad.sin();
-        let sun_direction = [
-            v12 * theta_rad.sin(),
-            v13 * theta_rad.sin(),
-            theta_rad.cos(),
-        ];
-        (intensity, sun_direction)
+        // Engine `get_sun_constants_from_sky @ 0x1803ADCB0` (non-override
+        // branch): both intensity and direction come from the sky model's
+        // `lightgen_lights[last]` — intensity already folded as
+        // `×solid_angle ×0.2 ×g_render_light_intensity` in the loader,
+        // direction read verbatim. When the sky has no lightgen lights the
+        // engine defaults to a white sun pointing straight down
+        // (`sun_intensity=(1,1,1)`, `*sun_direction=global_down3d=(0,0,-1)`).
+        match sky_sun {
+            Some(s) => (s.intensity, s.direction),
+            None => {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[atmosphere] sky has no lightgen lights — using engine default \
+                         white sun pointing down (warned once)",
+                    );
+                }
+                ([1.0, 1.0, 1.0], [0.0, 0.0, -1.0])
+            }
+        }
     }
 }
 
@@ -266,7 +281,7 @@ impl GpuAtmosphereData {
     pub fn from_sky_atmosphere_with_exposure(
         atm: &blam_tags::sky_atmosphere::SkyAtmosphere,
         view_exposure: f32,
-        sky_sun: Option<[f32; 3]>,
+        sky_sun: Option<SkySun>,
     ) -> Self {
         match atm.primary_setting() {
             None => Self::neutral(),
@@ -327,7 +342,7 @@ impl GpuAtmosphereData {
     pub fn from_atmosphere_setting(
         s: &blam_tags::sky_atmosphere::AtmosphereSettings,
         view_exposure: f32,
-        sky_sun: Option<[f32; 3]>,
+        sky_sun: Option<SkySun>,
     ) -> Self {
         let ((beta_m, beta_p), (beta_m_angular, beta_p_angular)) =
             precompute_betas(s.rayleigh_multiplier, s.mie_multiplier, s.desaturation);

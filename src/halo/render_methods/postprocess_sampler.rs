@@ -131,21 +131,19 @@ fn lookup_texture_transform(
         // dual-return-value semantics differently — see the call site.
         return [1.0, 1.0, 0.0, 0.0];
     }
-    entry
-        .real_constants
-        .get(pp_tex.xform_constant_index as usize)
-        .copied()
-        .unwrap_or([1.0, 1.0, 0.0, 0.0])
+    // Negative index already returned identity above; a non-negative index
+    // past `real_constants` is a real routing bug → fail loud.
+    entry.real_constants[pp_tex.xform_constant_index as usize]
 }
 
 fn inline_format_to_bitmap_format(fmt: InlinePixelFormat) -> Option<BitmapFormat> {
     use BitmapFormat as B;
     use InlinePixelFormat as I;
     Some(match fmt {
-        I::Bc1RgbaUnormSrgb | I::Bc1RgbaUnorm => B::Dxt1,
-        I::Bc2RgbaUnormSrgb | I::Bc2RgbaUnorm => B::Dxt3,
-        I::Bc3RgbaUnormSrgb | I::Bc3RgbaUnorm => B::Dxt5,
-        I::Bgra8UnormSrgb | I::Bgra8Unorm => B::A8r8g8b8,
+        I::Bc1RgbaUnorm => B::Dxt1,
+        I::Bc2RgbaUnorm => B::Dxt3,
+        I::Bc3RgbaUnorm => B::Dxt5,
+        I::Bgra8Unorm => B::A8r8g8b8,
         _ => return None,
     })
 }

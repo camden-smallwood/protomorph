@@ -74,6 +74,31 @@ pub fn part_type_to_flags(part_type: i8) -> u32 {
     }
 }
 
+/// Transform a model-space transparent sort plane `(i, j, k, d)` to world
+/// by the instance matrix — engine `matrix4x3_transform_plane` inside
+/// `c_structure_renderer::submit_visibility @ 0x18068E860`. Returns `None`
+/// for a degenerate (zero-normal / unauthored) plane so the element falls
+/// back to point-only sorting. Assumes a rigid + uniform-scale matrix
+/// (instance placements are scale × orthonormal-basis + translation): the
+/// world normal is the rotated unit normal, and `d` is recomputed through
+/// the transformed closest-point-to-origin (`n·d`).
+fn transform_sort_plane(m: &glam::Mat4, sort_plane: Option<[f32; 4]>) -> Option<[f32; 4]> {
+    let p = sort_plane?;
+    let n = glam::Vec3::new(p[0], p[1], p[2]);
+    let nl = n.length();
+    if nl <= 1e-6 {
+        return None;
+    }
+    let n_unit = n / nl;
+    let p_on = n_unit * (p[3] / nl);
+    let n_world = m.transform_vector3(n_unit).normalize_or_zero();
+    if n_world == glam::Vec3::ZERO {
+        return None;
+    }
+    let p_world = m.transform_point3(p_on);
+    Some([n_world.x, n_world.y, n_world.z, n_world.dot(p_world)])
+}
+
 /// `s_render_cluster_part` (Ares `render_structure.h:56`, 12 bytes).
 #[derive(Debug, Clone, Copy)]
 pub struct RenderClusterPart {
@@ -207,6 +232,24 @@ impl StructureRenderer {
             true
         };
 
+        // Transparent submission is NOT view-frustum culled — engine-faithful.
+        // `c_structure_renderer::submit_visibility @ 0x18068E860` walks the
+        // PVS-visible `c_visible_items` and submits EVERY transparent part with
+        // no frustum test, letting the rasterizer clip + the depth test reject
+        // anything behind opaque geometry. A bounding-sphere-vs-frustum test
+        // (camera-DIRECTION dependent) instead pops transparents (glass,
+        // waterfalls) in/out as the sphere center crosses a frustum plane even
+        // while geometry is still on screen. So: transparent parts always
+        // submit; OPAQUE parts stay frustum-culled (`in_frustum`) for perf.
+        // (Until the PVS walker is trusted enough to also bound transparents by
+        // visible-cluster set, every transparent BSP part map-wide is submitted;
+        // depth handles occlusion. Watch the 1024-element pool cap on very large
+        // maps — switch to `submit_visibility_from_items` when PVS is reliable.)
+        // DIAGNOSTIC (PROTOMORPH_SKIP_SHADER=substr): drop transparent parts
+        // whose shader path contains the substring, to isolate which shader is
+        // producing a visible artifact (e.g. =glass_activation).
+        let skip_shader = std::env::var("PROTOMORPH_SKIP_SHADER").ok();
+
         self.cluster_parts.clear();
         self.instance_parts.clear();
         transparency.reset();
@@ -221,13 +264,13 @@ impl StructureRenderer {
                     if mesh_idx < 0 {
                         continue;
                     }
-                    if let Some(bounds) = cluster_bounds_for_bsp
+                    // Opaque parts cull on this; transparent parts ignore it
+                    // (always submitted — see policy note above). We can't skip
+                    // the whole cluster on `!in_frustum` anymore: an off-frustum
+                    // cluster may still carry transparent parts we must submit.
+                    let in_frustum = cluster_bounds_for_bsp
                         .and_then(|b| b.get(cluster_idx))
-                    {
-                        if !sphere_in_frustum(bounds.0, bounds.1) {
-                            continue;
-                        }
-                    }
+                        .map_or(true, |bounds| sphere_in_frustum(bounds.0, bounds.1));
                     let mesh_idx = mesh_idx as usize;
                     let Some(mesh) = bsp.meshes.get(mesh_idx) else { continue };
                     if mesh.parts.is_empty() {
@@ -246,10 +289,26 @@ impl StructureRenderer {
                             part_type_to_flags(part.part_type)
                         };
                         if mat.is_transparent {
+                            // BSP geometry is world-space (identity), so the
+                            // part's authored sort centroid + plane ARE world —
+                            // pass straight through. Submitted UNCONDITIONALLY
+                            // (no frustum gate) per engine `submit_visibility`.
+                            if std::env::var("PROTOMORPH_DIAG_SORT_PLANE").is_ok() {
+                                let n = part.sort_plane.map(|p| {
+                                    (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt()
+                                });
+                                eprintln!(
+                                    "[sortplane] cluster bsp{bsp_index} c{cluster_idx} m{mesh_idx} p{part_idx} \
+                                     radius={:.4} |n|={:?} plane={:?}",
+                                    part.sort_radius, n, part.sort_plane,
+                                );
+                            }
                             transparency.add_element(
-                                [0.0, 0.0, 0.0],
+                                part.sort_centroid.unwrap_or([0.0, 0.0, 0.0]),
+                                part.sort_plane,
+                                part.sort_radius,
                                 0.0,
-                                TransparentSortLayer::Normal,
+                                mat.sort_layer,
                                 TransparentDispatch::BspClusterPart {
                                     bsp_index,
                                     cluster_index: cluster_idx as u16,
@@ -257,6 +316,10 @@ impl StructureRenderer {
                                     part_index: part_idx as u16,
                                 },
                             );
+                            continue;
+                        }
+                        // Opaque parts: never drawn when off-screen.
+                        if !in_frustum {
                             continue;
                         }
                         self.cluster_parts.push(RenderClusterPart {
@@ -281,17 +344,12 @@ impl StructureRenderer {
                     continue;
                 }
                 // Per-instance frustum cull — tag-precomputed
-                // world_bounding_sphere from BspInstance. Mirrors
-                // engine's cluster cull pattern (we don't have
-                // engine's PVS / portal chain yet so frustum is
-                // the safe minimum).
-                if let Some(bounds) = instance_bounds_for_bsp
+                // world_bounding_sphere from BspInstance. Gates OPAQUE instance
+                // parts only; transparent parts always submit (engine-faithful,
+                // see policy note above), so we can't skip the whole instance.
+                let in_frustum = instance_bounds_for_bsp
                     .and_then(|b| b.get(inst_idx))
-                {
-                    if !sphere_in_frustum(bounds.0, bounds.1) {
-                        continue;
-                    }
-                }
+                    .map_or(true, |bounds| sphere_in_frustum(bounds.0, bounds.1));
                 let Some(def) = bsp.definitions.get(def_i as usize) else { continue };
                 if def.mesh_index < 0 {
                     continue;
@@ -309,17 +367,61 @@ impl StructureRenderer {
                         part_type_to_flags(part.part_type)
                     };
                     if mat.is_transparent {
-                        transparency.add_element(
-                            [0.0, 0.0, 0.0],
-                            0.0,
-                            TransparentSortLayer::Normal,
-                            TransparentDispatch::BspInstancePart {
-                                bsp_index,
-                                structure_instance_index: inst_idx as u16,
-                                mesh_index: mesh_idx as u16,
-                                part_index: part_idx as u16,
-                            },
-                        );
+                        // Instance parts are placed by the instance matrix; use
+                        // the instance's world bounding-sphere center as the
+                        // sort centroid (per-instance back-to-front). Submitted
+                        // UNCONDITIONALLY (no frustum gate) per engine
+                        // `submit_visibility`; PROTOMORPH_SKIP_SHADER still
+                        // isolates a specific shader for diagnostics.
+                        let skip = skip_shader
+                            .as_deref()
+                            .is_some_and(|s| mat.shader_name.contains(s));
+                        if !skip {
+                            if std::env::var("PROTOMORPH_DIAG_SORT_PLANE").is_ok() {
+                                let n = part.sort_plane.map(|p| {
+                                    (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt()
+                                });
+                                eprintln!(
+                                    "[sortplane] instance bsp{bsp_index} i{inst_idx} m{mesh_idx} p{part_idx} \
+                                     radius={:.4} |n|={:?} plane={:?} shader={}",
+                                    part.sort_radius, n, part.sort_plane, mat.shader_name,
+                                );
+                            }
+                            let inst_center = instance_bounds_for_bsp
+                                .and_then(|b| b.get(inst_idx))
+                                .map(|b| [b.0.x, b.0.y, b.0.z])
+                                .unwrap_or([0.0, 0.0, 0.0]);
+                            // Instance geometry is placed by the instance
+                            // matrix, so the authored (model-space) sort plane
+                            // + centroid must be transformed to world — engine
+                            // `matrix4x3_transform_plane` / `_transform_point`
+                            // in `submit_visibility @ 0x18068E860`.
+                            let m = &inst.world_matrix;
+                            let world_centroid = part
+                                .sort_centroid
+                                .map(|c| {
+                                    m.transform_point3(glam::Vec3::from(c)).to_array()
+                                })
+                                .unwrap_or(inst_center);
+                            let world_plane = transform_sort_plane(m, part.sort_plane);
+                            transparency.add_element(
+                                world_centroid,
+                                world_plane,
+                                part.sort_radius,
+                                0.0,
+                                mat.sort_layer,
+                                TransparentDispatch::BspInstancePart {
+                                    bsp_index,
+                                    structure_instance_index: inst_idx as u16,
+                                    mesh_index: mesh_idx as u16,
+                                    part_index: part_idx as u16,
+                                },
+                            );
+                        }
+                        continue;
+                    }
+                    // Opaque parts: never drawn when off-screen.
+                    if !in_frustum {
                         continue;
                     }
                     self.instance_parts.push(RenderInstancePart {
@@ -389,10 +491,13 @@ impl StructureRenderer {
                     part_type_to_flags(part.part_type)
                 };
                 if mat.is_transparent {
+                    // Cluster geometry is world-space — plane passes through.
                     transparency.add_element(
-                        [0.0, 0.0, 0.0],
+                        part.sort_centroid.unwrap_or([0.0, 0.0, 0.0]),
+                        part.sort_plane,
+                        part.sort_radius,
                         0.0,
-                        TransparentSortLayer::Normal,
+                        mat.sort_layer,
                         TransparentDispatch::BspClusterPart {
                             bsp_index: bsp_index as u8,
                             cluster_index: cluster_index as u16,
@@ -443,10 +548,25 @@ impl StructureRenderer {
                     part_type_to_flags(part.part_type)
                 };
                 if mat.is_transparent {
+                    let inst_center = self
+                        .bsp_instance_bounds
+                        .get(bsp_index as usize)
+                        .and_then(|b| b.get(inst_idx))
+                        .map(|b| [b.0.x, b.0.y, b.0.z])
+                        .unwrap_or([0.0, 0.0, 0.0]);
+                    // Transform the authored model-space sort plane +
+                    // centroid to world by the instance matrix.
+                    let world_centroid = part
+                        .sort_centroid
+                        .map(|c| inst.world_matrix.transform_point3(glam::Vec3::from(c)).to_array())
+                        .unwrap_or(inst_center);
+                    let world_plane = transform_sort_plane(&inst.world_matrix, part.sort_plane);
                     transparency.add_element(
-                        [0.0, 0.0, 0.0],
+                        world_centroid,
+                        world_plane,
+                        part.sort_radius,
                         0.0,
-                        TransparentSortLayer::Normal,
+                        mat.sort_layer,
                         TransparentDispatch::BspInstancePart {
                             bsp_index: bsp_index as u8,
                             structure_instance_index: inst_idx as u16,
@@ -541,6 +661,9 @@ impl StructureRenderer {
             camera_bg,
             &[
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                // atmosphere @ binding 2 — BSP uses the cluster default
+                // (per-material overrides are sky/object-side for now).
+                crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                 crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                 // dominant_light @ binding 13 shares the same slot
                 // cursor as the ravi cbuffer at binding 1.
@@ -641,12 +764,17 @@ impl StructureRenderer {
         // `c_dynamic_cubemap_sample::search_for_cubemap_sample_in_cluster`
         // result. Fall back to slot 0 if the BSP has no atlas (length-1
         // bind group vec; the rasg default cube is bound).
-        let probe_idx = bsp
-            .cluster_to_probe
-            .get(part.cluster_index as usize)
-            .copied()
-            .unwrap_or(0) as usize;
-        let bind_group = bind_groups.get(probe_idx).or_else(|| bind_groups.first());
+        // Empty `cluster_to_probe` = this BSP has no cubemap atlas, so
+        // `bind_groups` is the length-1 rasg-default-cube vec → bind slot 0.
+        // A *populated* table with an OOB cluster index (or a probe index
+        // past the atlas) is a real bug → fail loud rather than silently
+        // binding the wrong/default cube.
+        let bind_group = if bsp.cluster_to_probe.is_empty() {
+            bind_groups.first()
+        } else {
+            let probe_idx = bsp.cluster_to_probe[part.cluster_index as usize] as usize;
+            Some(&bind_groups[probe_idx])
+        };
         let Some(bind_group) = bind_group else { return };
 
         // Per-cluster simple_lights offset — engine: each cluster gets
@@ -654,11 +782,11 @@ impl StructureRenderer {
         // scenario load and stable across camera motion. Slot 0 =
         // empty (no lights). Falls back to default if per-cluster
         // bake hasn't run yet.
-        let simple_lights_offset = bsp
-            .cluster_simple_lights_offsets
-            .get(part.cluster_index as usize)
-            .copied()
-            .unwrap_or(crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET);
+        // Always sized `vec![0; cluster_count]` (0 == SIMPLE_LIGHTS_DEFAULT_OFFSET),
+        // so an in-range cluster yields the same value as before; an OOB cluster
+        // index is a real bug → fail loud instead of silently binding no lights.
+        let simple_lights_offset =
+            bsp.cluster_simple_lights_offsets[part.cluster_index as usize];
 
         // Always bind here (covers both `use_sh = true` overriding the
         // SH probe slot AND the simple_lights per-cluster slot, even
@@ -680,9 +808,14 @@ impl StructureRenderer {
         rpass.set_bind_group(
             0,
             camera_bg,
-            // 3rd entry = dominant_light @ binding 13; shares the same
-            // slot cursor as the ravi cbuffer at binding 1.
-            &[lighting_offset, simple_lights_offset, lighting_offset],
+            // [1]=atmosphere @ binding 2 (BSP cluster default); last entry =
+            // dominant_light @ binding 13; shares the ravi cbuffer cursor.
+            &[
+                lighting_offset,
+                crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
+                simple_lights_offset,
+                lighting_offset,
+            ],
         );
 
         rpass.set_pipeline(&artifacts.pipeline);
@@ -788,11 +921,10 @@ impl StructureRenderer {
         //   set_object_dominant_light_direction_and_intensity(...)
         // happen inside `select_instance_entry_point`; here we just
         // pick the dynamic offset.
-        let lighting_offset = bsp
-            .instance_lighting_offsets
-            .get(inst_part.structure_instance_index as usize)
-            .copied()
-            .unwrap_or(0);
+        // `instance_lighting_offsets` is sized to the instance count, so an
+        // OOB instance index is a real bug → fail loud (was a silent `0`).
+        let lighting_offset =
+            bsp.instance_lighting_offsets[inst_part.structure_instance_index as usize];
         // Per-instance simple_lights — instances live in some cluster;
         // we route them through that cluster's per-cluster slot. v1
         // uses the default empty slot for instances; per-instance
@@ -806,6 +938,8 @@ impl StructureRenderer {
             camera_bg,
             &[
                 lighting_offset,
+                // atmosphere @ binding 2 — BSP cluster default.
+                crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                 crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                 // dominant_light @ binding 13 mirrors `lighting_offset`.
                 lighting_offset,

@@ -603,12 +603,19 @@ fn classify_bitmap_param(
     }
 }
 
-/// Linear-decode hint per Halo parameter name. Bump/normal data is
-/// authored as Bc5 SNORM and must NOT be sRGB-decoded; everything
-/// else is sRGB-decoded color data.
-pub fn is_linear_param_name(name: &str) -> bool {
+/// Sampling intent per Halo parameter name. Bump/normal data is authored
+/// as Bc5 SNORM (linear) and must NOT be sRGB-decoded → `ForceLinear`;
+/// every other param follows the bitmap's authored curve (`FollowCurve`).
+/// The bump override is a safety net for the rare mis-tagged bump map whose
+/// curve says gamma.
+pub fn sample_intent_for_param(name: &str) -> crate::halo::render::SampleIntent {
+    use crate::halo::render::SampleIntent;
     let n = name.to_ascii_lowercase();
-    n.starts_with("bump_") || n.contains("_bump_") || n.ends_with("_bump")
+    if n.starts_with("bump_") || n.contains("_bump_") || n.ends_with("_bump") {
+        SampleIntent::ForceLinear
+    } else {
+        SampleIntent::FollowCurve
+    }
 }
 
 /// Pick a fallback texture view per parameter name when the material
@@ -635,6 +642,12 @@ pub fn fallback_view_for_param(
         shared.fallback_textures.default_normal_view.clone()
     } else if n.starts_with("self_illum") || n == "change_color_map" {
         shared.fallback_textures.black_view.clone()
+    } else if n.contains("detail") {
+        // Unbound detail maps are multiplied by DETAIL_MULTIPLIER
+        // (4.59479) in the albedo combine — white (1.0) blows albedo
+        // 5-7× too bright. Use the engine's detail-neutral default
+        // (~0.218 linear = 1/DETAIL_MULTIPLIER); see `default_detail`.
+        shared.fallback_textures.detail_view.clone()
     } else {
         shared.fallback_textures.white_view.clone()
     }

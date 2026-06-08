@@ -21,7 +21,7 @@ use wgpu::util::DeviceExt;
 use crate::halo::decal::writer::RasterizerVertexWorld;
 use crate::halo::render::shared::SharedResources;
 use crate::halo::render_methods::material_bindings::{
-    fallback_view_for_param, is_linear_param_name,
+    fallback_view_for_param, sample_intent_for_param,
 };
 use crate::halo::render_methods::materials::{InlineTexture, MaterialData};
 use crate::halo::render_methods::pipeline_cache::{
@@ -619,14 +619,21 @@ pub fn bake_decals_gpu(
         palette_lifespan_fades.push(lifespan_fade);
 
         // Pick the first definition's shader as the palette's rmd.
-        // The decal_system tag can carry multiple definitions for
-        // animated sprite atlases / variant sprites; v1 uses the first
-        // one. Engine `c_decal::render` picks the definition by
-        // `m_definition_block_index` — we mirror at the build_mesh
-        // stage when we attach the definition index to each decal.
+        // The decal_system tag can carry multiple definitions, and the
+        // engine `c_decal::render` selects one per decal by
+        // `m_definition_block_index`. But that index is a RUNTIME
+        // impact-decal concern (bullet holes / blood variants chosen at
+        // spawn time) — PREPLACED scenario decals (the only kind we
+        // render) carry no per-placement definition selector
+        // (`DecalPlacement` has only `palette_index`) and default to
+        // definition 0. The orchestrator likewise builds geometry from
+        // the first definition's projection params, so geometry + shader
+        // stay consistent. Using `.first()` is therefore correct for
+        // preplaced decals; per-definition routing only becomes relevant
+        // if/when runtime impact decals are modeled.
         let candidate = entry.as_ref()
             .and_then(|sys| sys.definitions.first())
-            .and_then(|def| def.shader.as_ref().map(|rm| (def.pass, def.flags, rm)));
+            .and_then(|def| def.shader.as_ref().map(|rm| (def.pass.get(), def.flags, rm)));
         let Some((pass, def_flags, rm)) = candidate else {
             empty_palettes += 1;
             per_palette.push(None);
@@ -692,9 +699,9 @@ pub fn bake_decals_gpu(
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            let sys_flags = entry.as_ref().map(|sys| sys.flags).unwrap_or(0);
+            let sys_flags = entry.as_ref().map(|sys| sys.flags.clone()).unwrap_or_default();
             eprintln!(
-                "[decal-palette {i}] '{pal_name}' def_flags=0x{def_flags:x} sys_flags=0x{sys_flags:x} pass={pass:?} \
+                "[decal-palette {i}] '{pal_name}' def_flags=0x{def_flags:x} sys_flags={sys_flags:?} pass={pass:?} \
                  choices=[{choice_str}] textures=[{tex_str}]"
             );
         }
@@ -865,7 +872,7 @@ fn build_decal_material_bind_group(
         Vec::with_capacity(artifacts.bindings.textures.len());
     for tb in &artifacts.bindings.textures {
         let view = match material.find_texture_by_name(&tb.name) {
-            Some(tex) => upload_inline_texture(shared, tex, is_linear_param_name(&tb.name)),
+            Some(tex) => upload_inline_texture(shared, tex, sample_intent_for_param(&tb.name)),
             None => fallback_view_for_param(shared, &tb.name, tb.is_cube),
         };
         texture_views.push((tb.slot, view));
@@ -943,9 +950,10 @@ fn build_decal_material_bind_group(
 fn upload_inline_texture(
     shared: &SharedResources,
     tex: &InlineTexture,
-    linear: bool,
+    intent: crate::halo::render::SampleIntent,
 ) -> wgpu::TextureView {
-    let wgpu_format = crate::halo::render::inline_to_wgpu_format(tex.format, linear);
+    let wgpu_format =
+        crate::halo::render::resolve_wgpu_format(tex.format, tex.encoding, intent);
     // BC formats require block-aligned (multiple of 4) create extents.
     // See `feedback_wgpu_bc_mip_alignment.md` — mirrors the same fix in
     // `Renderer::upload_model_data` and `bsp_gpu::upload_inline_texture`.

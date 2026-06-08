@@ -15,6 +15,7 @@
 //! lightprobe SH coefficients into a shader cbuffer slot so any
 //! material can sample them as the ambient SH backdrop.
 
+use crate::halo::geometry::MAXIMUM_NUMBER_OF_MODEL_NODES;
 use crate::halo::structures::clusters::ClusterReference;
 use crate::halo::geometry::{ModelUniforms, ModelVertex, SkyVertColorVertex};
 use crate::halo::render::shared::SharedResources;
@@ -118,12 +119,13 @@ impl SkyGpu {
             }],
         });
 
-        // Node matrices buffer — sky models always have 1 node (the
-        // root); even multi-node skies (rare) get one identity bone
-        // matrix that doesn't move with the camera, so the static
-        // identity content is correct for the entire pass lifetime.
-        // Allocate node_matrices_stride bytes so the bind group's
-        // dynamic_offset=true expectation is satisfied.
+        // Node matrices buffer — initialized to identity at slot 0, then
+        // overwritten at scenario load by `upload_node_matrices` with the
+        // sky model's real per-node world bind pose (the authored node
+        // orientation — e.g. bunkerworld's ~103° yaw). Identity here is
+        // just the pre-load placeholder. Allocate node_matrices_stride
+        // bytes so the bind group's dynamic_offset=true expectation is
+        // satisfied.
         let nm_zeros: Vec<u8> = vec![0u8; shared.node_matrices_stride];
         let mut nm_init = nm_zeros;
         // Identity 4x4 at slot 0.
@@ -278,20 +280,46 @@ impl SkyGpu {
         }
     }
 
-    /// Sky model matrix is identity. Engine-faithful for MCC: dllcache
-    /// strips `render_sky_modify_node_matrices @ 0x1806e5b50` to `return 1;`
-    /// and `render_object_adjust_skinning_for_sky @ 0x180696d40` has zero
-    /// callers. Sky meshes render at authored world coords; the per-frame
-    /// camera-translation parallax-lock that Reach's `c_object_renderer
-    /// ::adjust_sky_object_position @ 0x82741570` did is dead code in MCC.
+    /// Upload the sky model's per-node WORLD matrices into slot[i] of
+    /// `node_matrices_buffer`. The sky shader reads `Nodes[0]` directly
+    /// (`entry_sky_dome_simple.wgsl::default_vs` mirrors the HLSL
+    /// `transform_point(vPos, Nodes[0])`), and the static_sh/albedo
+    /// workaround path indexes `node_matrices[vertex.node_indices.x]` —
+    /// both need the real node transforms, not identity.
     ///
-    /// Earlier protomorph commits attempted parallax-lock to fix
-    /// "trees moving weirdly when camera moves"; the actual cause was a
-    /// duplicate-render bug (sky drawn both via `render_list` and via
-    /// `submit_and_render_sky`). With the duplicate gone, identity is
-    /// engine-correct — sky stays put in world space as the camera moves.
-    pub fn update_model_matrix(&self, _queue: &wgpu::Queue, _camera_position: Vec3) {
-        // Identity is initialized in `new`; no per-frame upload needed.
+    /// **Why this matters (engine-faithfulness):** in MCC, dllcache strips
+    /// the camera-relative `render_sky_modify_node_matrices @ 0x1806e5b50`
+    /// to `return 1;` (no-op) and `render_object_adjust_skinning_for_sky @
+    /// 0x180696d40` has zero callers — so the sky does NOT parallax-lock to
+    /// the camera. But it is NOT rendered at identity either: the sky object
+    /// goes through the normal `object_compute_node_matrices_non_recursive @
+    /// 0x1807e39a0` path, which sets `Nodes[i] = origin_matrix ×
+    /// node_orientations[i]`. `node_orientations` comes from the render_model's
+    /// `default_node_orientations` block — which tool.exe BAKES at cache-build
+    /// from `nodes[i].default_translation/rotation` (it's empty in the loose
+    /// source tag, so `model_get_node_orientations @ 0x1804e7fc0` would copy
+    /// from null at runtime). The sky object's origin is identity (spawned at
+    /// the world origin), so `Nodes[i]` reduces to the node's world bind pose.
+    ///
+    /// Protomorph reads loose tags → must reconstruct that bind pose from the
+    /// node hierarchy (`render_model::convert_nodes` already does the same to
+    /// build `offset_matrix`). bunkerworld's sky has ONE node with a ~103° yaw
+    /// + small translate; binding identity drew the whole sky (dome + distant
+    /// backdrop, vertices out to ±7565) rotated/offset into the playable space
+    /// ("giant tilted slabs"). With the real node matrix it lands where MCC
+    /// puts it.
+    ///
+    /// Caps at `MAXIMUM_NUMBER_OF_MODEL_NODES`; extra matrices are ignored
+    /// (the buffer is one object slot wide). Single-node skies — the common
+    /// case — only touch slot 0.
+    pub fn upload_node_matrices(&self, queue: &wgpu::Queue, world_matrices: &[Mat4]) {
+        let n = world_matrices.len().min(MAXIMUM_NUMBER_OF_MODEL_NODES);
+        let mut bytes = vec![0u8; n * 64];
+        for (i, m) in world_matrices.iter().take(n).enumerate() {
+            let cols = m.to_cols_array();
+            bytes[i * 64..(i + 1) * 64].copy_from_slice(bytemuck::cast_slice(&cols));
+        }
+        queue.write_buffer(&self.node_matrices_buffer, 0, &bytes);
     }
 }
 

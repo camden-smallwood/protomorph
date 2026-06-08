@@ -2367,6 +2367,11 @@ pub mod lights_distant_lighting_flags {
 pub fn lights_distant_lighting_at_point_new(
     flags: u8,
     object_class: u8,
+    // `s_object_data.flags` — the runtime object DATUM's flags word, not
+    // the tag's `object_definition_flags` (the IDA decompile mislabels the
+    // local `obj_def`, but it reads the live datum). Bit 2 (`& 4`) =
+    // damaged-biped state. Engine-internal runtime state with no tag-schema
+    // names, so it stays a raw integer.
     object_def_flags: u32,
     object_radius: f32,
     up: RealVector3d,
@@ -2415,6 +2420,8 @@ pub fn lights_distant_lighting_at_point_new(
         // n6 = object class, v23/v24 = class predicates.
         let n6 = object_class;
         let v23 = n6 == 6 || n6 == 0;
+        // Runtime "damaged biped" datum bit (engine `& 4`); only consulted
+        // for live bipeds (object class 0).
         let v24 = n6 == 0 && (object_def_flags & 4) != 0;
 
         // Engine lines 152-162:

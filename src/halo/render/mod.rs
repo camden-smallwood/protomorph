@@ -38,12 +38,12 @@ pub mod views;
 
 use crate::game::GameState;
 use glam::Vec3;
-use crate::halo::animations::MAXIMUM_NUMBER_OF_MODEL_NODES;
+use crate::halo::geometry::MAXIMUM_NUMBER_OF_MODEL_NODES;
 use crate::halo::camera::CameraUniforms;
 use crate::halo::geometry::{ModelData, ModelMeshPart, ModelUniforms, SkyVertColorVertex};
 use crate::halo::objects::ObjectIndex;
 use crate::halo::render::env_probe_pass::GpuSkyParams;
-use crate::halo::render_methods::material_bindings::{fallback_view_for_param, is_linear_param_name};
+use crate::halo::render_methods::material_bindings::{fallback_view_for_param, sample_intent_for_param};
 use crate::halo::render_methods::HaloEntryPoint;
 use crate::halo::render_methods::materials::{InlinePixelFormat, MaterialData, MaterialTextureUsage};
 use crate::halo::render_methods::pipeline_cache::{
@@ -57,51 +57,110 @@ use winit::window::Window;
 
 use shared::*;
 
-/// Map our format-agnostic [`InlinePixelFormat`] to a wgpu format.
-/// `linear` strips the sRGB curve from variants that have one — used
-/// for normal/specular/opacity maps that the shader expects in linear
-/// space regardless of how the bitmap was authored.
-pub(crate) fn inline_to_wgpu_format(fmt: InlinePixelFormat, linear: bool) -> wgpu::TextureFormat {
+/// Caller's sampling intent for a bitmap upload — combined with the
+/// texture's [`TexelEncoding`] to pick the final wgpu format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleIntent {
+    /// Sample per the bitmap's authored curve (the common, correct case):
+    /// gamma-encoded data gets an sRGB view, linear data a linear view.
+    FollowCurve,
+    /// Override to linear regardless of curve — ONLY for values that are
+    /// physical/packed, not display color (BRDF LUTs, normal maps, masks,
+    /// noise/warp). The hard-override hatch.
+    ForceLinear,
+}
+
+/// Map our layout-only [`InlinePixelFormat`] to a wgpu format, choosing
+/// sRGB-vs-linear from the data's [`TexelEncoding`] and the call site's
+/// [`SampleIntent`] — the single place that decision is made.
+///
+/// `want_srgb` is true ONLY when the caller follows the curve AND the data
+/// is gamma-encoded. `ForceLinear` (BRDF LUTs / normals / masks) and
+/// already-linear data both yield a linear view. The prior design baked
+/// srgb-ness into the format variant and let an upload-time bool override
+/// it; folding both into this one function makes the two facts impossible
+/// to desync — and authored-linear data stays linear, so the shrine
+/// `stone_edge_dif` ~3× darkening regression (2026-05-17) can't recur.
+pub(crate) fn resolve_wgpu_format(
+    fmt: InlinePixelFormat,
+    encoding: crate::halo::render_methods::materials::TexelEncoding,
+    intent: SampleIntent,
+) -> wgpu::TextureFormat {
+    use crate::halo::render_methods::materials::TexelEncoding;
     use InlinePixelFormat as F;
     use wgpu::TextureFormat as W;
-    // `linear=true` is a HARD OVERRIDE — caller has out-of-band knowledge
-    // that the data must be sampled in linear space regardless of how it
-    // was authored (normal maps, masks, packed data). For `linear=false`
-    // we respect the authored curve as already encoded into the
-    // `InlinePixelFormat` variant: `*UnormSrgb` says the bitmap loader
-    // saw `BitmapCurve::XrgbGamma2`, `*Unorm` says it saw Linear /
-    // Gamma2 / Srgb / Unknown / OffsetLog. The prior collapse that
-    // mapped `*Unorm + linear=false` to `*UnormSrgb` force-applied sRGB
-    // decoding to authored-linear data and darkened decal bitmaps ~3×
-    // (shrine stone_edge_dif visible-bug symptom 2026-05-17).
-    match (fmt, linear) {
-        (F::Bc1RgbaUnormSrgb, false) => W::Bc1RgbaUnormSrgb,
-        (F::Bc1RgbaUnorm,     false) => W::Bc1RgbaUnorm,
-        (F::Bc1RgbaUnormSrgb, true)  | (F::Bc1RgbaUnorm, true)  => W::Bc1RgbaUnorm,
-        (F::Bc2RgbaUnormSrgb, false) => W::Bc2RgbaUnormSrgb,
-        (F::Bc2RgbaUnorm,     false) => W::Bc2RgbaUnorm,
-        (F::Bc2RgbaUnormSrgb, true)  | (F::Bc2RgbaUnorm, true)  => W::Bc2RgbaUnorm,
-        (F::Bc3RgbaUnormSrgb, false) => W::Bc3RgbaUnormSrgb,
-        (F::Bc3RgbaUnorm,     false) => W::Bc3RgbaUnorm,
-        (F::Bc3RgbaUnormSrgb, true)  | (F::Bc3RgbaUnorm, true)  => W::Bc3RgbaUnorm,
-        (F::Bc4RUnorm, _)           => W::Bc4RUnorm,
-        (F::Bc4RSnorm, _)           => W::Bc4RSnorm,
-        (F::Bc5RgUnorm, _)          => W::Bc5RgUnorm,
-        (F::Bc5RgSnorm, _)          => W::Bc5RgSnorm,
-        (F::Rgba8UnormSrgb, false) => W::Rgba8UnormSrgb,
-        (F::Rgba8Unorm,     false) => W::Rgba8Unorm,
-        (F::Rgba8UnormSrgb, true)  | (F::Rgba8Unorm, true)  => W::Rgba8Unorm,
-        (F::Rgba8Snorm, _)          => W::Rgba8Snorm,
-        (F::Bgra8UnormSrgb, false) => W::Bgra8UnormSrgb,
-        (F::Bgra8Unorm,     false) => W::Bgra8Unorm,
-        (F::Bgra8UnormSrgb, true)  | (F::Bgra8Unorm, true)  => W::Bgra8Unorm,
-        (F::Rg8Unorm, _)            => W::Rg8Unorm,
-        (F::Rg8Snorm, _)            => W::Rg8Snorm,
-        (F::R8Unorm, _)             => W::R8Unorm,
-        (F::Rgba16Float, _)         => W::Rgba16Float,
-        (F::Rgba16Unorm, _)         => W::Rgba16Unorm,
-        (F::Rgba16Snorm, _)         => W::Rgba16Snorm,
-        (F::Rgba32Float, _)         => W::Rgba32Float,
+    let want_srgb = matches!(intent, SampleIntent::FollowCurve)
+        && matches!(encoding, TexelEncoding::Gamma);
+    match fmt {
+        F::Bc1RgbaUnorm => if want_srgb { W::Bc1RgbaUnormSrgb } else { W::Bc1RgbaUnorm },
+        F::Bc2RgbaUnorm => if want_srgb { W::Bc2RgbaUnormSrgb } else { W::Bc2RgbaUnorm },
+        F::Bc3RgbaUnorm => if want_srgb { W::Bc3RgbaUnormSrgb } else { W::Bc3RgbaUnorm },
+        F::Bc4RUnorm    => W::Bc4RUnorm,
+        F::Bc4RSnorm    => W::Bc4RSnorm,
+        F::Bc5RgUnorm   => W::Bc5RgUnorm,
+        F::Bc5RgSnorm   => W::Bc5RgSnorm,
+        F::Rgba8Unorm   => if want_srgb { W::Rgba8UnormSrgb } else { W::Rgba8Unorm },
+        F::Rgba8Snorm   => W::Rgba8Snorm,
+        F::Bgra8Unorm   => if want_srgb { W::Bgra8UnormSrgb } else { W::Bgra8Unorm },
+        F::Rg8Unorm     => W::Rg8Unorm,
+        F::Rg8Snorm     => W::Rg8Snorm,
+        F::R8Unorm      => W::R8Unorm,
+        F::Rgba16Float  => W::Rgba16Float,
+        F::Rgba16Unorm  => W::Rgba16Unorm,
+        F::Rgba16Snorm  => W::Rgba16Snorm,
+        F::Rgba32Float  => W::Rgba32Float,
+    }
+}
+
+#[cfg(test)]
+mod resolve_wgpu_format_tests {
+    use super::resolve_wgpu_format;
+    use super::SampleIntent::{FollowCurve, ForceLinear};
+    use crate::halo::render_methods::materials::InlinePixelFormat as F;
+    use crate::halo::render_methods::materials::TexelEncoding::{Gamma, Linear};
+    use wgpu::TextureFormat as W;
+
+    /// The three rules the old `(fmt, linear)` table encoded, now a pure
+    /// function of (encoding, intent). Gamma+FollowCurve → sRGB; everything
+    /// else → the linear (Unorm) view.
+    #[test]
+    fn srgb_capable_families_follow_curve_and_intent() {
+        let cases = [
+            (F::Bc1RgbaUnorm, W::Bc1RgbaUnormSrgb, W::Bc1RgbaUnorm),
+            (F::Bc2RgbaUnorm, W::Bc2RgbaUnormSrgb, W::Bc2RgbaUnorm),
+            (F::Bc3RgbaUnorm, W::Bc3RgbaUnormSrgb, W::Bc3RgbaUnorm),
+            (F::Rgba8Unorm,   W::Rgba8UnormSrgb,   W::Rgba8Unorm),
+            (F::Bgra8Unorm,   W::Bgra8UnormSrgb,   W::Bgra8Unorm),
+        ];
+        for (raw, srgb, unorm) in cases {
+            assert_eq!(resolve_wgpu_format(raw, Gamma, FollowCurve), srgb, "gamma+follow → sRGB");
+            assert_eq!(resolve_wgpu_format(raw, Linear, FollowCurve), unorm, "linear+follow → unorm");
+            assert_eq!(resolve_wgpu_format(raw, Gamma, ForceLinear), unorm, "force-linear overrides gamma");
+            assert_eq!(resolve_wgpu_format(raw, Linear, ForceLinear), unorm, "force-linear");
+        }
+    }
+
+    /// Non-sRGB-capable layouts ignore encoding + intent entirely.
+    #[test]
+    fn non_srgb_formats_are_invariant() {
+        let cases = [
+            (F::Bc4RUnorm, W::Bc4RUnorm),
+            (F::Bc4RSnorm, W::Bc4RSnorm),
+            (F::Bc5RgUnorm, W::Bc5RgUnorm),
+            (F::Bc5RgSnorm, W::Bc5RgSnorm),
+            (F::Rgba8Snorm, W::Rgba8Snorm),
+            (F::Rg8Unorm, W::Rg8Unorm),
+            (F::R8Unorm, W::R8Unorm),
+            (F::Rgba16Float, W::Rgba16Float),
+            (F::Rgba32Float, W::Rgba32Float),
+        ];
+        for (raw, want) in cases {
+            for enc in [Gamma, Linear] {
+                for intent in [FollowCurve, ForceLinear] {
+                    assert_eq!(resolve_wgpu_format(raw, enc, intent), want);
+                }
+            }
+        }
     }
 }
 
@@ -140,6 +199,12 @@ pub(crate) struct GpuMesh {
     /// `_vertex_buffer_usage_vert_color` stream consumed by
     /// `_entry_point_vertex_color_lighting` (idx=14, sky shader path).
     pub vert_color_buffer: Option<wgpu::Buffer>,
+    /// `MeshFlags::UseRegionIndexForSorting` — transparent parts sort by
+    /// `region_index` (constant centroid + region offset), keeping co-located
+    /// transparent layers in fixed composite order. See `ModelMesh`.
+    pub use_region_index_for_sorting: bool,
+    /// Region this mesh belongs to (engine `region_index` sort key).
+    pub region_index: u8,
 }
 
 pub(crate) struct GpuMaterial {
@@ -164,6 +229,15 @@ pub(crate) struct GpuMaterial {
     pub artifacts_prt_ambient: Option<Rc<VariantArtifacts>>,
     /// Bind group for `artifacts_prt_ambient`.
     pub bind_group_prt_ambient: Option<wgpu::BindGroup>,
+    /// Pipeline for `_entry_point_vertex_color_lighting`
+    /// (`static_per_vertex_color_ps`) — the diffuse term is the per-vertex
+    /// baked `vert_color` (slot 1) instead of the SH probe. Compiled only
+    /// for materials on a model that carries a vert_color stream (sky
+    /// `.render_model` meshes). Drawn by `submit_and_render_sky` /
+    /// `SkyMeshPart` when the mesh has a `vert_color_buffer`.
+    pub artifacts_vertex_color: Option<Rc<VariantArtifacts>>,
+    /// Bind group for `artifacts_vertex_color`.
+    pub bind_group_vertex_color: Option<wgpu::BindGroup>,
     /// Pipeline for the rmd-on-object `_entry_point_default` variant —
     /// engine `c_object_renderer::render_albedo_decals @ 0x1806E4A60`
     /// dispatches these through a skinned-VS port of `decal_fx::default_ps`
@@ -212,6 +286,22 @@ pub(crate) struct GpuMaterial {
     /// the gate, an rmtr cluster with atlas coverage would sample
     /// per-pixel SH instead of the SH-cbuffer path the engine uses.
     pub group_tag: u32,
+    /// Byte-offset into `shared.atmosphere_buffer`'s per-frame table that
+    /// THIS material's draws bind at `camera_bgl` binding 2 (dynamic
+    /// offset). Resolved once at load from the source render_method's
+    /// `flags` + `custom_fog_setting_index` via `shared::atmosphere_offset_for`
+    /// — engine `render_method_submit_volatile_per_shader`'s per-shader
+    /// atmosphere override (`UseCustomSetting` → setting[idx], `DontFogMe`
+    /// → disabled, else → cluster default). Almost always the default (0);
+    /// sky backdrop materials resolve to their custom setting (e.g.
+    /// construct's `fog_waterfall`).
+    pub atmosphere_offset: u32,
+    /// Transparent draw-order bucket — the render_method's authored
+    /// `sort layer` (`GlobalSortLayer`) mapped to the runtime
+    /// `TransparentSortLayer`. Primary key of the back-to-front transparent
+    /// sort (engine `transparent_layer_and_z_sort_proc`). `Normal` for
+    /// opaque/stub materials.
+    pub sort_layer: crate::halo::render::render_transparents::TransparentSortLayer,
 }
 
 pub(crate) struct GpuModel {
@@ -246,6 +336,16 @@ pub(crate) struct GpuModel {
     /// model has `casts_shadow == false` — most static scenery on a
     /// typical map (`lightmap_shadow_mode == default` + `type == scenery`).
     pub casts_shadow: bool,
+    /// Spec bind-pose: object-local node-world matrices (precomputed at
+    /// load into `ModelData::node_local_matrices`). The renderer uploads
+    /// these as the per-object `node_matrices` (`model_u × node ×
+    /// vertex`). Static per model until the real animation system makes
+    /// them per-instance.
+    pub node_local_matrices: Vec<glam::Mat4>,
+    /// The model's markers (name → object-local marker world matrix).
+    /// Used to attach parented objects to a marker on this model (engine
+    /// `object_attach_to_marker`).
+    pub marker_transforms: Vec<(String, glam::Mat4)>,
 }
 
 impl GpuModel {
@@ -402,7 +502,7 @@ pub struct Renderer {
     /// Sky sun (`get_sun_constants_from_sky @ 0x1803adcb0`) — engine's
     /// fallback when the picked atmosphere setting's bit-1 ("Override
     /// Real Sun Values") is unset.
-    scenario_sky_sun: Option<[f32; 3]>,
+    scenario_sky_sun: Option<env_probe_pass::SkySun>,
     /// Active scenario's camera_fx_settings tag — drives bloom,
     /// color grading, SSAO, lightshafts via `ScreenPostprocess`.
     /// `None` until a scenario is loaded.
@@ -892,6 +992,36 @@ impl Renderer {
     /// inheriting `obje`) by walking the object → model → render_model
     /// chain. Materials are resolved through `halo::load_shader_material`
     /// → the blam-tags `render_method` walker.
+    /// Object-local world matrix of `marker` on the sky scenery model
+    /// (`node_world × marker.local`). The sky object is at the world origin,
+    /// so this is also the marker's world matrix. For parent-marker
+    /// attachment of sky-parented placements. `None` if there's no sky or no
+    /// such marker.
+    pub(crate) fn sky_marker_transform(&self, marker: &str) -> Option<glam::Mat4> {
+        self.sky_model
+            .as_ref()?
+            .marker_transforms
+            .iter()
+            .find(|(n, _)| n.as_str() == marker)
+            .map(|(_, m)| *m)
+    }
+
+    /// Object-local world matrix of `marker` on the model at `model_index`
+    /// (`node_world × marker.local`). Compose with the object's world matrix
+    /// for the marker's world pose. `None` if the model/marker is missing.
+    pub(crate) fn model_marker_transform(
+        &self,
+        model_index: usize,
+        marker: &str,
+    ) -> Option<glam::Mat4> {
+        self.models
+            .get(model_index)?
+            .marker_transforms
+            .iter()
+            .find(|(n, _)| n.as_str() == marker)
+            .map(|(_, m)| *m)
+    }
+
     pub fn load_object_tag(&mut self, path: &std::path::Path) -> (usize, ModelData) {
         let model = crate::halo::loader::load_object(path)
             .unwrap_or_else(|e| panic!("failed to load Halo object {}: {e}", path.display()));
@@ -1035,11 +1165,11 @@ impl Renderer {
                 Some(cg) if cg.is_enabled() => {
                     eprintln!(
                         "[scenario]   color grading: ENABLED (bc={:?} hslv={:?} colorize={:?} sel={:?} cb={:?})",
-                        cg.brightness_contrast.as_ref().filter(|b| b.flags != 0).map(|b| (b.brightness, b.contrast)),
-                        cg.hslv.as_ref().filter(|h| h.flags != 0).map(|h| (h.hue_offset_deg, h.saturation_offset, h.vibrance, h.lightness_offset)),
-                        cg.colorize.as_ref().filter(|c| c.flags != 0).map(|c| (c.blendfactor, c.target_hue_deg)),
-                        cg.selective_color.as_ref().filter(|s| s.flags != 0).map(|s| s.flags),
-                        cg.color_balance.as_ref().filter(|c| c.flags != 0).map(|c| c.flags),
+                        cg.brightness_contrast.as_ref().filter(|b| b.flags.contains(blam_tags::camera_fx_settings::CameraFxEnableFlags::Enable)).map(|b| (b.brightness, b.contrast)),
+                        cg.hslv.as_ref().filter(|h| h.flags.contains(blam_tags::camera_fx_settings::CameraFxEnableFlags::Enable)).map(|h| (h.hue_offset_deg, h.saturation_offset, h.vibrance, h.lightness_offset)),
+                        cg.colorize.as_ref().filter(|c| c.flags.contains(blam_tags::camera_fx_settings::CameraFxEnableFlags::Enable)).map(|c| (c.blendfactor, c.target_hue_deg)),
+                        cg.selective_color.as_ref().filter(|s| s.flags.contains(blam_tags::camera_fx_settings::CameraFxEnableFlags::Enable)).map(|s| s.flags.names()),
+                        cg.color_balance.as_ref().filter(|c| c.flags.contains(blam_tags::camera_fx_settings::CameraFxEnableFlags::Enable)).map(|c| c.flags.names()),
                     );
                 }
                 Some(_) => eprintln!("[scenario]   color grading: present but disabled (identity LUT)"),
@@ -1057,7 +1187,13 @@ impl Renderer {
         // instead of sky's `lightgen[last].intensity × solid_angle ×
         // 0.2`), which washed every distant pixel toward white.
         let sky_sun = loaded.sky_lighting.as_ref().and_then(|s| {
-            s.lightgen_sun_intensity.map(|v| [v.i, v.j, v.k])
+            match (s.lightgen_sun_intensity, s.lightgen_sun_direction) {
+                (Some(i), Some(d)) => Some(env_probe_pass::SkySun {
+                    intensity: [i.i, i.j, i.k],
+                    direction: [d.i, d.j, d.k],
+                }),
+                _ => None,
+            }
         });
         self.scenario_atmosphere = loaded.atmosphere.as_ref()
             .map(|atm| env_probe_pass::GpuAtmosphereData::from_sky_atmosphere_with_exposure(atm, view_exposure, sky_sun))
@@ -1098,12 +1234,12 @@ impl Renderer {
         self.scenario_sky_sun = sky_sun;
         if let Some(sun) = sky_sun {
             eprintln!(
-                "[atmosphere] sky lightgen sun (sky_lights[last] × solid_angle × 0.2): {:?}",
-                sun,
+                "[atmosphere] sky lightgen sun (sky_lights[last]): intensity {:?} dir {:?}",
+                sun.intensity, sun.direction,
             );
         } else {
             eprintln!(
-                "[atmosphere] sky lightgen sun: <none> — falling back to atmosphere color×intensity",
+                "[atmosphere] sky lightgen sun: <none> — engine default white-down sun",
             );
         }
         if let Some(atm) = loaded.atmosphere.as_ref() {
@@ -1113,8 +1249,9 @@ impl Renderer {
                 let beta_m  = [snap.slot2_beta_m_log2e_g1[0]/log2e, snap.slot2_beta_m_log2e_g1[1]/log2e, snap.slot2_beta_m_log2e_g1[2]/log2e];
                 let beta_p  = [snap.slot3_beta_p_log2e_refh[0]/log2e, snap.slot3_beta_p_log2e_refh[1]/log2e, snap.slot3_beta_p_log2e_refh[2]/log2e];
                 eprintln!(
-                    "[atm[{}] {}] flags=0x{:04x} enabled={} override_real_sun={} ray_mult={} mie_mult={} desat={} max_thick={} dist_bias={} sea={} ray_h={} mie_h={}",
-                    i, s.name, s.flags, s.is_enabled(), (s.flags & 0x0002) != 0,
+                    "[atm[{}] {}] flags={:?} enabled={} override_real_sun={} ray_mult={} mie_mult={} desat={} max_thick={} dist_bias={} sea={} ray_h={} mie_h={}",
+                    i, s.name, s.flags.get(), s.is_enabled(),
+                    s.flags.contains(blam_tags::sky_atmosphere::AtmosphereFlags::OverrideRealSunValues),
                     s.rayleigh_multiplier, s.mie_multiplier, s.desaturation,
                     s.max_fog_thickness, s.distance_bias, s.sea_level, s.rayleigh_height_scale, s.mie_height_scale,
                 );
@@ -1564,7 +1701,7 @@ impl Renderer {
         // dim/black" — distinguishes default-branch-hits-dim-atlas vs
         // airprobe-fallback vs sky-fallback.
         let probe_for_diag = std::env::var("PROTOMORPH_DIAG_OL4_PATH").ok();
-        let probe_for = |pos: glam::Vec3, radius: f32, obj_def_flags: u16, diag_label: &str| -> Option<blam_tags::scenario_lightmap::DequantizedLightmapProbe> {
+        let probe_for = |pos: glam::Vec3, radius: f32, obj_def_flags: blam_tags::Flags<blam_tags::object::ObjectDefinitionFlags, u16>, diag_label: &str| -> Option<blam_tags::scenario_lightmap::DequantizedLightmapProbe> {
             let log = probe_for_diag.as_deref() == Some(diag_label) || probe_for_diag.as_deref() == Some("all");
             // Engine-faithful per-tag dispatch of
             // `lights_prepare_for_object_static_new @ 0x1808A2930`:
@@ -1598,9 +1735,9 @@ impl Renderer {
             // [[feedback_ol4_dispatch_blocked_by_bit13]].
             if log {
                 eprintln!(
-                    "[diag-ol4] {diag_label} pos=({:.3},{:.3},{:.3}) radius={radius:.4} obj_def_flags=0x{obj_def_flags:04x} (bit1={})",
+                    "[diag-ol4] {diag_label} pos=({:.3},{:.3},{:.3}) radius={radius:.4} obj_def_flags={obj_def_flags:?} (searches_lightmaps_on_failure={})",
                     pos.x, pos.y, pos.z,
-                    obj_def_flags & blam_tags::object::OBJ_FLAG_SEARCHES_LIGHTMAPS_ON_FAILURE != 0,
+                    obj_def_flags.contains(blam_tags::object::ObjectDefinitionFlags::SearchCardinalDirectionLightmapsOnFailure),
                 );
                 eprintln!(
                     "[diag-ol4]   raycast_ready={raycast_ready} bake_resources.len()={}",
@@ -1617,8 +1754,8 @@ impl Renderer {
                     use crate::halo::math::globals::GLOBAL_UP_3D;
                     use blam_tags::math::RealPoint3d;
 
-                    let use_sideways =
-                        obj_def_flags & blam_tags::object::OBJ_FLAG_SEARCHES_LIGHTMAPS_ON_FAILURE != 0;
+                    let use_sideways = obj_def_flags
+                        .contains(blam_tags::object::ObjectDefinitionFlags::SearchCardinalDirectionLightmapsOnFailure);
                     let flags = if use_sideways { lights_distant_lighting_flags::SIDEWAYS } else { 0 };
                     if log {
                         if use_sideways {
@@ -1637,11 +1774,14 @@ impl Renderer {
                     // and `up` from object_header_data + object_get_orientation. For
                     // statically-placed scenery at scenario load we lack an object
                     // index; pass a sentinel class (255) that falls into the
-                    // 1-ray default branch, world-up, and tag-side def_flags.
+                    // 1-ray default branch, world-up. The runtime datum
+                    // `object_def_flags` is unavailable here, and its only branch
+                    // (damaged biped) is gated on object class 0, so 0 is exact
+                    // under the sentinel class.
                     let outcome = lights_distant_lighting_at_point_new(
                         flags,
                         /*object_class*/ 255,
-                        /*object_def_flags*/ obj_def_flags as u32,
+                        /*object_def_flags*/ 0,
                         /*object_radius*/ radius,
                         /*up*/ GLOBAL_UP_3D,
                         /*ignore_object_index*/ -1,
@@ -1718,7 +1858,7 @@ impl Renderer {
         // header table). Inline the mapping here rather than wiring a
         // `From` impl across module boundaries.
         let scenario_ref = &loaded.scenario;
-        let obj_meta_for = |object_type: ObjectType, i: u32| -> (f32, u16) {
+        let obj_meta_for = |object_type: ObjectType, i: u32| -> (f32, blam_tags::Flags<blam_tags::object::ObjectDefinitionFlags, u16>) {
             use crate::halo::objects::object_type::ObjectType as OT;
             let header_type = match object_type {
                 ObjectType::Biped         => OT::Biped,
@@ -1858,7 +1998,7 @@ impl Renderer {
                         scenario_ref, header_type, i as u32,
                     );
                     let f = crate::halo::objects::object_header_data::object_definition_flags(obj_idx);
-                    if f & blam_tags::object::OBJ_FLAG_SEARCHES_LIGHTMAPS_ON_FAILURE != 0 {
+                    if f.contains(blam_tags::object::ObjectDefinitionFlags::SearchCardinalDirectionLightmapsOnFailure) {
                         *side += 1;
                     } else {
                         *deft += 1;
@@ -2165,9 +2305,38 @@ impl Renderer {
             }
         };
         eprintln!(
-            "[sky] loaded render_model: {} meshes, {} materials",
-            model.meshes.len(), model.materials.len(),
+            "[sky] loaded render_model: {} meshes, {} materials, {} nodes",
+            model.meshes.len(), model.materials.len(), model.node_local_matrices.len(),
         );
+
+        // `node_local_matrices` already IS the per-node WORLD bind pose
+        // (composed from the parent-relative `default_transform` chain at
+        // load time — see `loader::convert`). Hand it straight to the sky
+        // pass. The sky shader reads `Nodes[0]` (and the static_sh fallback
+        // indexes by the vertex node) — without this the sky draws at
+        // identity, ignoring the authored node orientation (e.g.
+        // bunkerworld's 103° yaw). Engine-faithful: `SkyGpu::upload_node_matrices`.
+        let world_matrices: Vec<glam::Mat4> = model.node_local_matrices.clone();
+        self.sky_gpu.upload_node_matrices(&self.shared.queue, &world_matrices);
+
+        // TEMP DIAG: dump node 0 matrix + per-mesh WORLD-space AABB so we can
+        // see where the sky meshes actually land vs authored.
+        if std::env::var("PROTOMORPH_DIAG_SKY").is_ok() {
+            eprintln!("[sky-diag] node0 world matrix (cols): {:?}", world_matrices.get(0).map(|m| m.to_cols_array()));
+            for (mi, mesh) in model.meshes.iter().enumerate() {
+                let nm = world_matrices.get(0).copied().unwrap_or(glam::Mat4::IDENTITY);
+                let mut mn = glam::Vec3::splat(f32::INFINITY);
+                let mut mx = glam::Vec3::splat(f32::NEG_INFINITY);
+                for v in &mesh.vertices {
+                    let p = nm.transform_point3(glam::Vec3::from_array(v.position));
+                    mn = mn.min(p); mx = mx.max(p);
+                }
+                let mat = mesh.parts.get(0).map(|p| p.material_index).unwrap_or(0);
+                eprintln!("[sky-diag] mesh[{mi:2}] mat={mat} world_bbox=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}]",
+                    mn.x, mn.y, mn.z, mx.x, mx.y, mx.z);
+            }
+        }
+
         // Borrow self mutably-then-immutably — temporarily move the
         // models pool out, upload (which appends to it), then take
         // the freshly-uploaded entry off the end + restore the pool.
@@ -2357,12 +2526,16 @@ impl Renderer {
             &mut self.structure_renderer.next_probe_slot,
             cubemap_routing.as_ref(),
         );
-        // Phase A6a — load the BSP's first rmw material into the
-        // WaterRenderer (env_cubemap + reflection / fresnel coefficients).
-        // Riverworld has 1 rmw material; Phase A4b will move this into
-        // a per-rmw-material cache when multi-material levels arrive.
-        if let Some(water_mat) = bsp_gpu.water_material_data.as_ref() {
-            self.water_renderer.load_water_material(&self.shared, water_mat);
+        // Load EVERY rmw material on this BSP into the WaterRenderer's
+        // per-material slot cache (env_cubemap + reflection/fresnel +
+        // wave/foam/global_shape textures + variant pipeline). The draw
+        // loop selects per water part by `material_index`. docks has two
+        // (dock_water_1 / dock_water_2); rendering both is what gives its
+        // harbor the right wave scale + foam (the old single-material
+        // path forced every surface onto the first material).
+        if !bsp_gpu.water_materials.is_empty() {
+            self.water_renderer
+                .load_water_materials(&self.shared, &bsp_gpu.water_materials);
         }
         let cluster_meshes = bsp.sbsp.clusters.iter().map(|c| c.mesh_index).collect();
         // Pre-bake per-cluster bounding spheres for frustum culling in
@@ -2484,14 +2657,22 @@ impl Renderer {
         let mut animated_materials: Vec<
             crate::halo::render_methods::animated::AnimatedMaterial,
         > = Vec::new();
+        // Compile the `_entry_point_vertex_color_lighting` variant only
+        // when this model carries a per-vertex baked color stream — i.e.
+        // sky `.render_model`s. Regular objects have no vc-bit meshes, so
+        // gating here avoids compiling a dead pipeline for every object
+        // material. Engine routes vc-bit sky meshes through this entry
+        // point (`render_mesh_part_default @ 0x18069EBC0:64-82`).
+        let model_has_vert_color =
+            model.meshes.iter().any(|m| !m.vert_color_stream.is_empty());
         let materials: Vec<GpuMaterial> = model
             .materials
             .iter()
             .map(|mat| {
                 let upload_view = |tex: &crate::halo::render_methods::materials::InlineTexture,
-                                   linear: bool|
+                                   intent: SampleIntent|
                  -> wgpu::TextureView {
-                    let wgpu_format = inline_to_wgpu_format(tex.format, linear);
+                    let wgpu_format = resolve_wgpu_format(tex.format, tex.encoding, intent);
                     // BC formats need block-aligned (multiple of 4) extents
                     // at create_texture time. Halo authors bitmaps at the
                     // logical size (e.g. 474×474); the GPU allocation rounds
@@ -2647,6 +2828,23 @@ impl Renderer {
                 } else {
                     None
                 };
+                // Vertex-color lighting variant (sky meshes only). Same
+                // rmsh-family gate as PRT — the WGSL assembler emits the
+                // `entry_static_per_vertex_color.wgsl` body for these
+                // subclasses; others lack the `@location(12) vert_color`
+                // wiring.
+                let artifacts_vertex_color = if supports_prt && model_has_vert_color {
+                    Some(self.halo_pipelines.ensure(
+                        &self.shared,
+                        &mat.resolved,
+                        &mat.cbuffer,
+                        choices,
+                        HaloEntryPoint::StaticVertexColor,
+                        &self.scenario_tags_root,
+                    ))
+                } else {
+                    None
+                };
 
                 // Build the per-variant bind group — one slot per
                 // bitmap parameter the rmop declares, looked up by
@@ -2655,7 +2853,7 @@ impl Renderer {
                     Vec::with_capacity(artifacts.bindings.textures.len());
                 for tb in &artifacts.bindings.textures {
                     let view = match mat.find_texture_by_name(&tb.name) {
-                        Some(tex) => upload_view(tex, is_linear_param_name(&tb.name)),
+                        Some(tex) => upload_view(tex, sample_intent_for_param(&tb.name)),
                         None => fallback_view_for_param(&self.shared, &tb.name, tb.is_cube),
                     };
                     texture_views.push((tb.slot, view));
@@ -2797,6 +2995,15 @@ impl Renderer {
                             entries: &entries,
                         })
                 });
+                let bind_group_vertex_color = artifacts_vertex_color.as_ref().map(|arts| {
+                    self.shared
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("material_bg_vertex_color"),
+                            layout: &arts.material_bgl,
+                            entries: &entries,
+                        })
+                });
 
                 // Classify transparency the same way BspGpu does
                 // (`classify_transparency` in bsp_gpu.rs): rmd/rmhg
@@ -2858,7 +3065,7 @@ impl Renderer {
                         Vec::with_capacity(arts.bindings.textures.len());
                     for tb in &arts.bindings.textures {
                         let view = match real_mat.find_texture_by_name(&tb.name) {
-                            Some(tex) => upload_view(tex, is_linear_param_name(&tb.name)),
+                            Some(tex) => upload_view(tex, sample_intent_for_param(&tb.name)),
                             None => fallback_view_for_param(&self.shared, &tb.name, tb.is_cube),
                         };
                         real_texture_views.push((tb.slot, view));
@@ -2981,6 +3188,8 @@ impl Renderer {
                     bind_group_albedo: Some(bind_group_albedo),
                     artifacts_prt_ambient,
                     bind_group_prt_ambient,
+                    artifacts_vertex_color,
+                    bind_group_vertex_color,
                     artifacts_decal_object,
                     bind_group_decal_object,
                     default_decal_constants_buffer,
@@ -2988,6 +3197,39 @@ impl Renderer {
                     is_transparent,
                     blend_mode: choices.get_or("blend_mode", "opaque").to_string(),
                     group_tag: mat.resolved.group_tag,
+                    // Per-shader atmosphere override (engine
+                    // `render_method_submit_volatile_per_shader`): resolve this
+                    // material's atmosphere-table offset from its render_method
+                    // flags + custom_fog_setting_index. Sky backdrop shaders set
+                    // `UseCustomSetting` + an index (construct → fog_waterfall);
+                    // sun rings set `DontFogMe`; everything else = default.
+                    atmosphere_offset: mat
+                        .render_method_source
+                        .as_ref()
+                        .map(|s| {
+                            use blam_tags::render_method::GlobalRenderMethodFlags as F;
+                            let mut bits = 0u16;
+                            if s.rmsh.flags.contains(F::DontFogMe) {
+                                bits |= 0x1;
+                            }
+                            if s.rmsh.flags.contains(F::UseCustomSetting) {
+                                bits |= 0x2;
+                            }
+                            crate::halo::render::shared::atmosphere_offset_for(
+                                bits,
+                                s.rmsh.custom_fog_setting_index,
+                            )
+                        })
+                        .unwrap_or(crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET),
+                    sort_layer: mat
+                        .render_method_source
+                        .as_ref()
+                        .map(|s| {
+                            crate::halo::render::render_transparents::TransparentSortLayer::from_global(
+                                s.rmsh.sort_layer.get(),
+                            )
+                        })
+                        .unwrap_or(crate::halo::render::render_transparents::TransparentSortLayer::Normal),
                 }
             })
             .collect();
@@ -3111,6 +3353,8 @@ impl Renderer {
                     parts: mesh.parts.clone(),
                     prt_ambient_buffer,
                     vert_color_buffer,
+                    use_region_index_for_sorting: mesh.use_region_index_for_sorting,
+                    region_index: mesh.region_index,
                 }
             })
             .collect();
@@ -3138,6 +3382,8 @@ impl Renderer {
             bounding_aabb_min,
             bounding_aabb_max,
             casts_shadow: model.casts_shadow,
+            node_local_matrices: model.node_local_matrices.clone(),
+            marker_transforms: model.marker_transforms.clone(),
         });
         index
     }
@@ -3442,7 +3688,7 @@ impl Renderer {
                 if palette_idx < 0 { return None; }
                 let entry = bsp.sbsp.camera_fx_palette.get(palette_idx as usize)?;
                 Some(crate::halo::render::camera_fx_settings::ClusterCameraFxPaletteOverrides {
-                    flags: entry.flags,
+                    flags: entry.flags.clone(),
                     forced_exposure: entry.forced_exposure,
                     forced_auto_exposure_brightness: entry.forced_auto_exposure_brightness,
                     exposure_min: entry.exposure_min,
@@ -3475,12 +3721,13 @@ impl Renderer {
                 ))
             });
             if let Some(o) = cluster_palette_overrides.as_ref() {
-                let bit0 = (o.flags & 0x01) != 0;
-                let bit1 = (o.flags & 0x02) != 0;
-                let bit2 = (o.flags & 0x04) != 0;
-                let bit3 = (o.flags & 0x08) != 0;
+                use blam_tags::structure_bsp::CameraFxPaletteFlags;
+                let force_exp = o.flags.contains(CameraFxPaletteFlags::ForceExposure);
+                let force_auto = o.flags.contains(CameraFxPaletteFlags::ForceAutoExposure);
+                let minmax = o.flags.contains(CameraFxPaletteFlags::OverrideExposureBounds);
+                let bloom = o.flags.contains(CameraFxPaletteFlags::OverrideInherentBloom);
                 eprintln!(
-                    "[exposure-cluster] flags=0x{:02x} (b0_forced_exp={bit0} b1_auto_b={bit1} b2_minmax={bit2} b3_bloom={bit3}) \
+                    "[exposure-cluster] flags={:?} (force_exp={force_exp} force_auto_b={force_auto} minmax={minmax} bloom={bloom}) \
                      forced_exp={:.3} forced_auto_b={:.3} min/max=[{:.3}, {:.3}] inherent={:.3} bloom={:.3}",
                     o.flags, o.forced_exposure, o.forced_auto_exposure_brightness,
                     o.exposure_min, o.exposure_max,
@@ -3659,11 +3906,10 @@ impl Renderer {
                 views.push(self.shared.fallback_textures.white_view.clone());
                 continue;
             };
-            // is_linear=true — these are pre-integrated BRDF LUTs, the
-            // values are physical reflectance / Schlick fresnel terms,
-            // not display-encoded color.
+            // Pre-integrated BRDF LUTs — physical reflectance / Schlick
+            // fresnel terms, not display-encoded color → force linear.
             let view = crate::halo::structures::bsp_gpu::upload_inline_texture(
-                &self.shared, &tex, true,
+                &self.shared, &tex, SampleIntent::ForceLinear,
             );
             views.push(view);
             loaded += 1;
@@ -3719,8 +3965,17 @@ impl Renderer {
                 views.push(placeholder);
                 continue;
             };
+            // Trust the authored curve for color/env defaults — notably
+            // `DefaultDynamicCubeMap` is RGBW gamma-encoded, so forcing it
+            // linear was the same over-bright bug as the scenario cube atlas.
+            // `DefaultVector` is a tangent-space normal → force linear.
+            let intent = if idx == DefaultBitmap::DefaultVector as usize {
+                SampleIntent::ForceLinear
+            } else {
+                SampleIntent::FollowCurve
+            };
             let view = crate::halo::structures::bsp_gpu::upload_inline_texture(
-                &self.shared, &tex, true,
+                &self.shared, &tex, intent,
             );
             views.push(view);
             loaded += 1;
@@ -3821,7 +4076,13 @@ fn build_bsp_cubemap_routing(
     let probe_views: Vec<wgpu::TextureView> = images
         .iter()
         .map(|tex| {
-            crate::halo::structures::bsp_gpu::upload_inline_texture(shared, tex, true)
+            // RGBW cube: DXT5 with the HDR multiplier in alpha and RGB
+            // gamma-encoded (bitmap curve = XrgbGamma2). Upload as sRGB so
+            // the sampler gamma-decodes RGB while leaving alpha (the W
+            // multiplier) linear — exactly the RGBW reconstruction the
+            // `× a × 256` shader path expects. (Was `true`/linear, which
+            // read the gamma RGB ~2-3× too bright and miscolored.)
+            crate::halo::structures::bsp_gpu::upload_inline_texture(shared, tex, SampleIntent::FollowCurve)
         })
         .collect();
     // Synthesize `cluster_to_probe[]` — engine

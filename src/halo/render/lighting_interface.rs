@@ -331,6 +331,14 @@ impl LightingInterface {
     /// so this is an analytical neutral analog: top-down sun + warm-white
     /// intensity + ambient-gray L0 + +z L1 lobe.
     pub fn fallback() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[lighting] LightingInterface::fallback() in use — no scenario sky chain \
+                 resolved; rendering with the neutral warm-white floor (warned once)",
+            );
+        }
         // Y_00 = 1/(2√π). SH[0] is the constant term — solid ambient.
         const Y00_INV: f32 = 3.5449078; // 2 * √π
         // Y_1,0 = √(3/(4π)) z. SH[2] is the z directional lobe.

@@ -45,6 +45,22 @@ pub enum TransparentSortLayer {
     Post = 3,
 }
 
+impl TransparentSortLayer {
+    /// Map the render_method's authored `GlobalSortLayer` to the runtime
+    /// transparent sort bucket. Discriminants match 1:1 (invalid=0,
+    /// pre[-pass]=1, normal=2, post[-pass]=3) — this is the engine's
+    /// `sort layer` → `e_transparent_sort_layer` carry. Defaults to
+    /// `Normal` for `Invalid` (the engine asserts non-invalid in `sort()`).
+    pub fn from_global(g: blam_tags::render_method::GlobalSortLayer) -> Self {
+        use blam_tags::render_method::GlobalSortLayer as G;
+        match g {
+            G::PrePass => TransparentSortLayer::Pre,
+            G::PostPass => TransparentSortLayer::Post,
+            G::Normal | G::Invalid => TransparentSortLayer::Normal,
+        }
+    }
+}
+
 /// `e_transparent_sort_method` (render_transparents.h:22-28). v1 uses
 /// only `PointQsort` — BSP and plane-qsort variants TBD with the full
 /// recursive sort.
@@ -108,23 +124,50 @@ pub enum TransparentDispatch {
 }
 
 /// `s_transparent_types` (render_transparents.h:32-44, 0xB0 bytes).
-/// We omit `anchor_points[9]` and `plane` for v1 — they're inputs to
-/// the recursive plane-qsort which we don't run yet. Halo also stores
-/// the sort_layer + z_sort + centroid + importance + the callback
-/// triple — we mirror those.
+/// We carry everything the engine sort consumes EXCEPT the 9
+/// `anchor_points`: those exist only to make the plane-vs-plane test
+/// (`plane_location_testing`) robust for near-coplanar planes, and for
+/// construct's discrete water/glass planes that test reduces to the
+/// `radius → 0` limit (a single centroid-vs-plane side test). We use the
+/// centroid test in [`TransparencyRenderer::sort`]; see that method.
 #[derive(Debug, Clone, Copy)]
 pub struct TransparentTypes {
-    /// Halo: `bool use_plane;` — false means point-only sort, true
-    /// means use the plane equation. Stays `false` until we port the
-    /// plane-qsort.
+    /// Halo: `bool use_plane;` — false means point-only sort, true means
+    /// this element participates in the stage-2 BSP plane sort. Engine
+    /// `add_element`: true iff a plane was supplied AND `radius > 1e-4`
+    /// AND `|plane.n| > 0.5`. Computed in `sort()` (we defer it there
+    /// with `z_sort`/`importance` since the camera is per-frame).
     pub use_plane: bool,
+    /// Camera-FACED plane (engine `add_element` flips the authored plane
+    /// so the camera sits on its positive side). Valid iff `use_plane`.
+    /// Computed in `sort()` from `raw_plane`.
+    pub plane: [f32; 4],
+    /// Authored sort plane `(i, j, k, d)` as registered (model→world
+    /// already applied by the caller). `None` when the part has no
+    /// authored sorting position. Feeds `use_plane` + `plane`.
+    pub raw_plane: Option<[f32; 4]>,
+    /// Authored sort-quad radius (`SortingPosition.radius`). Gates
+    /// `use_plane` and scales `importance`.
+    pub radius: f32,
     /// Halo: `float z_sort;` — view-space depth used as the primary
-    /// sort key WITHIN a layer.
+    /// sort key WITHIN a layer. Computed in `sort()` from `centroid`,
+    /// the camera, and `offset` (engine `add_element` stores it at
+    /// registration; we defer it to `sort()` since the camera is fixed
+    /// per frame and not every registration site has it).
     pub z_sort: f32,
+    /// Halo `add_element` `offset` param — SUBTRACTED from the
+    /// view-forward depth before comparison. `c_object_renderer::
+    /// add_transparent_mesh_part @ 0x1806E3EB0` passes
+    /// `region_index*0.1 (+100000 for sky)`; the +100000 is a constant
+    /// within the sky's own marker batch (cancels in comparison), the
+    /// `region*0.1` a per-region tiebreak. 0 for paths without a bias.
+    pub offset: f32,
     pub centroid: [f32; 3],
     pub sort_layer: TransparentSortLayer,
-    /// Halo: `float importance;` — controls debug overlay verbosity;
-    /// not used by sort math.
+    /// Halo: `float importance;` — engine `add_element` sets it to
+    /// `radius² · |plane.n · camera_forward| / dist(centroid, camera)`
+    /// for plane elements (0 for points). The stage-2 sort picks the
+    /// highest-importance plane in a sublist as the BSP splitter.
     pub importance: f32,
     /// What to dispatch when this element's turn comes up.
     pub dispatch: TransparentDispatch,
@@ -234,13 +277,19 @@ impl TransparencyRenderer {
     ///       render_callback, user_data, user_context, radius);
     /// Returns false if the static array is full.
     ///
-    /// v1: skips plane / offset / radius / importance — those feed
-    /// the recursive plane-qsort. Replace `render_callback` triple
-    /// with a `TransparentDispatch` enum.
+    /// `raw_plane` + `radius` are the authored sorting plane/radius
+    /// (already transformed to world by the caller for instances). They
+    /// feed the stage-2 BSP plane sort; `None`/`0.0` → point-only element
+    /// (`use_plane == false`). `use_plane`, the camera-faced `plane`,
+    /// `z_sort`, and `importance` are all resolved in [`Self::sort`]
+    /// (the camera is per-frame and not every caller has it). Replaces
+    /// the engine `render_callback` triple with a `TransparentDispatch`.
     pub fn add_element(
         &mut self,
         centroid: [f32; 3],
-        z_sort: f32,
+        raw_plane: Option<[f32; 4]>,
+        radius: f32,
+        offset: f32,
         sort_layer: TransparentSortLayer,
         dispatch: TransparentDispatch,
     ) -> bool {
@@ -249,7 +298,11 @@ impl TransparencyRenderer {
         }
         self.transparents.push(TransparentTypes {
             use_plane: false,
-            z_sort,
+            plane: [0.0; 4],
+            raw_plane,
+            radius,
+            z_sort: 0.0,
+            offset,
             centroid,
             sort_layer,
             importance: 0.0,
@@ -270,14 +323,65 @@ impl TransparencyRenderer {
     /// surrounding `render_transparents` then sorts + renders the
     /// outer regular-transparent batch).
     ///
-    /// v1: stable sort by `(sort_layer, z_sort)` mirroring
+    /// Stable sort by `(sort_layer, z_sort)` mirroring
     /// `transparent_layer_and_z_sort_proc @ 0x1806CE870`. Higher
-    /// z_sort = farther from camera = drawn first (back-to-front).
-    pub fn sort(&mut self) {
+    /// z_sort = farther along the view axis = drawn first (back-to-front).
+    ///
+    /// `z_sort` is **view-forward depth**, not euclidean distance —
+    /// engine `add_element @ 0x1806CCFD0` computes
+    /// `abs(dot(centroid - camera_pos, camera_forward)) - offset`.
+    /// Euclidean distance ranks off-axis elements (e.g. a sky nebula to
+    /// the side) as farther than they really are in screen depth, which
+    /// flips their order against on-axis elements (the planet). All
+    /// object/sky parts have `use_plane == false` (engine passes a NULL
+    /// plane + 0 radius from `add_transparent_mesh_part`), so the
+    /// recursive plane-qsort never runs for them — this metric is the
+    /// only thing ordering them within a layer.
+    pub fn sort(&mut self, camera_pos: [f32; 3], camera_forward: [f32; 3]) {
         let start = self.current_batch_start();
         let end = self.total_transparent_count as usize;
         if end <= start {
             return;
+        }
+        let f = camera_forward;
+        // Per-element resolve (engine does this in add_element; we defer
+        // it because the camera is per-frame and not every caller has it):
+        //   z_sort    = |(centroid - camera_pos) · camera_forward| - offset
+        //   use_plane = raw_plane present AND radius > 1e-4 AND |n| > 0.5
+        //   plane     = raw_plane flipped so the camera is on its + side
+        //   importance= radius² · |plane.n · forward| / dist(centroid, cam)
+        for i in start..end {
+            let e = &mut self.transparents[i];
+            let c = e.centroid;
+            let dx = c[0] - camera_pos[0];
+            let dy = c[1] - camera_pos[1];
+            let dz = c[2] - camera_pos[2];
+            e.z_sort = (dx * f[0] + dy * f[1] + dz * f[2]).abs() - e.offset;
+
+            e.use_plane = false;
+            e.plane = [0.0; 4];
+            e.importance = 0.0;
+            if let Some(p) = e.raw_plane {
+                let n_len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                if e.radius > 0.000_1 && n_len > 0.5 {
+                    e.use_plane = true;
+                    // Face the plane toward the camera (engine add_element).
+                    let side = p[0] * camera_pos[0]
+                        + p[1] * camera_pos[1]
+                        + p[2] * camera_pos[2]
+                        - p[3];
+                    let faced = if side >= 0.0 {
+                        p
+                    } else {
+                        [-p[0], -p[1], -p[2], -p[3]]
+                    };
+                    e.plane = faced;
+                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.000_1);
+                    let face_dot =
+                        (faced[0] * f[0] + faced[1] * f[1] + faced[2] * f[2]).abs();
+                    e.importance = (e.radius * e.radius * face_dot) / dist;
+                }
+            }
         }
         // Grow sorted_order so [0..end] is addressable. Earlier indices
         // (from prior sort calls) are preserved verbatim.
@@ -287,14 +391,157 @@ impl TransparencyRenderer {
         for i in start..end {
             self.sorted_order[i] = i as u16;
         }
-        let elements = &self.transparents;
-        self.sorted_order[start..end].sort_by(|&a, &b| {
-            let ea = &elements[a as usize];
-            let eb = &elements[b as usize];
-            ea.sort_layer
-                .cmp(&eb.sort_layer)
-                .then(eb.z_sort.partial_cmp(&ea.z_sort).unwrap_or(std::cmp::Ordering::Equal))
-        });
+        // Stage 1: stable sort by (sort_layer asc, z_sort desc) —
+        // `transparent_layer_and_z_sort_proc @ 0x1806CE870`. Higher
+        // z_sort = farther = drawn first (back-to-front).
+        {
+            let elements = &self.transparents;
+            self.sorted_order[start..end].sort_by(|&a, &b| {
+                let ea = &elements[a as usize];
+                let eb = &elements[b as usize];
+                ea.sort_layer.cmp(&eb.sort_layer).then(
+                    eb.z_sort
+                        .partial_cmp(&ea.z_sort)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+            });
+        }
+        // Stage 2: per sort-layer run, the recursive BSP plane sort
+        // (`group_plane_and_point_of_sublist` + `sort_plane_and_point`).
+        //
+        // GATED OFF by default (PROTOMORPH_PLANE_SORT to enable). The
+        // algorithm is engine-faithful, but it only sorts correctly when the
+        // sublist's plane elements are GOOD spatial separators for the whole
+        // sublist. On construct the big waterfall sheets read with NO authored
+        // plane (`plane = [0,0,0,0]` in the loose tag) so they participate as
+        // planeless POINTS, and the only available splitter is a small
+        // horizontal glass pane (z≈5.3) — using it to partition the distant
+        // waterfall scatters far segments to the "camera side" and draws them
+        // OVER near glass (a milky veil). Plain `z_sort` (stage 1) orders these
+        // correctly (far-first). Re-enable once the waterfall's authored sort
+        // plane is recovered (suspected loose-tag parse gap: radius is present
+        // but the plane reads zero) so it splits as a plane, not a point.
+        if std::env::var_os("PROTOMORPH_PLANE_SORT").is_some() {
+            let mut run_start = start;
+            while run_start < end {
+                let layer =
+                    self.transparents[self.sorted_order[run_start] as usize].sort_layer;
+                let mut run_end = run_start + 1;
+                while run_end < end
+                    && self.transparents[self.sorted_order[run_end] as usize].sort_layer
+                        == layer
+                {
+                    run_end += 1;
+                }
+                if run_end - run_start >= 2 {
+                    self.plane_sort_sublist(run_start, run_end);
+                }
+                run_start = run_end;
+            }
+        }
+    }
+
+    /// `group_plane_and_point_of_sublist @ 0x1806CDEE0` followed by the
+    /// recursive `sort_plane_and_point @ 0x1806CE070`. Partitions the
+    /// `sorted_order[start..end]` run (a single sort-layer) into
+    /// plane-bearing elements (`use_plane`) followed by point elements,
+    /// then BSP-sorts them so the result is a stable back-to-front order
+    /// independent of camera rotation. Operates in place on `sorted_order`.
+    fn plane_sort_sublist(&mut self, start: usize, end: usize) {
+        // Group: planes first (preserving stage-1 order), then points.
+        let mut grouped: Vec<u16> = Vec::with_capacity(end - start);
+        let mut points: Vec<u16> = Vec::with_capacity(end - start);
+        for &oi in &self.sorted_order[start..end] {
+            if self.transparents[oi as usize].use_plane {
+                grouped.push(oi);
+            } else {
+                points.push(oi);
+            }
+        }
+        let plane_count = grouped.len();
+        grouped.extend_from_slice(&points);
+        let out = self.sort_plane_and_point(&grouped, plane_count);
+        self.sorted_order[start..end].copy_from_slice(&out);
+    }
+
+    /// Recursive BSP split of one sort-layer sublist. `items` is
+    /// `[plane elements..., point elements...]` (length = sublist size);
+    /// `plane_count` is how many leading entries carry a usable plane.
+    /// Mirrors `sort_plane_and_point @ 0x1806CE070`:
+    ///   - pick the highest-`importance` plane as the split plane,
+    ///   - partition the other planes + all points to the behind/front
+    ///     side of it (points by `dot(centroid, n) - d` sign; planes by
+    ///     their centroid, the `radius → 0` limit of the engine's
+    ///     9-anchor `plane_location_testing` — exact for non-intersecting
+    ///     planes, which is every discrete water/glass surface here),
+    ///   - emit `[behind..., split, front...]`, recurse on each side.
+    /// Camera-independent ⇒ stable under rotation. Returns the reordered
+    /// index list (back-to-front).
+    fn sort_plane_and_point(&self, items: &[u16], plane_count: usize) -> Vec<u16> {
+        if items.len() <= 1 || plane_count == 0 {
+            // No splitter: leave the stage-1 (z_sort) order untouched.
+            return items.to_vec();
+        }
+        // Choose the splitter: highest-importance plane element.
+        let mut split_pos = 0usize;
+        let mut best = f32::NEG_INFINITY;
+        for (i, &oi) in items[..plane_count].iter().enumerate() {
+            let imp = self.transparents[oi as usize].importance;
+            if imp > best {
+                best = imp;
+                split_pos = i;
+            }
+        }
+        let split = items[split_pos];
+        let sp = self.transparents[split as usize].plane;
+
+        // Signed side of a centroid w.r.t. the (camera-faced) split plane.
+        // < 0 = behind (away from camera) = drawn first.
+        let side = |oi: u16| -> f32 {
+            let c = self.transparents[oi as usize].centroid;
+            sp[0] * c[0] + sp[1] * c[1] + sp[2] * c[2] - sp[3]
+        };
+
+        let mut left_planes: Vec<u16> = Vec::new();
+        let mut right_planes: Vec<u16> = Vec::new();
+        for (i, &oi) in items[..plane_count].iter().enumerate() {
+            if i == split_pos {
+                continue;
+            }
+            if side(oi) < 0.0 {
+                left_planes.push(oi);
+            } else {
+                right_planes.push(oi);
+            }
+        }
+        let mut left_points: Vec<u16> = Vec::new();
+        let mut right_points: Vec<u16> = Vec::new();
+        for &oi in &items[plane_count..] {
+            if side(oi) < 0.0 {
+                left_points.push(oi);
+            } else {
+                right_points.push(oi);
+            }
+        }
+
+        // Recurse each side, planes-before-points so a side's own
+        // splitter is available.
+        let left_plane_n = left_planes.len();
+        let mut left = left_planes;
+        left.extend_from_slice(&left_points);
+        let left_sorted = self.sort_plane_and_point(&left, left_plane_n);
+
+        let right_plane_n = right_planes.len();
+        let mut right = right_planes;
+        right.extend_from_slice(&right_points);
+        let right_sorted = self.sort_plane_and_point(&right, right_plane_n);
+
+        // [behind..., split, front...] = back-to-front.
+        let mut out = Vec::with_capacity(items.len());
+        out.extend_from_slice(&left_sorted);
+        out.push(split);
+        out.extend_from_slice(&right_sorted);
+        out
     }
 
     /// Starting index of the current marker scope, or 0 when no marker
@@ -349,6 +596,31 @@ impl TransparencyRenderer {
         self.total_transparent_count as usize
     }
 
+    /// Debug: dump the current marker batch's post-sort draw order with
+    /// both the engine metric (view-forward depth, the live `z_sort`)
+    /// and the old euclidean distance, so the two can be compared. Front
+    /// (drawn last / on top) is the LAST line. Gated by the caller.
+    pub fn debug_dump_sorted(&self, camera_pos: [f32; 3], label: &str) {
+        eprintln!("[diag-sort] {label}: {} elems (back-to-front; last = on top)", {
+            let s = self.current_batch_start();
+            let e = self.total_transparent_count as usize;
+            e.saturating_sub(s)
+        });
+        for (rank, el) in self.sorted_elements().enumerate() {
+            let c = el.centroid;
+            let dx = c[0] - camera_pos[0];
+            let dy = c[1] - camera_pos[1];
+            let dz = c[2] - camera_pos[2];
+            let eucl = (dx * dx + dy * dy + dz * dz).sqrt();
+            eprintln!(
+                "  [{rank:2}] {:?} layer={:?} centroid=[{:.1},{:.1},{:.1}] z_sort(fwd)={:.2} eucl={:.1} \
+                 use_plane={} imp={:.4} plane={:?} r={:.2}",
+                el.dispatch, el.sort_layer, c[0], c[1], c[2], el.z_sort, eucl,
+                el.use_plane, el.importance, el.plane, el.radius,
+            );
+        }
+    }
+
     /// `c_transparency_renderer::render(depth_test=1) @ 0x1806CDB70`.
     /// Walks the CURRENT marker scope's `sorted_order` slice and
     /// dispatches each `TransparentDispatch` variant. Render state per
@@ -392,6 +664,9 @@ impl TransparencyRenderer {
             &ctx.shared.camera_bind_group_sl,
             &[
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                // atmosphere @ binding 2 — default; per-element binds below
+                // override it (sky transparents → their custom fog setting).
+                crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
                 crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                 // dominant_light @ binding 13.
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
@@ -437,16 +712,16 @@ impl TransparencyRenderer {
                     };
                     // Engine-faithful per-cluster cubemap pick — see
                     // `structure_renderer::render_cluster_mesh_part`.
-                    let probe_idx = bsp
-                        .cluster_to_probe
-                        .get(cluster_index as usize)
-                        .copied()
-                        .unwrap_or(0) as usize;
-                    let Some(bind_group) =
-                        bind_groups.get(probe_idx).or_else(|| bind_groups.first())
-                    else {
-                        continue;
+                    // Empty `cluster_to_probe` = no cubemap atlas → length-1
+                    // rasg-default-cube vec, bind slot 0. A populated table
+                    // with an OOB cluster/probe index is a real bug → fail loud.
+                    let bind_group = if bsp.cluster_to_probe.is_empty() {
+                        bind_groups.first()
+                    } else {
+                        let probe_idx = bsp.cluster_to_probe[cluster_index as usize] as usize;
+                        Some(&bind_groups[probe_idx])
                     };
+                    let Some(bind_group) = bind_group else { continue };
                     let simple_lights_offset = bsp
                         .cluster_simple_lights_offsets
                         .get(cluster_index as usize)
@@ -460,8 +735,14 @@ impl TransparencyRenderer {
                     rpass.set_bind_group(
                         0,
                         &ctx.shared.camera_bind_group_sl,
-                        // 3rd entry = dominant_light @ binding 13.
-                        &[lighting_offset, simple_lights_offset, lighting_offset],
+                        // [1]=atmosphere @ binding 2 (BSP cluster default);
+                        // last = dominant_light @ binding 13.
+                        &[
+                            lighting_offset,
+                            crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
+                            simple_lights_offset,
+                            lighting_offset,
+                        ],
                     );
                     rpass.set_pipeline(&artifacts.pipeline);
                     rpass.set_bind_group(1, identity_model_bg, &[0u32]);
@@ -501,15 +782,57 @@ impl TransparencyRenderer {
                         continue;
                     };
                     let Some(inst_nm_bg) = bsp.instance_nm_bg.as_ref() else { continue };
-                    let (Some(artifacts), Some(bind_groups)) = (
-                        material.artifacts.as_ref(),
-                        material.bind_group.as_ref(),
-                    ) else {
+                    // Per-instance entry/probe selection — engine
+                    // `render_instance_mesh_part @ 0x18068FB20` ALWAYS routes
+                    // instances through `select_instance_entry_point` (per-vertex
+                    // SH / single probe), even for transparents — UNLIKE the
+                    // cluster path (`render_transparent_cluster_mesh_part`) which
+                    // forces per_pixel. Mirror the opaque
+                    // `StructureRenderer::render_instance_mesh_part`. Forcing
+                    // StaticPerPixel + default lighting here lit transparent glass
+                    // from the empty-atlas → bright-sky fallback → white frost;
+                    // the real per-vertex baked SH is dim/local (correct).
+                    use crate::halo::render_methods::HaloEntryPoint as Ep;
+                    let sel = bsp
+                        .instance_selections
+                        .get(structure_instance_index as usize)
+                        .map(|s| s.entry);
+                    let (artifacts_opt, bind_groups_opt) = match sel {
+                        Some(Ep::StaticPerPixel) => (material.artifacts.as_ref(), material.bind_group.as_ref()),
+                        Some(Ep::StaticShPerVertex) => (
+                            material.artifacts_sh_per_vertex.as_ref(),
+                            material.bind_group_sh_per_vertex.as_ref(),
+                        ),
+                        Some(Ep::StaticPrtAmbient) => (
+                            material.artifacts_prt_ambient.as_ref(),
+                            material.bind_group_prt_ambient.as_ref(),
+                        ),
+                        _ => (material.artifacts_sh.as_ref(), material.bind_group_sh.as_ref()),
+                    };
+                    let (Some(artifacts), Some(bind_groups)) = (artifacts_opt, bind_groups_opt) else {
                         continue;
                     };
                     // Instance probe selection — todo: per-instance
                     // nearest-probe lookup. For now bind probe[0].
                     let Some(bind_group) = bind_groups.first() else { continue };
+                    let lighting_offset = bsp
+                        .instance_lighting_offsets
+                        .get(structure_instance_index as usize)
+                        .copied()
+                        .unwrap_or(crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET);
+                    // Rebind group 0 with the per-instance lighting offset +
+                    // BSP cluster-default atmosphere (so a preceding SkyMeshPart's
+                    // custom fog doesn't leak into this instance).
+                    rpass.set_bind_group(
+                        0,
+                        &ctx.shared.camera_bind_group_sl,
+                        &[
+                            lighting_offset,
+                            crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
+                            crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
+                            lighting_offset,
+                        ],
+                    );
                     rpass.set_pipeline(&artifacts.pipeline);
                     rpass.set_bind_group(1, inst_model_bg, &[0u32]);
                     // Path B: cbuffer slot is dynamic; offset 0 for static materials.
@@ -521,6 +844,16 @@ impl TransparencyRenderer {
                         .and_then(|o| o.as_ref())
                         .unwrap_or(&mesh.vertex_buffer);
                     rpass.set_vertex_buffer(0, placement_vb.slice(..));
+                    // Per-vertex SH stream (slot 1) — StaticShPerVertex only.
+                    if matches!(sel, Some(Ep::StaticShPerVertex)) {
+                        if let Some(pv_buf) = bsp
+                            .instance_per_vertex_sh_buffers
+                            .get(structure_instance_index as usize)
+                            .and_then(|o| o.as_ref())
+                        {
+                            rpass.set_vertex_buffer(1, pv_buf.slice(..));
+                        }
+                    }
                     rpass.set_index_buffer(
                         mesh.index_buffer.slice(..),
                         wgpu::IndexFormat::Uint32,
@@ -547,6 +880,19 @@ impl TransparencyRenderer {
                         ((object_slot as usize) * ctx.shared.model_stride) as u32;
                     let nm_offset =
                         ((object_slot as usize) * ctx.shared.node_matrices_stride) as u32;
+                    // Rebind group 0 with this object material's atmosphere
+                    // offset (honors any per-shader fog override; resets a
+                    // preceding SkyMeshPart's setting so it doesn't leak here).
+                    rpass.set_bind_group(
+                        0,
+                        &ctx.shared.camera_bind_group_sl,
+                        &[
+                            crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                            material.atmosphere_offset,
+                            crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
+                            crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                        ],
+                    );
                     rpass.set_pipeline(&material.artifacts.pipeline);
                     rpass.set_bind_group(1, &ctx.shared.model_bind_group, &[model_offset]);
                     // Path B: cbuffer slot dynamic; offset 0.
@@ -622,16 +968,40 @@ impl TransparencyRenderer {
                         &ctx.shared.camera_bind_group_sl,
                         &[
                             crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                            // Per-shader atmosphere override — transparent sky
+                            // backdrop (nebula, planetoid, clouds) resolves to
+                            // its `Custom fog setting index` (construct →
+                            // fog_waterfall), the bright daytime haze.
+                            material.atmosphere_offset,
                             crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
                             crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
                         ],
                     );
-                    rpass.set_pipeline(&material.artifacts.pipeline);
                     rpass.set_bind_group(1, &ctx.sky_gpu.model_bind_group, &[0u32]);
-                    // Path B: cbuffer slot dynamic; offset 0.
-                    rpass.set_bind_group(2, &material.bind_group, &[0u32]);
                     rpass.set_bind_group(3, &ctx.sky_gpu.node_matrices_bind_group, &[0u32]);
                     rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    // Engine routes vc-bit sky meshes through
+                    // `_entry_point_vertex_color_lighting` — albedo×vert_color
+                    // + self_illum, NOT static_sh. Use the vertex_color
+                    // variant when the mesh carries the stream and the
+                    // material compiled it; else fall back to static_sh.
+                    let vc = mesh.vert_color_buffer.is_some();
+                    if let (true, Some(arts), Some(bg)) = (
+                        vc,
+                        material.artifacts_vertex_color.as_ref(),
+                        material.bind_group_vertex_color.as_ref(),
+                    ) {
+                        rpass.set_vertex_buffer(
+                            1,
+                            mesh.vert_color_buffer.as_ref().unwrap().slice(..),
+                        );
+                        rpass.set_pipeline(&arts.pipeline);
+                        rpass.set_bind_group(2, bg, &[0u32]);
+                    } else {
+                        rpass.set_pipeline(&material.artifacts.pipeline);
+                        // Path B: cbuffer slot dynamic; offset 0.
+                        rpass.set_bind_group(2, &material.bind_group, &[0u32]);
+                    }
                     rpass.set_index_buffer(
                         mesh.index_buffer.slice(..),
                         wgpu::IndexFormat::Uint32,

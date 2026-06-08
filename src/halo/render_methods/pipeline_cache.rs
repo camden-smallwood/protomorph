@@ -319,13 +319,15 @@ fn build_variant(
         | HaloEntryPoint::StaticPerPixel
         | HaloEntryPoint::StaticShPerVertex
         | HaloEntryPoint::StaticPrtAmbient
+        | HaloEntryPoint::StaticVertexColor
             if is_transparent_subclass => &transparent_targets,
         HaloEntryPoint::Albedo => &albedo_targets,
         // Standard SL entries write the lit color to accum_HDR.
         HaloEntryPoint::StaticSh
         | HaloEntryPoint::StaticPerPixel
         | HaloEntryPoint::StaticShPerVertex
-        | HaloEntryPoint::StaticPrtAmbient => &static_lighting_targets,
+        | HaloEntryPoint::StaticPrtAmbient
+        | HaloEntryPoint::StaticVertexColor => &static_lighting_targets,
         // Decal entry without transparency is unsupported in this branch
         // (handled above when transparent). Panic so we surface any new
         // dispatch we forgot to map.
@@ -344,13 +346,18 @@ fn build_variant(
     // attribute layout from ModelVertex (no skinning/lightmap UVs,
     // explicit normal/tangent/binormal as Snorm16x4).
     use crate::halo::decal::writer::RasterizerVertexWorld;
-    use crate::halo::geometry::{PerVertexShVertex, PrtAmbientVertex};
+    use crate::halo::geometry::{PerVertexShVertex, PrtAmbientVertex, SkyVertColorVertex};
     let vertex_buffers_pv: [wgpu::VertexBufferLayout<'_>; 2] =
         [ModelVertex::layout(), PerVertexShVertex::layout()];
     // PRT Ambient mirrors the engine's slot-2 binding: `ModelVertex`
     // primary stream + a single-f32-per-vertex transfer stream.
     let vertex_buffers_prt: [wgpu::VertexBufferLayout<'_>; 2] =
         [ModelVertex::layout(), PrtAmbientVertex::layout()];
+    // Vertex-color lighting (sky): primary `ModelVertex` + the
+    // `SkyVertColorVertex` stream (slot 1, location 12) carrying the
+    // per-vertex baked sky color.
+    let vertex_buffers_vc: [wgpu::VertexBufferLayout<'_>; 2] =
+        [ModelVertex::layout(), SkyVertColorVertex::layout()];
     let vertex_buffers_default: [wgpu::VertexBufferLayout<'_>; 1] =
         [ModelVertex::layout()];
     let vertex_buffers_decal: [wgpu::VertexBufferLayout<'_>; 1] =
@@ -358,6 +365,7 @@ fn build_variant(
     let vertex_buffers: &[wgpu::VertexBufferLayout<'_>] = match entry_point {
         HaloEntryPoint::StaticShPerVertex => &vertex_buffers_pv,
         HaloEntryPoint::StaticPrtAmbient => &vertex_buffers_prt,
+        HaloEntryPoint::StaticVertexColor => &vertex_buffers_vc,
         HaloEntryPoint::Decal | HaloEntryPoint::DecalAlbedo => &vertex_buffers_decal,
         // DecalObject = rmd PS body + OBJECT skinned ModelVertex VS.
         // Engine dispatches via `render_object_contexts(_default, ...)`
