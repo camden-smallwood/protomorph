@@ -908,6 +908,18 @@ impl ObjectRenderer {
                 // author per-decal sprite/fade).
                 BindPath::DecalObject(bg) => rpass.set_bind_group(2, bg, &[cbuffer_offset, 0u32]),
             }
+        } else {
+            // Part references a material the model doesn't have — e.g.
+            // `inviso_block.render_model` carries collision geometry but ZERO
+            // materials because it's an invisible player-blocker the engine
+            // never draws. With no material there's no pipeline or material
+            // bind group, so skip the draw. Falling through would dispatch
+            // with the previously-bound pipeline (the decorator pipeline,
+            // since decorators draw first in the albedo pass) while
+            // `model_bind_group` is still set at group 1 — a BindGroupLayout
+            // mismatch wgpu rejects (the 005_intro crash). Mirrors the
+            // DecalObject early-return above.
+            return;
         }
         rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
         if bind_prt_stream {

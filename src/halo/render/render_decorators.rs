@@ -1033,31 +1033,31 @@ impl DecoratorRenderer {
                     // → drop / unlit fallback → "all over the place" pattern
                     // on riverworld. Verified divergence 2026-05-26.
                     //
-                    // TEST REVERT 2026-05-26 (later same day): the
-                    // compression_info[0] path made tall multi-subpart fern
-                    // sets bake dim & sky-biased (bright ≈ 0.07-0.12 vs
-                    // thistle/clover ≈ 0.50). Going back to per-subpart
-                    // vertex AABB to verify ferns light correctly when each
-                    // variant samples its own true extent.
+                    // RESTORED 2026-06-08: use the engine's `compression_info[0]`
+                    // bounds (above). The 2026-05-26 revert to per-subpart vertex
+                    // AABB was wrong: that AABB is ~3x smaller than the real model
+                    // extent (lichen: subpart 0.035 vs compression 0.136), so the
+                    // sample rays (`radius × weight × |q|²`) fall short of the
+                    // wall/ground the decorator sits on → 0 hits → bright unbaked
+                    // fallback (the "white lichen" / "white grass" bug). The
+                    // engine reads compression_info[0] for ALL placements; the
+                    // dim-fern symptom that motivated the revert is the correct
+                    // shadowed result, not a bug. Verified vs the lichen_set
+                    // render_model compression bounds via blam-tag-shell.
                     let subpart_aabb: crate::halo::decorators::light_placement::MeshBounds = {
-                        let _ = &rm.render_geometry.compression_info; // unused on this path
-                        let mut mn = Vec3::splat(f32::INFINITY);
-                        let mut mx = Vec3::splat(f32::NEG_INFINITY);
-                        for &i in subpart_tri_list.iter() {
-                            if let Some(v) = subpart_geom.vertices.get(i as usize) {
-                                let local = Vec3::new(v.position.x, v.position.y, v.position.z);
-                                let lifted = subpart_pose.transform_point3(local);
-                                mn = mn.min(lifted);
-                                mx = mx.max(lifted);
+                        match rm.render_geometry.compression_info.first() {
+                            Some(ci) => {
+                                let b0 = ci.position_bounds[0];
+                                let b1 = ci.position_bounds[1];
+                                crate::halo::decorators::light_placement::MeshBounds {
+                                    min: Vec3::new(b0.x.min(b1.x), b0.y.min(b1.y), b0.z.min(b1.z)),
+                                    max: Vec3::new(b0.x.max(b1.x), b0.y.max(b1.y), b0.z.max(b1.z)),
+                                }
                             }
-                        }
-                        if mn.x.is_finite() {
-                            crate::halo::decorators::light_placement::MeshBounds { min: mn, max: mx }
-                        } else {
-                            crate::halo::decorators::light_placement::MeshBounds {
+                            None => crate::halo::decorators::light_placement::MeshBounds {
                                 min: Vec3::splat(-0.5),
                                 max: Vec3::splat(0.5),
-                            }
+                            },
                         }
                     };
 

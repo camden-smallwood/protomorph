@@ -675,7 +675,31 @@ pub fn collision_test_vector_2(
 
         // 2. Instanced geometry tests.
         if test_instances {
+            // Divergence (authorized): for render/lighting queries (test-render-
+            // only flag bit 0x10, set by the decorator/geometry-sampler bake),
+            // skip instances whose render mesh is EMPTY — the authored invisible-
+            // collision hulls (">invis_coll_f", def.mesh_index → render mesh with
+            // 0 vertices, no lightmap entry). Their collision sits right at the
+            // ground under decorators; resolving the hit to an empty render mesh
+            // fails the lightmap lookup → bright unbaked fallback. Skipping them
+            // lets the ray reach the lit CLUSTER the decorator actually samples.
+            let skip_render_empty = (cf_test & 0x10) != 0;
             for inst_idx in 0..bsp.sbsp.instanced_geometry_instances.len() {
+                if skip_render_empty {
+                    let render_mesh_empty = bsp
+                        .sbsp
+                        .instanced_geometry_instances
+                        .get(inst_idx)
+                        .and_then(|i| bsp.sbsp.instance_definitions.get(i.definition_index as usize))
+                        .map(|d| d.mesh_index)
+                        .filter(|&mi| mi >= 0)
+                        .and_then(|mi| bsp.meshes.get(mi as usize))
+                        .map(|m| m.vertices.is_empty())
+                        .unwrap_or(false);
+                    if render_mesh_empty {
+                        continue;
+                    }
+                }
                 let mut temp_collision = collision.clone();
                 let hit = instanced_geometry_test_vector_internal(
                     &bsp.sbsp,

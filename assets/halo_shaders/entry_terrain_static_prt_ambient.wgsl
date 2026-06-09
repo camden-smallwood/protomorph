@@ -498,8 +498,11 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
         // during cache build). Until that's resolved, substitute the
         // engine_lighting_ps frame-default ravi cbuffer when atlas SH
         // DC is near zero. Same pattern as entry_static_per_pixel.wgsl.
+        // Engine-faithful default OFF: no DC threshold exists in the engine
+        // HLSL; it lit real baked shadows. See entry_static_per_pixel.wgsl.
+        const LIGHTMAP_EMPTY_ATLAS_FALLBACK: bool = false;
         let _atlas_dc = probe.sh[0];
-        if ((_atlas_dc.r + _atlas_dc.g + _atlas_dc.b) < 0.01) {
+        if (LIGHTMAP_EMPTY_ATLAS_FALLBACK && (_atlas_dc.r + _atlas_dc.g + _atlas_dc.b) < 0.01) {
             let r0 = engine_lighting_ps.ravi[0].xyz;
             let r1 = engine_lighting_ps.ravi[1];
             let r2 = engine_lighting_ps.ravi[2];

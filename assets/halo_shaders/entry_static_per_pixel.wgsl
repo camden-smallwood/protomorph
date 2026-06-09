@@ -215,8 +215,18 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // engine-faithful. Restored 2026-05-15 after dllcache trace
     // confirmed the bug isn't in the lighting code path but in the
     // atlas DATA, and that the engine-faithful fix lives in tool.exe.
+    // Engine-faithful default: NO empty-atlas fallback. The engine's
+    // lightmap_sampling_fx.hlsl + entry_points_fx.hlsl per-pixel path use
+    // the decoded atlas probe DIRECTLY — there is no DC threshold anywhere
+    // in the engine HLSL. The fallback below substituted the cluster
+    // default sky-probe + sun when baked DC < 0.01, which cannot tell an
+    // empty/unbaked atlas region from a legitimately-black BAKED shadow, so
+    // it lit every deep shadow (ghosttown's upper walls/ceilings). OFF by
+    // default; construct's empty loose-tag atlas is a separate DATA gap to
+    // fix in the loader, not by overriding real baked shadows here.
+    const LIGHTMAP_EMPTY_ATLAS_FALLBACK: bool = false;
     let _atlas_dc = probe.sh[0];
-    if ((_atlas_dc.r + _atlas_dc.g + _atlas_dc.b) < 0.01) {
+    if (LIGHTMAP_EMPTY_ATLAS_FALLBACK && (_atlas_dc.r + _atlas_dc.g + _atlas_dc.b) < 0.01) {
         // `engine_lighting_ps.ravi` layout (per `build_default_sh_array`
         // in spherical_harmonics_fx.wgsl, mirroring engine
         // `calculate_and_set_ravi_constants_internal @ 0x1806aa650`):

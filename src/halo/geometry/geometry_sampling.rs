@@ -1286,6 +1286,8 @@ pub fn geometry_test_collision_result(
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
             continue;
         }
+        // `mapping.triangle_index` is a position in the (raw) index buffer that
+        // `RenderMesh::indices` preserves for triangle-list BSP meshes.
         // Engine: get_structure_triangle(vertex_data, mapping.triangle_index, indices, count, &triangle)
         let last_index = mapping.triangle_index as u32;
         if (last_index as usize) >= mesh.indices.len() {
