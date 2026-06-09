@@ -21,18 +21,12 @@ struct ShadowGenerateUniforms {
     /// caster's projection_bounds OBB (per-object) or the light's
     /// frustum/ortho (per-light).
     world_to_shadow: mat4x4<f32>,
-}
-
-@group(0) @binding(0) var<uniform> shadow_u: ShadowGenerateUniforms;
-
-struct ModelUniforms {
-    /// Object-to-world transform (engine VS slot 12). Matches the
-    /// `model_bgl` layout in `shared.rs` so we can reuse the existing
-    /// `model_bind_group` with its per-object dynamic offset.
+    /// Object-to-world for this caster. Folded into the per-caster slot
+    /// (dynamic offset) so shadows aren't tied to the render_list.
     model: mat4x4<f32>,
 }
 
-@group(1) @binding(0) var<uniform> object: ModelUniforms;
+@group(0) @binding(0) var<uniform> shadow_u: ShadowGenerateUniforms;
 
 struct VertexInput {
     // Only `position` is needed for depth — match `ModelVertex` layout
@@ -54,7 +48,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    let world_pos = object.model * vec4<f32>(input.position, 1.0);
+    let world_pos = shadow_u.model * vec4<f32>(input.position, 1.0);
     out.clip = shadow_u.world_to_shadow * world_pos;
     return out;
 }

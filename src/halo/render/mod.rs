@@ -425,6 +425,14 @@ pub struct ObjectLightingCacheEntry {
     /// 10-vec4 ravi cbuffer entry lives. Assigned sequentially as
     /// placements get baked (`structure_renderer.next_probe_slot`).
     pub slot_offset: u32,
+    /// Baked per-placement dominant-light direction (world-space, points
+    /// TO the light) from the probe at this object's position. Used by
+    /// the object-shadow loop so each caster's shadow points along its
+    /// OWN local dominant light (engine `object_get_cached_render_lighting`)
+    /// rather than one global direction — matters where lighting varies
+    /// (indoor vs sunlit doorway). `[0,0,0]` if the probe had no usable
+    /// dominant; the shadow loop falls back to the global dominant then.
+    pub dominant_dir: [f32; 3],
 }
 
 // ---------------------------------------------------------------------------
@@ -2180,6 +2188,7 @@ impl Renderer {
                 sh_lum,
                 object_type,
                 slot_offset: offset,
+                dominant_dir: dq_cached.dominant_light_direction,
             });
             offsets[i] = Some(offset);
             self.structure_renderer.next_probe_slot += 1;

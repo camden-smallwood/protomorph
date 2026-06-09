@@ -100,17 +100,28 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
 // the slope-based depth bias subtracted (so deeper-than-actual occluders
 // don't false-positive shadow this pixel).
 fn pcf_9tap(light_uv: vec2<f32>, compare_ref: f32) -> f32 {
-    let step = u.shadow_pixel_size.x;
-    var sum: f32 = 0.0;
-    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-            let off = vec2<f32>(f32(dx), f32(dy)) * step;
-            sum = sum + textureSampleCompare(
-                shadow_depth, shadow_sampler, light_uv + off, compare_ref,
-            );
-        }
-    }
-    return sum * (1.0 / 9.0);
+    // Engine `sample_percentage_closer_PCF_3x3_block` (PC path,
+    // shadow_apply_hlsl.hlsl:74-110): nine POINT comparison taps on a
+    // 1-texel grid, weighted BILINEARLY by the fragment's sub-texel
+    // position so the effective footprint is ~2×2 (sharp) rather than a
+    // flat 3×3 box. `shadow_sampler` is Nearest, so each tap is a single
+    // point comparison (1 = unshadowed); the smoothing is the weighting.
+    // `shadow_pixel_size.x` is √2/res; ×0.7071 → one texel.
+    let texel = u.shadow_pixel_size.x * 0.70710678;
+    let blend = fract(light_uv / texel);          // engine blend.xy
+    let inv = vec2<f32>(1.0) - blend;             // engine blend.zw
+    let t = texel;
+    let c =
+          inv.x   * inv.y   * textureSampleCompare(shadow_depth, shadow_sampler, light_uv + vec2<f32>(-t, -t), compare_ref)
+        +           inv.y   * textureSampleCompare(shadow_depth, shadow_sampler, light_uv + vec2<f32>(0.0, -t), compare_ref)
+        + blend.x * inv.y   * textureSampleCompare(shadow_depth, shadow_sampler, light_uv + vec2<f32>( t, -t), compare_ref)
+        + inv.x             * textureSampleCompare(shadow_depth, shadow_sampler, light_uv + vec2<f32>(-t, 0.0), compare_ref)
+        +                     textureSampleCompare(shadow_depth, shadow_sampler, light_uv + vec2<f32>(0.0, 0.0), compare_ref)
+        + blend.x           * textureSampleCompare(shadow_depth, shadow_sampler, light_uv + vec2<f32>( t, 0.0), compare_ref)
+        + inv.x   * blend.y * textureSampleCompare(shadow_depth, shadow_sampler, light_uv + vec2<f32>(-t,  t), compare_ref)
+        +           blend.y * textureSampleCompare(shadow_depth, shadow_sampler, light_uv + vec2<f32>(0.0,  t), compare_ref)
+        + blend.x * blend.y * textureSampleCompare(shadow_depth, shadow_sampler, light_uv + vec2<f32>( t,  t), compare_ref);
+    return c * 0.25;
 }
 
 // 16-tap fancy 5×5 predicated PCF, per engine
@@ -277,22 +288,36 @@ fn fs_main(in: VsOut) -> AccumPixel {
         unshadowed = pcf_9tap(light_uv, compare_ref);
     }
 
-    // 6. Cosine falloff + depth-z falloff (engine
-    //    `shadow_apply_hlsl.hlsl:154-163`):
-    //      shadow_falloff  = saturate(z*2 - 1)²        (only bottom half)
-    //      cosine_falloff  = saturate(cosine)
-    //      shadow_darkness = caster_opacity * (1 - falloff⁴) * cosine_falloff
+    // 6. Cosine falloff + depth-z falloff (engine `shadow_apply_hlsl.hlsl:
+    //    154-163`): shadow_darkness = alpha × (1 - saturate(2z-1)⁴) ×
+    //    cosine. The z-falloff fades the shadow toward the FAR end of the
+    //    volume — this is the engine's mechanism that keeps a caster's
+    //    shadow from stamping at full strength onto geometry far behind the
+    //    intended receiver (e.g. a weapon on a ledge stamping onto the wall
+    //    below): that geometry sits near the volume's back plane (high z) →
+    //    faded out. (Removing this is what let those phantom second shadows
+    //    appear; it also mildly fades a tall caster's far footprint, which
+    //    is the engine's behaviour too.)
     let shadow_falloff_a = saturate(light_ndc.z * 2.0 - 1.0);
     let shadow_falloff = shadow_falloff_a * shadow_falloff_a;
-    // ── DEBUG: pcf_quality.z ≥ 0.5 forces cosine_falloff = 1.0. Lets us
-    // tell whether the normal-MRT path is killing stamps. If shadows
-    // appear with no_cosine but not normally, the bug is that receiver
-    // pixels have cleared normals (or the normal decode is wrong).
     let no_cosine = u.pcf_quality.z;
     let cosine_falloff = select(saturate(cosine_raw), 1.0, no_cosine > 0.5);
     let shadow_darkness =
         u.caster_opacity.x * (1.0 - shadow_falloff * shadow_falloff) * cosine_falloff;
-    let stamp_alpha = (1.0 - unshadowed) * shadow_darkness;
+    // Engine `shadow_apply_hlsl.hlsl:204-205`:
+    //   darken = saturate(1 - shadow_darkness + percentage_closer*shadow_darkness)
+    //   darken *= darken            // <-- the SQUARING (was missing here)
+    // `darken` is the light-KEEP factor (1 = fully lit, 0 = fully shadowed);
+    // `unshadowed` == engine `percentage_closer`. The square roughly doubles
+    // shadow strength and sharpens the umbra/penumbra contrast — without it
+    // the stamp was linear (`(1-unshadowed)*shadow_darkness`) and read washed
+    // out: umbra only 85% dark vs the engine's ~97.75%. With SrcAlpha/
+    // OneMinusSrcAlpha blend and rgb=0, stamp_alpha = 1-darken reproduces the
+    // engine's `dst*darken + shadow_color*(1-darken)` (shadow_color=black for
+    // now; engine uses atmosphere inscatter·exposure — deferred).
+    var darken = saturate(1.0 - shadow_darkness + unshadowed * shadow_darkness);
+    darken = darken * darken;
+    let stamp_alpha = 1.0 - darken;
 
     // Output: alpha-blend (SrcAlpha, OneMinusSrcAlpha) with rgb=0 darkens
     // toward black by `stamp_alpha`. Engine emits `inscatter * exposure`

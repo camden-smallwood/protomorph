@@ -932,18 +932,37 @@ impl PlayerView {
         // the resolution-clamp's 16-pixel minimum, but our depth ortho
         // is built from the world-space radius directly.
         const CASTER_RADIUS_FALLBACK: f32 = 1.0;
-        let light_dir = renderer
+        // Shadow light direction. The engine sources this from each object's
+        // CACHED dominant light (`object_get_cached_render_lighting`), NOT
+        // the authored atmosphere sun. `lighting_interface.dominant_light_dir`
+        // is protomorph's SH-derived global dominant (camera cluster) — a
+        // closer match (the sun's authored angle can sit lower → longer
+        // shadows than the engine). `PROTOMORPH_SHADOW_SUN_DIR=1` reverts to
+        // the authored sun for A/B comparison.
+        let atmosphere_sun = renderer
             .scenario_sky_atmosphere
             .as_ref()
             .and_then(|atm| atm.primary_setting())
             .map(|s| {
                 let d = s.sun_direction();
                 glam::Vec3::new(d.x, d.y, d.z)
-            })
-            .unwrap_or_else(|| {
-                let dom = renderer.lighting_interface.dominant_light_dir;
-                glam::Vec3::new(dom.x, dom.y, dom.z)
             });
+        let dom = renderer.lighting_interface.dominant_light_dir;
+        let dominant = glam::Vec3::new(dom.x, dom.y, dom.z);
+        let use_sun = {
+            use std::sync::OnceLock;
+            static ON: OnceLock<bool> = OnceLock::new();
+            *ON.get_or_init(|| {
+                std::env::var("PROTOMORPH_SHADOW_SUN_DIR").map(|v| v == "1").unwrap_or(false)
+            })
+        };
+        let light_dir = if use_sun {
+            atmosphere_sun.unwrap_or(dominant)
+        } else if dominant.length_squared() > 1e-6 {
+            dominant
+        } else {
+            atmosphere_sun.unwrap_or(dominant)
+        };
         // Diagnostic toggle — `PROTOMORPH_NO_SHADOWS=1` skips all
         // generate + apply passes, leaving _surface_shadow_1
         // uninitialized + lighting_base unstamped. Useful for A/B
@@ -969,11 +988,13 @@ impl PlayerView {
             if !SHADOW_DIAG_LOGGED.load(std::sync::atomic::Ordering::Relaxed)
                 && !SHADOW_DIAG_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
-                let from_atmosphere = renderer.scenario_sky_atmosphere.is_some();
+                let s = atmosphere_sun.unwrap_or(glam::Vec3::ZERO);
                 eprintln!(
-                    "[shadow] per-caster dir=({:.3},{:.3},{:.3}) source={} casters={}",
+                    "[shadow] dir=({:.3},{:.3},{:.3}) using={} | dominant=({:.3},{:.3},{:.3}) sun=({:.3},{:.3},{:.3}) casters={}",
                     light_dir.x, light_dir.y, light_dir.z,
-                    if from_atmosphere { "atmosphere.sun" } else { "lighting_interface.dominant" },
+                    if use_sun { "sun" } else { "dominant" },
+                    dominant.x, dominant.y, dominant.z,
+                    s.x, s.y, s.z,
                     render_list.len(),
                 );
             }
@@ -1045,7 +1066,24 @@ impl PlayerView {
             let mut culled_no_cast = 0usize;
             let mut culled_frustum = 0usize;
             let mut casters_rendered = 0usize;
-            for (slot, &(obj_idx, model_idx)) in render_list.iter().enumerate() {
+            // Shadow casters are NOT the on-screen `render_list` — an
+            // object can be frustum-culled from view yet still throw a
+            // shadow onto visible ground (it sits just past a screen edge
+            // with the sun behind it). Iterating the culled render_list
+            // made such shadows POP as the camera rotated. Iterate ALL
+            // objects; the expanded cull below keeps only those whose
+            // shadow could land in view. Each caster gets its OWN
+            // `world_to_shadow` + `model` in a distinct per-caster uniform
+            // slot (dynamic offset) — see `shadow_apply_pass`. Engine:
+            // shadow casters come from the visibility prepass keyed on each
+            // object's shadow potential bounds (`c_lightmap_shadows_view::
+            // render @ 0x1806BB2A0` walks `root_objects`), not the camera
+            // render set.
+            for (obj_idx, obj) in game.objects.iter() {
+                if game.sky_object.map(|s| s.0) == Some(obj_idx.0) {
+                    continue;
+                }
+                let Some(model_idx) = obj.model_index else { continue };
                 let Some(model) = renderer.models.get(model_idx) else { continue };
                 // STEP 0 — drop placements whose obje tag isn't shadow-
                 // eligible. Most static scenery (lightmap_shadow_mode ==
@@ -1062,7 +1100,6 @@ impl PlayerView {
                 // matrix's max-axis scale. For unscaled objects (the
                 // overwhelming majority), this collapses to (M·offset,
                 // radius).
-                let obj = game.objects.get(obj_idx);
                 let model_matrix = obj
                     .header_index
                     .and_then(crate::halo::objects::object_header_data::world_matrix)
@@ -1096,12 +1133,61 @@ impl PlayerView {
                 const SHADOW_RADIUS_FACTOR: f32 = 3.0;
                 let shadow_radius = caster_radius * SHADOW_RADIUS_FACTOR;
 
-                // STEP 1 — camera-frustum sphere cull on the inflated
-                // shadow bounds. Cheaper than the engine's per-OBB test
-                // but conservative (slightly more passes through than
-                // strictly necessary). Drops the bulk of off-screen
-                // casters before the per-pass setup cost.
-                if !sphere_in_frustum(caster_center, shadow_radius) {
+                // Per-caster light direction — engine sources each object's
+                // shadow direction from its OWN cached render lighting
+                // (`object_get_cached_render_lighting`), not one global value.
+                // Look up the baked per-placement dominant light (stored in
+                // `object_lighting_cache`, indexed by slot = lighting_offset /
+                // stride). Falls back to the global `light_dir` when the probe
+                // had no usable dominant (degenerate / off-BSP). Matters where
+                // lighting varies (e.g. ghosttown interior vs sunlit doorway).
+                // Match by slot_offset, NOT by cache index: the engine-
+                // lighting slot cursor (structure_renderer.n) starts at 1
+                // and is consumed by BSP clusters/instances before objects
+                // bake, so object_lighting_cache[0] lives at some base slot
+                // ≫ 0 — the Vec index is NOT the absolute slot. Indexing by
+                // offset/STRIDE handed objects the WRONG entry (divergent
+                // shadow directions on adjacent objects). The cache is small
+                // (per-placement); a linear find is cheap.
+                let caster_light_dir = obj
+                    .engine_lighting_offset
+                    .and_then(|off| {
+                        renderer
+                            .object_lighting_cache
+                            .iter()
+                            .find(|e| e.slot_offset == off)
+                    })
+                    .map(|e| glam::Vec3::new(e.dominant_dir[0], e.dominant_dir[1], e.dominant_dir[2]))
+                    // Engine `object_shadow_visible` guards a degenerate
+                    // shadow_direction: NaN/Inf → fallback, near-zero → fallback.
+                    // (The engine uses the per-object dominant AS-IS otherwise —
+                    // no strength/contrast gate — so neither do we.)
+                    .filter(|d| d.is_finite() && d.length_squared() > 1e-6)
+                    .unwrap_or(light_dir);
+
+                // STEP 1 — camera-frustum cull keyed on the SHADOW, not the
+                // object. Keep the caster if EITHER its shadow bounds OR
+                // the far end of its shadow throw is in view, so an object
+                // just off-screen whose shadow falls into the frame still
+                // draws (fixes shadows popping on camera rotation).
+                // `shadow_dir` is the direction shadows travel (away from
+                // the light); the throw end approximates where the highest
+                // part's shadow lands.
+                let shadow_dir = (-caster_light_dir).normalize_or_zero();
+                let shadow_throw_end =
+                    caster_center + shadow_dir * (shadow_radius * 2.0);
+                if !sphere_in_frustum(caster_center, shadow_radius)
+                    && !sphere_in_frustum(shadow_throw_end, shadow_radius)
+                {
+                    culled_frustum += 1;
+                    continue;
+                }
+                // Per-caster uniform slot index. Cap at the buffer size;
+                // drop (and count) any beyond it.
+                let caster_index = casters_rendered as u32;
+                if caster_index
+                    >= crate::halo::render::shadow_apply_pass::MAX_SHADOW_CASTERS
+                {
                     culled_frustum += 1;
                     continue;
                 }
@@ -1132,13 +1218,22 @@ impl PlayerView {
                         );
                     }
                 }
+                // Tight light-aligned OBB from the model's vertex-walked
+                // AABB — engine `setup_camera`'s projection-bounds path.
+                // Fits the box to the object's ACTUAL dimensions (thin for
+                // a ladder, etc.) instead of the height-dominated bounding
+                // sphere, so the silhouette fills the shadow map → SHARP
+                // rungs rather than a soft blob. Perpendicular is tight to
+                // the object; depth extends down-light to catch the ground
+                // footprint. (`shadow_radius`/`caster_center` above still
+                // drive the frustum cull.)
                 let world_to_shadow =
-                    crate::halo::render::shadow_apply_pass::build_caster_ortho(
-                        caster_center,
-                        glam::Vec3::splat(shadow_radius),
-                        light_dir,
+                    crate::halo::render::shadow_apply_pass::build_caster_obb_ortho(
+                        model.bounding_aabb_min,
+                        model.bounding_aabb_max,
+                        model_matrix,
+                        caster_light_dir,
                     );
-                let model_offset = (slot * renderer.shared.model_stride) as u32;
 
                 // S1-final-c — per-caster resolution clamp. Distant /
                 // small objects render into a small sub-rect of
@@ -1192,9 +1287,10 @@ impl PlayerView {
                         &mut encoder,
                         &renderer.intermediates.shadow_depth_view,
                         world_to_shadow,
+                        model_matrix,
+                        caster_index,
                         sub_res,
                     );
-                    rpass.set_bind_group(1, &renderer.shared.model_bind_group, &[model_offset]);
                     for mesh in &model.meshes {
                         rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         rpass.set_index_buffer(
@@ -1227,8 +1323,9 @@ impl PlayerView {
                     frame_ctx.game.camera.view,
                     frame_ctx.game.camera.projection,
                     world_to_shadow,
-                    light_dir,
+                    caster_light_dir,
                     /* opacity = */ 0.85,
+                    caster_index,
                     sub_res,
                 );
             }

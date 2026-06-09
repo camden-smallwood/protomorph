@@ -371,6 +371,14 @@ struct VsOut {
     /// start_fade))`. PS multiplies albedo.a so alpha-test culls
     /// past-fade fragments cleanly.
     @location(4) fade_alpha: f32,
+    /// Host-surface normal (the BSP surface the decorator is planted on
+    /// = the instance's up/local-Z axis), written to the normal MRT so
+    /// the screenspace shadow + SSAO treat the decorator like its host
+    /// surface — orientation-independent (ground/wall/ceiling). The
+    /// per-leaf `world_normal` above stays the LIGHTING normal; using it
+    /// for the shadow cosine zeroed shadows on grass (billboard normals
+    /// are ~perpendicular to the up-ish light).
+    @location(5) surface_normal: vec3<f32>,
 };
 
 // PS output — two MRTs matching engine `albedo_pixel`
@@ -635,6 +643,11 @@ fn default_vs(in: VsIn) -> VsOut {
     out.ambient_light = ambient;
     out.inscatter = inscatter;
     out.world_normal = world_normal;
+    // Host-surface normal = the instance's up axis (local +Z in world =
+    // 3rd column of the instance rotation). The decorator is planted with
+    // local-Z along the surface normal, so this is the ground/wall/ceiling
+    // normal it grows from — correct for any orientation.
+    out.surface_normal = normalize(in.inst_m2.xyz);
 
     // LOD fade — engine: `saturate(distance × LOD_constants.x + LOD_constants.y)`
     // per `decorators.hlsl:165`. Substituting our fade.xy:
@@ -685,7 +698,13 @@ fn default_ps(in: VsOut) -> PsOut {
     //   result.albedo_specmask = albedo;          (slot 0 = lit color)
     //   result.normal.xyz = normal * 0.5 + 0.5;
     //   result.normal.w = albedo.w;               (slot 1 .w = original albedo.a)
-    let n = normalize(in.world_normal);
+    // Write the HOST-SURFACE normal (not the per-leaf billboard normal)
+    // to the normal MRT, so the screenspace shadow's cosine term + SSAO
+    // treat the decorator like the surface it grows from. Using the leaf
+    // normal here zeroed object shadows on grass (leaf normals are ~90°
+    // to the up-ish light → cosine≈0). The lit `color` already used the
+    // leaf `world_normal`, so this doesn't change how the grass is shaded.
+    let n = normalize(in.surface_normal);
     var out: PsOut;
     out.color = color;
     out.normal = vec4<f32>(n * 0.5 + vec3<f32>(0.5), color.w);

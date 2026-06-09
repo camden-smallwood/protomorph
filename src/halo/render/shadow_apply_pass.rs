@@ -120,10 +120,27 @@ pub fn shadow_frustum_only_from_env() -> f32 {
     })
 }
 
+/// Per-caster uniform slot stride. 256 is the spec maximum for
+/// `min_uniform_buffer_offset_alignment`, so dynamic offsets of
+/// `caster_index × STRIDE` are valid on every device. Each slot holds
+/// one `ShadowGenerateUniforms` (128 B) or `ShadowApplyUniforms` (208 B).
+const SHADOW_CASTER_STRIDE: u64 = 256;
+
+/// Max shadow casters drawn per frame. The generate/apply uniform
+/// buffers are sized for this; casters past it are dropped (logged once).
+/// Object shadows only — far above the engine's throttled
+/// `shadow_generate_count`, but protomorph has no LOD throttle yet.
+pub const MAX_SHADOW_CASTERS: u32 = 512;
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable, Debug, Default)]
 struct ShadowGenerateUniforms {
     world_to_shadow: [[f32; 4]; 4],
+    /// Object-to-world for THIS caster. Folded in here (vs the shared
+    /// `model_bind_group` slot) so shadows aren't tied to the on-screen
+    /// `render_list` — any shadow-casting object can be drawn, including
+    /// ones culled from view whose shadow still lands on-screen.
+    model: [[f32; 4]; 4],
 }
 
 /// State for the shadow-generate + apply pipelines.
@@ -161,7 +178,8 @@ impl ShadowApplyPass {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
+                        // Per-caster slot addressed by dynamic offset.
+                        has_dynamic_offset: true,
                         min_binding_size: None,
                     },
                     count: None,
@@ -279,10 +297,12 @@ impl ShadowApplyPass {
             cache: None,
         });
 
-        let apply_uniform = shared.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // One slot per caster (dynamic offset). Sized for MAX_SHADOW_CASTERS.
+        let apply_uniform = shared.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow_apply_uniform"),
-            contents: bytemuck::bytes_of(&ShadowApplyUniforms::default()),
+            size: MAX_SHADOW_CASTERS as u64 * SHADOW_CASTER_STRIDE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let depth_sampler = shared.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -294,8 +314,14 @@ impl ShadowApplyPass {
         });
         let shadow_sampler = shared.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow_apply_compare_sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            // POINT comparison — engine `shadow_apply_hlsl.hlsl` samples
+            // the shadow depth with `tex2D_offset_point` and does the
+            // bilinear smoothing via MANUAL blend weights in the kernel.
+            // A Linear comparison sampler would add a hardware 2×2 PCF to
+            // every tap, turning the 3×3 kernel into a ~4×4 blur — the
+            // main remaining over-softening vs the engine.
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
@@ -309,8 +335,10 @@ impl ShadowApplyPass {
         });
 
         // ----- Shadow generate (depth-only) pipeline -----
-        // Bind groups: @group(0) = ShadowGenerateUniforms (world_to_shadow),
-        //              @group(1) = shared.model_bgl (per-object dynamic offset).
+        // @group(0) = ShadowGenerateUniforms {world_to_shadow, model},
+        // one slot per caster addressed by dynamic offset. The model is
+        // folded in (no shared model_bind_group), so shadows are not tied
+        // to the on-screen render_list.
         let generate_bgl = shared.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadow_generate_uniforms_bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -318,28 +346,34 @@ impl ShadowApplyPass {
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
+                    has_dynamic_offset: true,
                     min_binding_size: None,
                 },
                 count: None,
             }],
         });
-        let generate_uniform = shared.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let generate_uniform = shared.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow_generate_uniform"),
-            contents: bytemuck::bytes_of(&ShadowGenerateUniforms::default()),
+            size: MAX_SHADOW_CASTERS as u64 * SHADOW_CASTER_STRIDE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let generate_uniform_bg = shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shadow_generate_uniforms_bg"),
             layout: &generate_bgl,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: generate_uniform.as_entire_binding(),
+                // One slot window; the dynamic offset selects the caster.
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &generate_uniform,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(SHADOW_CASTER_STRIDE),
+                }),
             }],
         });
         let generate_layout = shared.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow_generate_pipeline_layout"),
-            bind_group_layouts: &[&generate_bgl, &shared.model_bgl],
+            bind_group_layouts: &[&generate_bgl],
             immediate_size: 0,
         });
         let generate_shader = shared.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -419,29 +453,37 @@ impl ShadowApplyPass {
     }
 
     /// Open a depth-only render pass into `_surface_shadow_1` for one
-    /// caster. The caller draws shadow-casting geometry through the
-    /// already-bound shadow_generate pipeline (set_bind_group(1, model_bg, &[off]),
-    /// set_vertex_buffer, set_index_buffer, draw_indexed). When the
-    /// returned rpass is dropped, depth has been written.
+    /// caster `caster_index`. The caller draws shadow-casting geometry
+    /// through the already-bound shadow_generate pipeline (set_vertex_buffer,
+    /// set_index_buffer, draw_indexed — the per-caster `world_to_shadow`
+    /// + `model` are already in the bound uniform slot). When the returned
+    /// rpass is dropped, depth has been written.
     ///
     /// Engine equivalent: `setup_targets_shadow_generate(clear=1, ...)
     /// → object_renderer::render_shadows_generate(...) →
     /// structure_renderer::render_shadows_generate(...)`.
     ///
-    /// Pairs with `apply_caster` — the latter samples the populated
-    /// depth target and stamps darkening onto LDR.
+    /// Each caster writes a DISTINCT slot (`caster_index × STRIDE`) of the
+    /// generate uniform buffer, so a single per-frame submit sees every
+    /// caster's own matrix — no last-write-wins clobber. Pairs with
+    /// `apply_caster`, which must use the SAME `caster_index`.
+    #[allow(clippy::too_many_arguments)]
     pub fn begin_generate_pass<'a>(
         &'a self,
         shared: &SharedResources,
         encoder: &'a mut wgpu::CommandEncoder,
         shadow_depth_view: &'a wgpu::TextureView,
         world_to_shadow: glam::Mat4,
+        model_matrix: glam::Mat4,
+        caster_index: u32,
         sub_res: u32,
     ) -> wgpu::RenderPass<'a> {
         let uniforms = ShadowGenerateUniforms {
             world_to_shadow: world_to_shadow.to_cols_array_2d(),
+            model: model_matrix.to_cols_array_2d(),
         };
-        shared.queue.write_buffer(&self.generate_uniform, 0, bytemuck::bytes_of(&uniforms));
+        let slot = caster_index as u64 * SHADOW_CASTER_STRIDE;
+        shared.queue.write_buffer(&self.generate_uniform, slot, bytemuck::bytes_of(&uniforms));
 
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("shadow_generate_pass"),
@@ -464,7 +506,7 @@ impl ShadowApplyPass {
         let sub = sub_res.max(8) as f32;
         rpass.set_viewport(0.0, 0.0, sub, sub, 0.0, 1.0);
         rpass.set_pipeline(&self.generate_pipeline);
-        rpass.set_bind_group(0, &self.generate_uniform_bg, &[]);
+        rpass.set_bind_group(0, &self.generate_uniform_bg, &[slot as u32]);
         rpass
     }
 
@@ -487,6 +529,7 @@ impl ShadowApplyPass {
         world_to_shadow: glam::Mat4,
         light_dir_world: glam::Vec3,
         opacity: f32,
+        caster_index: u32,
         sub_res: u32,
     ) {
         let inv_vp = (camera_projection * camera_view).inverse();
@@ -508,7 +551,9 @@ impl ShadowApplyPass {
                 shadow_frustum_only_from_env(),
             ],
         };
-        shared.queue.write_buffer(&self.apply_uniform, 0, bytemuck::bytes_of(&uniforms));
+        // Distinct slot per caster — no clobber across the single submit.
+        let slot = caster_index as u64 * SHADOW_CASTER_STRIDE;
+        shared.queue.write_buffer(&self.apply_uniform, slot, bytemuck::bytes_of(&uniforms));
 
         // Cache key folds in the varying-per-caster views; the uniform
         // buffer + samplers are stable. Each caster's bind group is
@@ -528,7 +573,13 @@ impl ShadowApplyPass {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: self.apply_uniform.as_entire_binding(),
+                        // One slot window; the dynamic offset selects the
+                        // caster at bind time.
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.apply_uniform,
+                            offset: 0,
+                            size: std::num::NonZeroU64::new(SHADOW_CASTER_STRIDE),
+                        }),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -588,7 +639,7 @@ impl ShadowApplyPass {
             ..Default::default()
         });
         rpass.set_pipeline(&self.apply_pipeline);
-        rpass.set_bind_group(0, bind_group.as_ref(), &[]);
+        rpass.set_bind_group(0, bind_group.as_ref(), &[slot as u32]);
         rpass.draw(0..3, 0..1);
     }
 }
@@ -648,11 +699,17 @@ pub fn build_caster_ortho(
     let right = forward.cross(up_world).normalize_or_zero();
     let up = right.cross(forward).normalize_or_zero();
 
-    // Eye sits behind the caster center along -forward by extents.
-    let radius = caster_extents.length();
+    // Half-size of the ortho box. The loop passes `splat(shadow_radius)`
+    // (= 3× the bounding-sphere radius, per `object_shadow_get_potential_
+    // bounds @ 0x1806BAAD0`). Take the max extent → a cube of that
+    // half-size (~6r across). Using `.length()` instead circumscribed the
+    // sphere with a cube of half-size `radius·√3 ≈ 5.2r` — ~1.7× too loose
+    // on every axis, so the caster's silhouette covered ~3× fewer shadow-
+    // map texels → blurry. `max_element` packs the caster into far more
+    // depth texels (sharper) while still covering the 3× ground bound.
+    let radius = caster_extents.max_element();
     let eye = caster_center - forward * radius;
     let view = glam::Mat4::look_at_rh(eye, caster_center, up);
-    // Ortho through the OBB radius.
     let proj = glam::Mat4::orthographic_rh(
         -radius, radius, -radius, radius, 0.01, radius * 2.5,
     );
@@ -722,18 +779,42 @@ pub fn build_caster_obb_ortho(
     // attachment-tree expansion of `m_projection_bounds` for the same
     // effect; we get there with an explicit padding factor.
     let center_l = (min_l + max_l) * 0.5;
-    let half_l = (max_l - min_l) * 0.5;
-    const RECEIVER_BUFFER: f32 = 4.0;
-    let depth_back = half_l.z * 2.0 + 0.5;
-    let z_far = depth_back + half_l.z + RECEIVER_BUFFER * half_l.z + 0.5;
-    // World-space center.
+    // Floor each half-extent so a near-flat object (a decal-thin AABB, a
+    // single-plane mesh) can't collapse the ortho to a zero-width frustum
+    // → NaN projection. 5 cm is well below any real caster's dimensions.
+    let half_l = ((max_l - min_l) * 0.5).max(glam::Vec3::splat(0.05));
+    // Engine `object_shadow_visible`/`setup_camera`: the along-light volume
+    // depth (`extents[0]`) is sized from the object's PERPENDICULAR
+    // (projected) radius (`extents[0] ≈ 1.5 × projected_radius`), then the
+    // ortho spans `[extents, 3·extents]` from an eye `2·extents` behind the
+    // OBB center. NOT a fixed buffer off the along-light extent.
+    //
+    // Why this is the right shape: the screenspace apply darkens EVERY
+    // receiver in the light column behind the occluder, so the volume's far
+    // plane is what stops a caster from stamping a phantom second shadow on
+    // geometry further down-light (a weapon on a ledge → the wall below).
+    // A small/flat caster has a tiny perpendicular radius → short volume →
+    // far plane just past its footprint, so the wall below is OUTSIDE the
+    // frustum (culled). A tall caster is large perpendicular to a steep
+    // sun → deep volume that reaches its ground footprint. (`shadow_falloff`
+    // in the apply softens the tail; the far-plane cull does the heavy work.)
+    // Size the depth from the object's BOUNDING-SPHERE radius (≈ the AABB's
+    // enclosing sphere), matching the engine's `projected_radius` (taken
+    // from the object's bounding sphere in `render_lightmap_shadow_calculate_
+    // radius`). NOT the perpendicular AABB width: that's tiny for a thin TALL
+    // caster (the antenna mast/ladder), which gave it a too-short volume and
+    // clipped its footprint ("barely visible"). The sphere radius is large
+    // for tall objects (reaches the footprint) and small for compact ones
+    // (far plane culls the geometry below a ledge → no phantom).
+    let radius = half_l.length();
+    let extents = radius * 2.0;
     let center_world = right * center_l.x + up * center_l.y + forward * center_l.z;
-    let eye = center_world - forward * depth_back;
+    let eye = center_world - forward * (2.0 * extents);
     let view = glam::Mat4::look_at_rh(eye, center_world, up);
-    // Ortho frustum: ±half on the perpendicular axes, [near, z_far]
-    // along forward. Some lateral padding so shadows from objects whose
-    // silhouette extends past their AABB (alpha-tested foliage etc.)
-    // don't get clipped at the frustum sides.
+    let z_far = 3.0 * extents;
+    // Ortho frustum: ±half on the perpendicular axes, [near, z_far] along
+    // forward. Lateral padding so silhouettes that bleed past the AABB
+    // (alpha-tested foliage etc.) aren't clipped at the frustum sides.
     const LATERAL_BUFFER: f32 = 1.5;
     let proj = glam::Mat4::orthographic_rh(
         -half_l.x * LATERAL_BUFFER, half_l.x * LATERAL_BUFFER,

@@ -98,7 +98,51 @@ pub fn load_object(crate_path: &Path) -> Result<ModelData, HaloLoadError> {
         // builder fills this even when the object tag's radius is 0.
         read_model_object_data_sphere(&model_tag)
     };
-    model.casts_shadow = obj_def.casts_shadow_runtime();
+    // Engine `render_object_has_lightmap_shadow @ 0x180696EE0` type-matrix.
+    // Runtime shadow eligibility depends on the object's TYPE (tag class)
+    // AND its lightmap_shadow_mode:
+    //   - flags & does_not_cast_shadow → no
+    //   - mode == never                → no
+    //   - mode == default              → ONLY biped/vehicle/weapon (the
+    //       "dynamic" objects). Default-mode scenery/crate/equipment is
+    //       baked into the lightmap OFFLINE, NOT runtime-cast — which is
+    //       why placed default-mode props (pine trees, waterfalls,
+    //       man-cannons) must NOT throw a hard dynamic shadow.
+    //   - mode == always | blur        → static props that opt into a
+    //       runtime shadow (crates like the antenna mast, resupply scenery,
+    //       machines, …). The engine additionally excludes equipment /
+    //       projectile / sound_scenery here; we keep those (a small, safe
+    //       deviation) pending the exact e_object_type enum values.
+    // Replaces the prior relaxed `obj_def.casts_shadow_runtime()` (cast
+    // unless never / does-not-cast), which over-cast default-mode scenery.
+    let object_type = crate_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let does_not_cast = obj_def
+        .flags
+        .contains(blam_tags::object::ObjectDefinitionFlags::DoesNotCastShadow);
+    model.casts_shadow = !does_not_cast
+        && match obj_def.lightmap_shadow_mode.get() {
+            blam_tags::object::LightmapShadowMode::Never => false,
+            blam_tags::object::LightmapShadowMode::Default => {
+                matches!(object_type, "biped" | "vehicle" | "weapon")
+            }
+            blam_tags::object::LightmapShadowMode::Always
+            | blam_tags::object::LightmapShadowMode::Blur => true,
+        };
+
+    // Diagnostic — log shadow eligibility inputs per object so we can see
+    // which lightmap_shadow_mode + tag type the trees vs the ladder/crate
+    // actually have before tightening the gate to the engine type-matrix
+    // (`render_object_has_lightmap_shadow @ 0x180696EE0`). Gated env var.
+    if std::env::var("PROTOMORPH_LOG_SHADOW_ELIG").map(|v| v == "1").unwrap_or(false) {
+        let ext = crate_path.extension().and_then(|e| e.to_str()).unwrap_or("?");
+        let stem = crate_path.file_stem().and_then(|e| e.to_str()).unwrap_or("?");
+        eprintln!(
+            "[shadow-elig] {stem}.{ext} mode={:?} does_not_cast={} casts={}",
+            obj_def.lightmap_shadow_mode.get(),
+            obj_def.flags.contains(blam_tags::object::ObjectDefinitionFlags::DoesNotCastShadow),
+            model.casts_shadow,
+        );
+    }
 
     Ok(model)
 }
