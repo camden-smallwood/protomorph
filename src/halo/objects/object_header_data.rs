@@ -127,6 +127,63 @@ pub fn clear() {
     OBJECT_NAME_MAP.write().unwrap().clear();
 }
 
+/// Append a header entry for a runtime-created object that has no
+/// scenario placement — currently model-variant child objects (turrets
+/// attached via `model_variant_object_block`). Returns the new object's
+/// header index (`= table length before the push`). The entry is
+/// appended AFTER every scenario placement (which already occupy
+/// `[0, placement_count)` from [`populate_from_scenario`]), so it never
+/// collides with a [`header_index_for_placement`] result.
+///
+/// Engine equivalent: `object_new` allocates a fresh `object_data` slot
+/// for the spawned child and `c_object::initialize` fills its datum —
+/// the child is a first-class object with its own handle, which is what
+/// lets its render-method function lookups (`object_get_function_value`)
+/// resolve against ITS `object_definition.functions[]` instead of
+/// returning 0.
+///
+/// `world` is decomposed into the datum frame exactly as
+/// [`set_world_transform`] does (engine `from_cols(forward,left,up,pos)`).
+/// `variant_index` selects the child's own model variant (drives the
+/// `variant` compute case); `-1`/`0` when unresolved.
+pub fn push_object(
+    object_type: ObjectType,
+    tag_path: String,
+    object_definition: Arc<ObjectDefinition>,
+    variant_index: i8,
+    world: glam::Mat4,
+) -> u32 {
+    use blam_tags::math::{RealPoint3d, RealVector3d};
+
+    let mut datum = ObjectDatum::new(object_type, -1);
+    let (c0, c2, p) = (world.x_axis, world.z_axis, world.w_axis);
+    let fwd = glam::Vec3::new(c0.x, c0.y, c0.z);
+    let s = fwd.length();
+    let fwd_n = if s > 1e-6 { fwd / s } else { glam::Vec3::X };
+    let up_n = glam::Vec3::new(c2.x, c2.y, c2.z).normalize_or_zero();
+    datum.object.forward = RealVector3d { i: fwd_n.x, j: fwd_n.y, k: fwd_n.z };
+    datum.object.up = RealVector3d { i: up_n.x, j: up_n.y, k: up_n.z };
+    datum.object.relative_position = RealPoint3d { x: p.x, y: p.y, z: p.z };
+    datum.object.scale = if s > 1e-6 { s } else { 1.0 };
+    datum.object.bounding_sphere_center = RealPoint3d { x: p.x, y: p.y, z: p.z };
+    datum.object.bounding_sphere_radius = object_definition.bounding_radius;
+    datum.object.variant_index = variant_index;
+    // Runtime-created: no scenario placement / no name binding.
+    datum.object.scenario_datum_index = -1;
+    datum.object.name_index = -1;
+
+    let mut guard = OBJECT_HEADER_DATA.write().unwrap();
+    let new_index = guard.len() as u32;
+    datum.object.object_identifier.unique_id = new_index as i32;
+    guard.push(ObjectHeaderDatum {
+        object_type,
+        tag_path,
+        object_definition,
+        object_datum: Arc::new(RwLock::new(datum)),
+    });
+    new_index
+}
+
 /// Engine `(object_header_data->data + index * size)->object_type`
 /// lookup. Returns the `ObjectType` for `object_index`.
 ///
@@ -245,6 +302,10 @@ pub fn header_index_for_placement(
     }
     base += scenario.sound_scenery.len() as u32;
     if object_type == ObjectType::Crate {
+        return base + placement_index_within_type;
+    }
+    base += scenario.crates.len() as u32;
+    if object_type == ObjectType::EffectScenery {
         return base + placement_index_within_type;
     }
     panic!(
@@ -389,8 +450,10 @@ pub fn populate_from_scenario(
     push_block(&mut entries, &empty, ObjectType::SoundScenery, &scenario.sound_scenery, &scenario.sound_scenery_palette, base);
     base += scenario.sound_scenery.len() as u32;
     push_block(&mut entries, &empty, ObjectType::Crate,        &scenario.crates,        &scenario.crate_palette,        base);
+    base += scenario.crates.len() as u32;
+    push_block(&mut entries, &empty, ObjectType::EffectScenery, &scenario.effect_scenery, &scenario.effect_scenery_palette, base);
     let _ = base; // for symmetry; unused after last block
-    // creature, giant, effect_scenery — no dedicated placement Vec
+    // creature, giant — no dedicated placement Vec
 
     let total_functions: usize = entries.iter().map(|e| e.object_definition.functions.len()).sum();
     let mut nonzero_variant = 0usize;

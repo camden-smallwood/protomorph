@@ -163,13 +163,22 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
         specular_mask = albedo_full.w;
         albedo = vec4<f32>(albedo_full.rgb, specular_mask);
     } else {
-        let misc = vec4<f32>(0.0);
+        // misc.xyz carries world-space view_dir (fragment→camera) for albedo
+        // variants that need it (chameleon's N·V); .w reserved.
+        let misc = vec4<f32>(view_dir, 0.0);
         var bump_normal_unnorm: vec3<f32>;
         calc_bumpmap(texcoord, in.fragment_to_camera_world, tangent, binormal, normal, &bump_normal_unnorm);
         calc_albedo(texcoord, &albedo, bump_normal_unnorm, misc);
         bump_normal = normalize(bump_normal_unnorm + 1e-6 * normal);
         calc_specular_mask(texcoord, albedo.w, &specular_mask);
     }
+
+    // soft_fade (common_fx.hlsl apply_soft_fade) — the engine applies this
+    // inside get_albedo_and_normal, right after albedo is computed. No-op
+    // unless the material's soft_fade category = on. `bump_normal`/`view_dir`
+    // are world-space; `clip_position.z` is the fragment's device depth and
+    // `.xy` the screen pixel (both plumbed for the deferred soft-z branch).
+    apply_soft_fade(&albedo, bump_normal, view_dir, in.clip_position.z, in.clip_position.xy);
 
     // HLSL line 207-211:
     //   float view_dot_normal = dot(view_dir, bump_normal);
@@ -275,6 +284,12 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
             + self_illum_radiance
             + envmap_radiance
             + mat.specular_color.xyz;
+        // HLSL APPLY_OVERLAYS(out_color, texcoord, view_dot_normal) —
+        // overlay then edge_fade, BEFORE extinction/exposure. view_dot_normal
+        // = dot(view, normal); in tangent space the normal is (0,0,1) so it
+        // is the tangent-space view dir's z.
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dir_in_tangent_space.z);
         out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
         alpha_out = saturate(mat.specular_color.w + albedo.w);
     } else {
@@ -283,6 +298,10 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
             + mat.specular_color.xyz
             + self_illum_radiance
             + envmap_radiance;
+        // HLSL APPLY_OVERLAYS — overlay (multiply_and_additive_detail = the
+        // halogram cell layer) then edge_fade, before extinction/exposure.
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dir_in_tangent_space.z);
         out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
     }
     // Underwater fog is applied by the separate `render_underwater_fog`

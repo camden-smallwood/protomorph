@@ -671,6 +671,16 @@ pub struct FrameContext<'a> {
     /// `None` until `Renderer::load_scenario` has run.
     pub decal_renderer:
         Option<&'a crate::halo::render::render_decals::DecalRenderer>,
+    /// `ParticleGpu` — plumbed through for in-rpass dispatch of
+    /// `TransparentDispatch::Particle` batches (F-full): particles draw
+    /// inside the shared transparents rpass so they sort against
+    /// glass/water. Engine `c_particle_emitter::render_callback`.
+    pub particle_gpu: &'a crate::halo::gpu_particle::ParticleGpu,
+    /// `PatchyFogPass` — plumbed through for in-rpass dispatch of the
+    /// `TransparentDispatch::PatchyFog` fullscreen composite (engine
+    /// `render_patchy_fog_callback` registered by `queue_patchy_fog`).
+    /// `draw` is a no-op unless the player view `prepare`d it this frame.
+    pub patchy_fog_pass: &'a crate::halo::render::patchy_fog_pass::PatchyFogPass,
 }
 
 pub trait RenderPass {
@@ -803,6 +813,21 @@ pub struct SharedResources {
     /// views (`_surface_albedo` + normal). Used by static_lighting +
     /// transparents passes (where the G-buffer is read-only).
     pub camera_bind_group_sl: wgpu::BindGroup,
+    /// `camera_bind_group_transparent` — identical to `_sl` plus the REAL
+    /// scene depth at binding 15. Used ONLY by the transparent pass
+    /// (`render_transparents`), where the depth attachment is read-only
+    /// (`depth_ops: None`) so the same depth texture can be both depth-
+    /// tested and sampled. Drives the `soft_fade` use_soft_z fade. The
+    /// default + `_sl` groups bind a 1×1 placeholder depth at binding 15.
+    pub camera_bind_group_transparent: wgpu::BindGroup,
+    /// REAL scene-depth (DepthOnly aspect) view used by
+    /// `camera_bind_group_transparent` @ binding 15. Replaced via
+    /// `set_gbuffer_views` after the `GBuffer` is (re)constructed.
+    pub gbuffer_depth_view: wgpu::TextureView,
+    /// 1×1 placeholder DEPTH texture kept alive for the binding-15
+    /// placeholder views in the default + `_sl` camera bind groups
+    /// (passes that WRITE depth — can't also sample the live buffer).
+    pub depth_placeholder_texture: wgpu::Texture,
 
     // Model transforms
     pub model_bgl: wgpu::BindGroupLayout,
@@ -1173,6 +1198,28 @@ impl SharedResources {
         let gbuffer_normal_view =
             gbuffer_placeholder_texture.create_view(&Default::default());
 
+        // 1×1 placeholder DEPTH texture for camera_bgl binding 15 in the
+        // default + `_sl` groups (depth-writing passes never sample it).
+        // `Depth32Float` matches the gbuffer depth format so the layout's
+        // `Depth` sample type is satisfied. The real scene depth is wired
+        // into `camera_bind_group_transparent` via `set_gbuffer_views`.
+        let depth_placeholder_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth_placeholder"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_placeholder_view =
+            depth_placeholder_texture.create_view(&Default::default());
+        // Initial real scene-depth view — placeholder until
+        // `set_gbuffer_views` installs the real `GBuffer.depth_sample_view`.
+        let gbuffer_depth_view =
+            depth_placeholder_texture.create_view(&Default::default());
+
         // --- Bind groups ---
         // `camera_bind_group` uses placeholder views at 10/11 — bound
         // by `render_albedo` while it writes `_surface_albedo`.
@@ -1194,6 +1241,7 @@ impl SharedResources {
             &engine_misc_ps_buffer,
             &engine_dominant_light_buffer,
             &kernel5_ps_buffer,
+            &depth_placeholder_view,
             "camera_bg",
         );
         // `camera_bind_group_sl` uses real views at 10/11 — bound by
@@ -1218,7 +1266,32 @@ impl SharedResources {
             &engine_misc_ps_buffer,
             &engine_dominant_light_buffer,
             &kernel5_ps_buffer,
+            &depth_placeholder_view,
             "camera_bg_sl",
+        );
+        // `camera_bind_group_transparent` — real G-buffer views + real
+        // scene depth at 15. Initially placeholder depth (and placeholder
+        // gbuffer) until `set_gbuffer_views` installs the real views.
+        let camera_bind_group_transparent = build_camera_bind_group(
+            &device,
+            &camera_bgl,
+            &camera_buffer,
+            &engine_lighting_buffer,
+            &atmosphere_buffer,
+            &lightmap_compress_buffer,
+            &lightprobe_atlas_view,
+            &lightprobe_intensity_atlas_view,
+            &filtering_sampler,
+            &engine_underwater_buffer,
+            &simple_lights_buffer,
+            &engine_exposure_buffer,
+            &gbuffer_albedo_view,
+            &gbuffer_normal_view,
+            &engine_misc_ps_buffer,
+            &engine_dominant_light_buffer,
+            &kernel5_ps_buffer,
+            &gbuffer_depth_view,
+            "camera_bg_transparent",
         );
         let model_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("model_bg"),
@@ -1284,6 +1357,9 @@ impl SharedResources {
             gbuffer_normal_view,
             gbuffer_placeholder_texture,
             camera_bind_group_sl,
+            camera_bind_group_transparent,
+            gbuffer_depth_view,
+            depth_placeholder_texture,
         }
     }
 
@@ -1298,9 +1374,12 @@ impl SharedResources {
         &mut self,
         albedo_view: wgpu::TextureView,
         normal_view: wgpu::TextureView,
+        depth_view: wgpu::TextureView,
     ) {
         self.gbuffer_albedo_view = albedo_view;
         self.gbuffer_normal_view = normal_view;
+        self.gbuffer_depth_view = depth_view;
+        let placeholder_depth = self.depth_placeholder_texture.create_view(&Default::default());
         self.camera_bind_group_sl = build_camera_bind_group(
             &self.device,
             &self.camera_bgl,
@@ -1319,7 +1398,30 @@ impl SharedResources {
             &self.engine_misc_ps_buffer,
             &self.engine_dominant_light_buffer,
             &self.kernel5_ps_buffer,
+            &placeholder_depth,
             "camera_bg_sl",
+        );
+        // The transparent group is the only one with the REAL scene depth.
+        self.camera_bind_group_transparent = build_camera_bind_group(
+            &self.device,
+            &self.camera_bgl,
+            &self.camera_buffer,
+            &self.engine_lighting_buffer,
+            &self.atmosphere_buffer,
+            &self.lightmap_compress_buffer,
+            &self.lightprobe_atlas_view,
+            &self.lightprobe_intensity_atlas_view,
+            &self.filtering_sampler,
+            &self.engine_underwater_buffer,
+            &self.simple_lights_buffer,
+            &self.engine_exposure_buffer,
+            &self.gbuffer_albedo_view,
+            &self.gbuffer_normal_view,
+            &self.engine_misc_ps_buffer,
+            &self.engine_dominant_light_buffer,
+            &self.kernel5_ps_buffer,
+            &self.gbuffer_depth_view,
+            "camera_bg_transparent",
         );
     }
 
@@ -1345,6 +1447,9 @@ impl SharedResources {
         let placeholder_normal = self
             .gbuffer_placeholder_texture
             .create_view(&Default::default());
+        let placeholder_depth = self
+            .depth_placeholder_texture
+            .create_view(&Default::default());
         self.camera_bind_group = build_camera_bind_group(
             &self.device,
             &self.camera_bgl,
@@ -1363,6 +1468,7 @@ impl SharedResources {
             &self.engine_misc_ps_buffer,
             &self.engine_dominant_light_buffer,
             &self.kernel5_ps_buffer,
+            &placeholder_depth,
             "camera_bg",
         );
         self.camera_bind_group_sl = build_camera_bind_group(
@@ -1383,7 +1489,29 @@ impl SharedResources {
             &self.engine_misc_ps_buffer,
             &self.engine_dominant_light_buffer,
             &self.kernel5_ps_buffer,
+            &placeholder_depth,
             "camera_bg_sl",
+        );
+        self.camera_bind_group_transparent = build_camera_bind_group(
+            &self.device,
+            &self.camera_bgl,
+            &self.camera_buffer,
+            &self.engine_lighting_buffer,
+            &self.atmosphere_buffer,
+            &self.lightmap_compress_buffer,
+            &self.lightprobe_atlas_view,
+            &self.lightprobe_intensity_atlas_view,
+            &self.filtering_sampler,
+            &self.engine_underwater_buffer,
+            &self.simple_lights_buffer,
+            &self.engine_exposure_buffer,
+            &self.gbuffer_albedo_view,
+            &self.gbuffer_normal_view,
+            &self.engine_misc_ps_buffer,
+            &self.engine_dominant_light_buffer,
+            &self.kernel5_ps_buffer,
+            &self.gbuffer_depth_view,
+            "camera_bg_transparent",
         );
     }
 
@@ -1392,10 +1520,14 @@ impl SharedResources {
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera_bgl"),
             entries: &[
+                // VERTEX_FRAGMENT: the VS uses `camera.projection`/`view`
+                // for clip transform; the FS now reads `camera.projection`
+                // in the `soft_fade` use_soft_z branch (`sf_linear_depth`
+                // reconstructs view-space distance from device depth).
                 uniform_entry(
                     0,
                     size_of::<CameraUniforms>() as u64,
-                    wgpu::ShaderStages::VERTEX,
+                    wgpu::ShaderStages::VERTEX_FRAGMENT,
                     false,
                 ),
                 // Engine `LightingPS` cbuffer (slot 0x30 / 0x2E) —
@@ -1591,6 +1723,21 @@ impl SharedResources {
                     },
                     count: None,
                 },
+                // Scene depth (read-only) for the `soft_fade` use_soft_z
+                // branch. `texture_depth_2d` in WGSL — point-loaded (no
+                // sampler). Real only in `camera_bind_group_transparent`;
+                // a 1×1 placeholder in the default + `_sl` groups (which
+                // bind in depth-WRITING passes, where soft_z never runs).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Depth,
+                    },
+                    count: None,
+                },
             ],
         })
     }
@@ -1688,6 +1835,7 @@ fn build_camera_bind_group(
     engine_misc_ps_buffer: &wgpu::Buffer,
     engine_dominant_light_buffer: &wgpu::Buffer,
     kernel5_ps_buffer: &wgpu::Buffer,
+    scene_depth_view: &wgpu::TextureView,
     label: &str,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1745,6 +1893,10 @@ fn build_camera_bind_group(
             wgpu::BindGroupEntry {
                 binding: 14,
                 resource: kernel5_ps_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: wgpu::BindingResource::TextureView(scene_depth_view),
             },
         ],
     })

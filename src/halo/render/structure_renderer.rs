@@ -48,30 +48,50 @@ pub mod mesh_part_flags {
     pub const ALBEDO_MASK: u32 = LIT | SHADOW_CASTING;
 }
 
-/// Map `e_geometry_part_type` (Ares `geometry_definitions_new.h:25`)
-/// to the runtime `RenderClusterPart.flags` mask bits. The engine
-/// does this in the visibility traversal (results stored in a u16 on
-/// `s_visible_cluster` at offset 0); we don't have visibility yet, so
-/// we compute the same mapping here from `part->part_type` directly.
+use blam_tags::render_model::GeometryPartType;
+
+/// Map [`GeometryPartType`] (Ares `e_geometry_part_type`) to the runtime
+/// `RenderClusterPart.flags` mask bits. The engine does this in the
+/// visibility traversal (`s_visible_cluster.flags`); we compute the same
+/// mapping here from `part.part_type` directly.
 ///
-/// Mapping:
-/// - 0 `opaque_not_drawn` → 0 (never renders)
-/// - 1 `opaque_shadow_only` → LIT (lit pass; not in albedo without
-///   shadow_casting in mask)
-/// - 2 `opaque_shadow_casting` → LIT | SHADOW_CASTING (primary opaque)
-/// - 3 `opaque_non_shadowing` → LIT | SHADOW_CASTING
-/// - 4 `transparent` → 0 (queued via `TransparencyRenderer` instead)
-/// - 5 `lightmap_only` → 0 (offline lightmap baking only — `z_invis_lightquad`)
-pub fn part_type_to_flags(part_type: i8) -> u32 {
+/// - `OpaqueShadowOnly` → LIT (lit pass; not in albedo without
+///   shadow_casting in the mask)
+/// - `OpaqueShadowCasting` / `OpaqueNonShadowing` → LIT | SHADOW_CASTING
+/// - `OpaqueNotDrawn` → 0 (never renders)
+/// - `Transparent` → 0 (queued via `TransparencyRenderer` instead)
+/// - `LightmapOnly` → 0 (offline lightmap baking only — `z_invis_lightquad`)
+pub fn part_type_to_flags(part_type: GeometryPartType) -> u32 {
     use mesh_part_flags::*;
+    use GeometryPartType::*;
     match part_type {
-        0 => 0,
-        1 => LIT,
-        2 | 3 => LIT | SHADOW_CASTING,
-        4 => 0,
-        5 => 0,
-        _ => 0,
+        OpaqueShadowOnly => LIT,
+        OpaqueShadowCasting | OpaqueNonShadowing => LIT | SHADOW_CASTING,
+        OpaqueNotDrawn | Transparent | LightmapOnly => 0,
     }
+}
+
+/// Engine `part_is_renderable @ 0x18069eb90`:
+/// ```c
+/// return part->type != 5                       // NOT lightmap_only
+///     && part->render_method_index != -1
+///     && materials[part->render_method_index].render_method.index != -1;
+/// ```
+/// `submit_visibility` calls this as a GATE before computing the
+/// per-part render-pass flags — a non-renderable part is never added to
+/// any pass, *including the transparent pass*. The `render_method` /
+/// material validity checks are already handled upstream here (parts
+/// with a `None` material slot are skipped), so this only mirrors the
+/// `part->type != 5` clause: [`GeometryPartType::LightmapOnly`]
+/// (`z_invis_lightquad`) parts are invisible quads baked solely to feed
+/// the offline lightmapper and are never drawn at runtime. Without this
+/// gate the `is_transparent` shortcut (always true for rmhg/rmw/etc.)
+/// would route these invisible quads into the transparent pass and draw
+/// them (e.g. s3d_lockout `lct_collision` halogram lightquads rendering
+/// as flat grey planes).
+#[inline]
+pub fn part_is_renderable(part_type: GeometryPartType) -> bool {
+    part_type != GeometryPartType::LightmapOnly
 }
 
 /// Transform a model-space transparent sort plane `(i, j, k, d)` to world
@@ -281,6 +301,13 @@ impl StructureRenderer {
                             continue;
                         };
                         let Some(mat) = mat_slot.as_ref() else { continue };
+                        // Engine `part_is_renderable` gate (BEFORE the
+                        // transparency classification): lightmap_only parts
+                        // (part_type 5) are never drawn, even for transparent
+                        // materials.
+                        if !part_is_renderable(part.part_type) {
+                            continue;
+                        }
                         // Engine: cluster_part.flags =
                         //   is_transparent ? TRANSPARENT : part_type_to_flags(part_type)
                         let flags = if mat.is_transparent {
@@ -361,6 +388,11 @@ impl StructureRenderer {
                         continue;
                     };
                     let Some(mat) = mat_slot.as_ref() else { continue };
+                    // Engine `part_is_renderable` gate — skip lightmap_only
+                    // (part_type 5) parts even when the material is transparent.
+                    if !part_is_renderable(part.part_type) {
+                        continue;
+                    }
                     let flags = if mat.is_transparent {
                         mesh_part_flags::TRANSPARENT
                     } else {
@@ -485,6 +517,11 @@ impl StructureRenderer {
                     continue;
                 };
                 let Some(mat) = mat_slot.as_ref() else { continue };
+                // Engine `part_is_renderable` gate — lightmap_only (part_type
+                // 5) parts never draw, even transparent ones.
+                if !part_is_renderable(part.part_type) {
+                    continue;
+                }
                 let flags = if mat.is_transparent {
                     mesh_part_flags::TRANSPARENT
                 } else {
@@ -542,6 +579,11 @@ impl StructureRenderer {
                     continue;
                 };
                 let Some(mat) = mat_slot.as_ref() else { continue };
+                // Engine `part_is_renderable` gate — lightmap_only (part_type
+                // 5) parts never draw, even transparent ones.
+                if !part_is_renderable(part.part_type) {
+                    continue;
+                }
                 let flags = if mat.is_transparent {
                     mesh_part_flags::TRANSPARENT
                 } else {

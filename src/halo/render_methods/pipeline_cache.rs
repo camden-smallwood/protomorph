@@ -183,10 +183,29 @@ fn build_variant(
     //                                `DARK_COLOR_MULTIPLIER = 1.0` so RT1 == RT0
     //                                content-wise.
     //   Transparent subclasses    → MRT[0] = `lighting_base`, single target.
+    // `distortion` category: the shader participates in the engine's
+    // dedicated distortion-GENERATE pass (`c_player_view::generate_
+    // distortions` → `c_transparency_renderer::render`), NOT the main
+    // colour pass — its bound `distort_map`/dudv texture drives a
+    // screen-space warp, it is not visible albedo. We render the colour
+    // path (so the variant assembles + sorts) but write NO colour: the
+    // engine never shows these as flat planes, and rendering their dudv
+    // map as additive colour produced a grey wash over the scene. The
+    // actual displacement warp is a tracked follow-up (reuse the
+    // particle-distortion accumulate→warp infra); until then these
+    // surfaces are invisible, which matches the engine far better than
+    // grey planes. Depth-test still applies (read-only in the
+    // transparent pass) so they occlude/sort correctly.
+    let is_distortion = choices.get_or("distortion", "off") != "off";
+    let lighting_write_mask = if is_distortion {
+        wgpu::ColorWrites::empty()
+    } else {
+        wgpu::ColorWrites::ALL
+    };
     let color_target_lighting = Some(wgpu::ColorTargetState {
         format: wgpu::TextureFormat::Rgba16Float,
         blend,
-        write_mask: wgpu::ColorWrites::ALL,
+        write_mask: lighting_write_mask,
     });
     // RT1 in the SL pass — same format/blend as RT0 so the engine's
     // RT0/RT1-equal-on-PC invariant holds when we copy the same color
@@ -194,7 +213,7 @@ fn build_variant(
     let color_target_lighting_dark = Some(wgpu::ColorTargetState {
         format: wgpu::TextureFormat::Rgba16Float,
         blend,
-        write_mask: wgpu::ColorWrites::ALL,
+        write_mask: lighting_write_mask,
     });
     let color_target_albedo = Some(wgpu::ColorTargetState {
         // engine `_surface_accum_HDR` — same format as `lighting_base`

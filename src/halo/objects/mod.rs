@@ -86,6 +86,12 @@ pub struct ObjectData {
     /// scenery snapped to the sky's `"waterfall"` marker. `None` for the
     /// normal placement-transform path.
     pub model_matrix_override: Option<Mat4>,
+    /// Nearest scenario dynamic-env cubemap probe index for this object's
+    /// position (engine `c_dynamic_cubemap_sample`). Resolved at load via
+    /// `Renderer::nearest_object_cubemap_probe`. Selects the cube bound to
+    /// the material's `dynamic_environment_map_*` slots so glass/env objects
+    /// reflect the real environment. `None` → rasg `DefaultDynamicCubeMap`.
+    pub cubemap_probe_index: Option<u16>,
 }
 
 impl ObjectData {
@@ -163,6 +169,7 @@ impl ObjectStore {
                     header_index: None,
                     engine_lighting_offset: None,
                     model_matrix_override: None,
+                cubemap_probe_index: None,
                 });
 
                 return ObjectIndex(i);
@@ -181,6 +188,7 @@ impl ObjectStore {
             header_index: None,
             engine_lighting_offset: None,
             model_matrix_override: None,
+        cubemap_probe_index: None,
         }));
 
         ObjectIndex(index)

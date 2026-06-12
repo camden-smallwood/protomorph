@@ -737,6 +737,97 @@ impl PlayerView {
         // render in their OWN sort batch (push_marker / sort / render /
         // pop_marker). See `render_objects::submit_and_render_sky`.
 
+        // A1 — Patchy fog. Engine `c_player_view::queue_patchy_fog @
+        // 0x18068BFB0` registers the fog composite into the
+        // TransparencyRenderer: centroid = camera + forward ×
+        // transparent_sort_distance, radius 0 (point sort), offset =
+        // that same distance → z_sort ≈ 0 → it draws LAST within its
+        // authored layer, fogging every transparent/particle sorted
+        // there (the standalone pre-transparents dispatch this replaces
+        // left the s3d_turf drip streaks + chameleon railing punching
+        // through the fog unfogged). Gated on the active atmosphere
+        // setting having the "Patchy Fog" flag (bit 2) and density >
+        // 0.001 — the accumulator's density is 0 when no contributing
+        // setting has the flag, so the single threshold suffices
+        // (engine `c_patchy_fog::render_patchy_fog @ 0x1806B2160`).
+        if let Some(sky_atm) = renderer.scenario_sky_atmosphere.as_ref() {
+            let interface_params = &renderer.atmosphere_fog_interface.default_parameters;
+            if interface_params.patchy_fog_density > 0.001
+                && std::env::var("PROTOMORPH_PATCHY_FOG").as_deref() != Ok("0")
+            {
+                // A1 phase 6 — advance per-frame fog state from camera
+                // delta + wind direction (engine render_patchy_fog
+                // lines 218-260; `dt` mirrors `c_patchy_fog::ms_dt`).
+                let dt: f32 = game.delta_time;
+                let wind = glam::Vec3::new(
+                    interface_params.wind_direction.i,
+                    interface_params.wind_direction.j,
+                    interface_params.wind_direction.k,
+                );
+                self.patchy_fog.update_per_frame(
+                    game.camera.position.into(),
+                    game.camera.forward,
+                    game.camera.up,
+                    sky_atm.distance_between_sheets,
+                    game.camera.near_clip,
+                    wind,
+                    dt,
+                );
+                let params = crate::halo::render::patchy_fog_pass::build_patchy_fog_params(
+                    interface_params,
+                    sky_atm,
+                    &self.patchy_fog,
+                    game.camera.position.into(),
+                    game.camera.projection,
+                    (renderer.shared.config.width, renderer.shared.config.height),
+                    game.camera.near_clip,
+                );
+                let atm = crate::halo::render::patchy_fog_pass::build_patchy_fog_atmosphere(
+                    interface_params,
+                );
+                let fog_view_proj = game.camera.projection * game.camera.view;
+                renderer.patchy_fog.prepare(
+                    &renderer.shared,
+                    &renderer.gbuffer.depth_sample_view,
+                    &renderer.shared.nearest_sampler,
+                    // Falls back to `default_normal_view` (constant ~0.5
+                    // → flat tint) when `sky.patchy_fog_texture` isn't
+                    // authored or failed to load.
+                    &renderer.shared.fallback_textures.default_normal_view,
+                    &renderer.shared.filtering_sampler,
+                    &params,
+                    &atm,
+                    fog_view_proj,
+                    renderer.scenario_view_exposure,
+                    patchy_fog_debug_mode(),
+                );
+                // Register the sort element (engine `add_element(point,
+                // plane, 0.0, layer, render_patchy_fog_callback, this,
+                // 0, sort_distance)`). The authored layer byte is
+                // already e_transparent_sort_layer-space; 0 → normal.
+                use crate::halo::render::render_transparents::{
+                    TransparentDispatch, TransparentSortLayer,
+                };
+                let layer = match sky_atm.transparent_sort_layer {
+                    1 => TransparentSortLayer::Pre,
+                    3 => TransparentSortLayer::Post,
+                    _ => TransparentSortLayer::Normal,
+                };
+                let eye: glam::Vec3 = game.camera.position.into();
+                let fwd: glam::Vec3 = game.camera.forward.normalize_or_zero();
+                let dist = sky_atm.transparent_sort_distance;
+                let centroid = eye + fwd * dist;
+                renderer.transparency_renderer.add_element(
+                    [centroid.x, centroid.y, centroid.z],
+                    None, // radius 0 → point sort; the engine plane is unused
+                    0.0,
+                    dist, // offset: z_sort = depth(centroid) − dist ≈ 0
+                    layer,
+                    TransparentDispatch::PatchyFog,
+                );
+            }
+        }
+
         let frame_ctx = FrameContext {
             shared: &renderer.shared,
             gbuffer: &renderer.gbuffer,
@@ -769,6 +860,8 @@ impl PlayerView {
                 .loaded_scenario
                 .as_ref()
                 .map(|s| &s.decal_renderer),
+            particle_gpu: &renderer.particle_gpu,
+            patchy_fog_pass: &renderer.patchy_fog,
         };
 
         // Prepare phase — mutable pass access for uniform uploads.
@@ -836,6 +929,32 @@ impl PlayerView {
                 game.camera.position.into(),
             );
         }
+        // F-full: prepare the particle color-render group0 (camera + grid +
+        // frame_params + scene depth) BEFORE the frame_ctx aliasing reads
+        // (it borrows `&renderer.particle_gpu` immutably). The batches then
+        // draw inside the shared transparents rpass via `draw_batch`. The
+        // depth view is the DepthOnly aspect sample view — legal to sample
+        // because the transparents pass attaches the same texture read-only.
+        let particle_render_exposure = renderer.render_exposure.max(1.0e-6);
+        renderer.particle_gpu.prepare_color_render(
+            &renderer.shared,
+            &renderer.gbuffer.depth_sample_view,
+            particle_render_exposure,
+            game.camera.near_clip,
+            std::env::var("PROTOMORPH_PARTICLE_FADE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0),
+            // V_ILLUM_EXPOSURE = render_exposure · illum_render_scale (engine
+            // `setup_targets_static_lighting`). Both computed per-frame in
+            // `setup_camera_fx_parameters`. Env multiplier kept for A/B.
+            particle_render_exposure
+                * renderer.illum_render_scale
+                * std::env::var("PROTOMORPH_PARTICLE_ILLUM")
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(1.0),
+        );
         let frame_ctx = FrameContext {
             shared: &renderer.shared,
             gbuffer: &renderer.gbuffer,
@@ -865,6 +984,8 @@ impl PlayerView {
                 .loaded_scenario
                 .as_ref()
                 .map(|s| &s.decal_renderer),
+            particle_gpu: &renderer.particle_gpu,
+            patchy_fog_pass: &renderer.patchy_fog,
         };
 
         // Sky model matrix is identity — engine-faithful for MCC, which
@@ -1202,19 +1323,36 @@ impl PlayerView {
                 {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static LOGGED: AtomicU32 = AtomicU32::new(0);
-                    if LOGGED.load(Ordering::Relaxed) < 10
+                    let cap = if std::env::var("PROTOMORPH_DIAG_SHADOW_DIR").is_ok() { 200 } else { 10 };
+                    if LOGGED.load(Ordering::Relaxed) < cap
                         && let n = LOGGED.fetch_add(1, Ordering::Relaxed)
-                        && n < 10
+                        && n < cap
                     {
                         let pos = obj.position;
+                        // `from_cache` = the per-object dominant was found in
+                        // object_lighting_cache (vs fallback to the global
+                        // light_dir). Divergent dirs between adjacent same-model
+                        // objects → the cached-light bake is the suspect.
+                        let from_cache = obj
+                            .engine_lighting_offset
+                            .map(|off| {
+                                renderer
+                                    .object_lighting_cache
+                                    .iter()
+                                    .any(|e| e.slot_offset == off && {
+                                        let d = glam::Vec3::from(e.dominant_dir);
+                                        d.is_finite() && d.length_squared() > 1e-6
+                                    })
+                            })
+                            .unwrap_or(false);
                         eprintln!(
-                            "[shadow caster {}] obj_idx={:?} model_idx={} obj_pos=({:.2},{:.2},{:.2}) bs_local=(c=({:.3},{:.3},{:.3}), r={:.3}) world_scale={:.3} caster_center=({:.2},{:.2},{:.2}) caster_radius={:.3} shadow_radius={:.3}",
+                            "[shadow caster {}] obj_idx={:?} model_idx={} obj_pos=({:.2},{:.2},{:.2}) light_dir=({:.3},{:.3},{:.3}) from_cache={} off={:?} caster_center=({:.2},{:.2},{:.2}) r={:.3}",
                             n, obj_idx, model_idx,
                             pos.x, pos.y, pos.z,
-                            bs_local.x, bs_local.y, bs_local.z, bs_local.w,
-                            world_scale,
+                            caster_light_dir.x, caster_light_dir.y, caster_light_dir.z,
+                            from_cache, obj.engine_lighting_offset,
                             caster_center.x, caster_center.y, caster_center.z,
-                            caster_radius, shadow_radius,
+                            caster_radius,
                         );
                     }
                 }
@@ -1298,6 +1436,32 @@ impl PlayerView {
                             wgpu::IndexFormat::Uint32,
                         );
                         for part in &mesh.parts {
+                            // Engine-faithful per-part shadow-cast filter
+                            // (mirror `submit_visibility_from_render_list`'s
+                            // exclusion): a part casts ONLY if it is opaque
+                            // AND its part_type has the SHADOW_CASTING bit
+                            // (types 2/3). This decoupled caster loop was
+                            // drawing EVERY part, so transparent materials —
+                            // which have no `shadow_generate` entry point and
+                            // route to the transparency pool instead — cast a
+                            // SOLID silhouette: the halogram teleporter portal
+                            // bridged the top/bottom pieces, and the
+                            // alpha-blended deadlock chainlink fence cast a
+                            // filled sheet instead of nothing.
+                            use crate::halo::render::structure_renderer::{
+                                mesh_part_flags, part_type_to_flags,
+                            };
+                            let transparent = model
+                                .materials
+                                .get(part.material_index)
+                                .map(|m| m.is_transparent)
+                                .unwrap_or(false);
+                            let casts = part_type_to_flags(part.part_type)
+                                & mesh_part_flags::SHADOW_CASTING
+                                != 0;
+                            if transparent || !casts {
+                                continue;
+                            }
                             rpass.draw_indexed(
                                 part.index_start..part.index_start + part.index_count,
                                 0,
@@ -1436,119 +1600,42 @@ impl PlayerView {
         renderer.water_renderer.render_shading(&mut encoder, &frame_ctx);
         encoder.pop_debug_group();
 
-        // A1 — Patchy fog. Engine `c_player_view::queue_patchy_fog @
-        // 0x18068BFB0` enqueues a transparency-sort element that
-        // dispatches `c_patchy_fog::render_patchy_fog` between water
-        // and transparents. We dispatch directly (TransparencyRenderer
-        // routing deferred). Gated on the active atmosphere setting
-        // having the "Patchy Fog" flag (bit 2 / mask 4) and authored
-        // density > 0.
-        // Engine `c_patchy_fog::render_patchy_fog @ 0x1806B2160` gates on
-        // `c_atmosphere_fog_interface::m_default_parameters.patchy_fog_density
-        // <= 0.001f`. The accumulator's density is 0 when no contributing
-        // setting has the Patchy Fog flag (bit 2) set — engine
-        // `accumulate_atmosphere_settings` gates the patchy-fog field
-        // copy on that bit. So this single threshold subsumes the prior
-        // `has_patchy_fog() && density > 0.001` two-step check.
-        if let Some(sky_atm) = renderer.scenario_sky_atmosphere.as_ref() {
-            let interface_params = &renderer.atmosphere_fog_interface.default_parameters;
-            if interface_params.patchy_fog_density > 0.001 {
-                // A1 phase 6 — advance per-frame fog state from
-                // camera delta + wind direction. Engine
-                // `c_patchy_fog::render_patchy_fog @ 0x1806B2160`
-                // lines 218-260. `dt` mirrors engine
-                // `c_patchy_fog::ms_dt` — current per-frame delta.
-                let dt: f32 = game.delta_time;
-                let wind = glam::Vec3::new(
-                    interface_params.wind_direction.i,
-                    interface_params.wind_direction.j,
-                    interface_params.wind_direction.k,
-                );
-                self.patchy_fog.update_per_frame(
-                    game.camera.position.into(),
-                    game.camera.forward,
-                    game.camera.up,
-                    sky_atm.distance_between_sheets,
-                    game.camera.near_clip,
-                    wind,
-                    dt,
-                );
-                let params = crate::halo::render::patchy_fog_pass::build_patchy_fog_params(
-                    interface_params,
-                    sky_atm,
-                    &self.patchy_fog,
-                    game.camera.position.into(),
-                    game.camera.projection,
-                    (renderer.shared.config.width, renderer.shared.config.height),
-                    game.camera.near_clip,
-                );
-                let atm = crate::halo::render::patchy_fog_pass::build_patchy_fog_atmosphere(
-                    interface_params,
-                );
-                let view_proj = game.camera.projection * game.camera.view;
-                // One-shot dump of the cbuffer inputs. Helps catch
-                // saturated extinction / degenerate UV transforms
-                // without staring at the shader.
-                {
-                    use std::sync::atomic::{AtomicBool, Ordering};
-                    static LOGGED: AtomicBool = AtomicBool::new(false);
-                    if !LOGGED.load(Ordering::Relaxed)
-                        && !LOGGED.swap(true, Ordering::Relaxed)
-                    {
-                        eprintln!(
-                            "[patchy_fog dump]\n  iz={:?}\n  atten={:?} (full={:.2}+sea_level={:.2}=eff_full={:.2} rate={:.4} dff={:.4})\n  eye={:?}\n  basis={:?} (roll={:.3})\n  density={} sep={} repeat={}\n  sheet_d0={:?}\n  sheet_d1={:?}\n  uv_xform0={:?}\n  uv_xform4={:?}\n  uv_xform7={:?}\n  atm.sun_dir={:?}\n  atm.sun_int_over_tm={:?}\n  atm.tm_log2e={:?}\n  atm.mie_theta={:?}\n  atm.hg_const+1={} hg_2g={}",
-                            params.inverse_z_transform,
-                            params.attenuation_data,
-                            interface_params.full_intensity_height,
-                            interface_params.reference_datum_plane,
-                            interface_params.full_intensity_height + interface_params.reference_datum_plane,
-                            params.attenuation_data[1],
-                            sky_atm.depth_fade_factor,
-                            params.eye_position,
-                            params.texcoord_basis,
-                            self.patchy_fog.roll,
-                            interface_params.patchy_fog_density,
-                            sky_atm.distance_between_sheets,
-                            sky_atm.texture_repeat_rate,
-                            params.sheet_depths0,
-                            params.sheet_depths1,
-                            params.tex_coord_transform0,
-                            params.tex_coord_transform4,
-                            params.tex_coord_transform7,
-                            atm.sun_dir,
-                            atm.sun_intensity_over_tm,
-                            atm.total_mie_log2e,
-                            atm.mie_theta_prefix_hgc,
-                            atm.constant_2[3],
-                            atm.extra[0],
-                        );
-                    }
-                }
-                renderer.patchy_fog.render(
-                    &renderer.shared,
-                    &mut encoder,
-                    &renderer.intermediates.lighting_base_view,
-                    &renderer.intermediates.hdr_dark_view,
-                    &renderer.gbuffer.depth_sample_view,
-                    &renderer.shared.nearest_sampler,
-                    // Phase 5: prefer the scenario-loaded noise
-                    // bitmap (`sky.patchy_fog_texture`). Falls back
-                    // to `default_normal_view` (constant ~0.5) when
-                    // the bitmap isn't authored or failed to load —
-                    // visible result there is a flat tint, useful
-                    // for verifying the wiring.
-                    renderer.patchy_fog.noise_view().unwrap_or(
-                        &renderer.shared.fallback_textures.default_normal_view,
-                    ),
-                    &renderer.shared.filtering_sampler,
-                    &params,
-                    &atm,
-                    view_proj,
-                    renderer.scenario_view_exposure,
-                    patchy_fog_debug_mode(),
-                );
-            }
+        // Effects (color particles) now draw INSIDE the shared transparents
+        // rpass (F-full) so they sort in global depth order against
+        // glass/water/sky — see `register_particle_transparents` +
+        // `TransparentDispatch::Particle`. The standalone particle color
+        // pass that used to live here is gone; only the screen-space
+        // distortion warp remains as its own pass below (engine
+        // `submit_distortions` / `apply_distortions` run separately too).
+        encoder.push_debug_group("render_particles");
+        // Distortion particles (specialized_rendering, e.g. man cannon
+        // distortion_shimmer): accumulate a screen-space displacement and warp
+        // the scene. Engine `submit_distortions` → `apply_distortions`.
+        // Kill switch (PROTOMORPH_DISTORTION=0) to isolate / disable.
+        if std::env::var("PROTOMORPH_DISTORTION").as_deref() != Ok("0") {
+        renderer.particle_gpu.render_distortion(
+            &renderer.shared,
+            &mut encoder,
+            &renderer.intermediates.lighting_base_texture,
+            &renderer.intermediates.lighting_base_view,
+            &renderer.gbuffer.depth_sample_view,
+            game.camera.near_clip,
+            // Distortion soft-fade range — SMALLER than the color-particle fade
+            // (2.0) so the shimmer reaches full displacement over a short gap
+            // and warps the man cannon scenery it sits in front of, not just the
+            // distant BSP. Only fully-occluded shimmer (behind geometry) fades.
+            std::env::var("PROTOMORPH_DISTORTION_FADE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.5),
+            std::env::var("PROTOMORPH_DISTORTION_SCALE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.04),
+        );
         }
+        encoder.pop_debug_group();
+
         // `c_player_view::render_transparents @ 0x18068b3b0` —
         // sort + dispatch the transparency pool. Sits AFTER
         // `render_water` in the canonical pass order (water writes
@@ -1558,6 +1645,26 @@ impl PlayerView {
         encoder.push_debug_group("render_transparents");
         self.render_transparents(&mut encoder, &frame_ctx, &mut renderer.transparency_renderer);
         encoder.pop_debug_group();
+
+        // Light volumes (Track R1): the roll-locked light-shaft strips
+        // (vehicle headlights, searchlights, grav lifts). Rebuilt each frame
+        // by `EffectStore::frame_advance`; drawn additively into lighting_base
+        // (first pass: on top, no depth occlusion — a follow-up). V_ILLUM_
+        // EXPOSURE = render_exposure · illum_render_scale (as for additive
+        // particles). Kill switch PROTOMORPH_LIGHT_VOLUMES=0.
+        if std::env::var("PROTOMORPH_LIGHT_VOLUMES").as_deref() != Ok("0") {
+            let v_illum = particle_render_exposure * renderer.illum_render_scale;
+            renderer.light_volume_gpu.prepare(
+                &renderer.shared,
+                &renderer.gbuffer.depth_sample_view,
+                &game.effects.light_volume_profiles,
+                &game.effects.light_volume_draws,
+                v_illum,
+            );
+            renderer
+                .light_volume_gpu
+                .render(&mut encoder, &renderer.intermediates.lighting_base_view);
+        }
 
         // Step 19 of `c_player_view::render` — bloom + tonemap.
         // `c_screen_postprocess::postprocess_player_view` writes
@@ -2233,16 +2340,30 @@ impl PlayerView {
                     },
                 }),
             ],
+            // `depth_ops: None` marks the depth aspect READ-ONLY (engine
+            // `set_depth_stencil_surface(_surface_depth_stencil_read_only)`).
+            // Transparents only depth-TEST (write off), and F-full now draws
+            // particles in this pass whose soft-fade SAMPLES the same depth
+            // texture (via the DepthOnly aspect view) — legal only because
+            // the attachment is read-only. Was `Some(Load/Store)`; the store
+            // was a no-op anyway (no transparent pipeline writes depth).
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &ctx.gbuffer.depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                }),
+                depth_ops: None,
                 stencil_ops: None,
             }),
             ..Default::default()
         });
+
+        // F-full: register the live particle batches into the regular
+        // transparent batch BEFORE the sort so they composite in global
+        // depth order against glass/water/sky (engine
+        // `c_particle_emitter::submit` → `add_element`). Point-only
+        // elements (no sort plane), keyed on the per-batch world centroid
+        // rebuilt this frame in `EffectStore::frame_advance`. Opt-in
+        // frustum cull (PROTOMORPH_PARTICLE_CULL=1) — see the loose-tag
+        // radius caveat in `gpu_particle`.
+        Self::register_particle_transparents(ctx, transparency_renderer);
 
         // Sky-only sort batch FIRST. submit_and_render_sky(2) push_marker
         // → queue sky transparents → sort + render → pop_marker. This
@@ -2266,6 +2387,88 @@ impl PlayerView {
             transparency_renderer.debug_dump_sorted(eye.to_array(), "regular");
         }
         transparency_renderer.render(&mut rpass, ctx);
+    }
+
+    /// F-full: register each live particle batch into the transparency
+    /// renderer as a point-only element so particles sort in global depth
+    /// order against glass/water/sky (engine `c_particle_emitter::submit
+    /// @0x180568FA0` → `c_transparency_renderer::add_element(position_world,
+    /// NULL plane, sort_layer)`). Drawn by `TransparentDispatch::Particle`
+    /// via `ParticleGpu::draw_batch`. The per-batch world centroid is the
+    /// sphere center rebuilt each frame in `EffectStore::frame_advance`.
+    ///
+    /// Opt-in frustum cull (`PROTOMORPH_PARTICLE_CULL=1`): same loose-tag
+    /// caveat as F-lite — `bounding_radius_estimate` is 0 in loose tags so
+    /// the sphere only spans emission origins; off by default.
+    fn register_particle_transparents(
+        ctx: &FrameContext<'_>,
+        transparency_renderer: &mut crate::halo::render::render_transparents::TransparencyRenderer,
+    ) {
+        use crate::halo::render::render_transparents::{
+            TransparentDispatch, TransparentSortLayer,
+        };
+        let pg = ctx.particle_gpu;
+        if pg.batch_count() == 0 {
+            return;
+        }
+        // Engine `c_particle_emitter::submit @0x180568FA0` registers one
+        // element PER EMITTER instance at `get_position_world`, with
+        // `offset = sort_bias*0.05` and the particle shader's sort layer.
+        // protomorph's per-emitter-instance units are prebuilt each frame in
+        // `EffectStore::frame_advance` (`emitter_draws`); register one
+        // transparent element each so each emitter sorts at its OWN world
+        // depth (fixes multi-instance systems like s3d_turf's 11 steam vents
+        // sharing one batch — the fence/drips now interleave by local depth).
+        let draws = &ctx.game.effects.emitter_draws;
+        if draws.is_empty() {
+            return;
+        }
+        let cull = std::env::var("PROTOMORPH_PARTICLE_CULL").as_deref() == Ok("1");
+        // 5-plane Gribb-Hartmann frustum (far is at infinity under
+        // perspective_infinite_reverse_rh, so it's omitted).
+        let planes: [glam::Vec4; 5] = {
+            let vp = ctx.game.camera.projection * ctx.game.camera.view;
+            let r = |n: usize| {
+                glam::Vec4::new(vp.x_axis[n], vp.y_axis[n], vp.z_axis[n], vp.w_axis[n])
+            };
+            let (r0, r1, r2, r3) = (r(0), r(1), r(2), r(3));
+            [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r3 + r2].map(|p| {
+                let len = p.truncate().length().max(1e-6);
+                p / len
+            })
+        };
+        let sphere_visible = |c: glam::Vec3, radius: f32| -> bool {
+            planes
+                .iter()
+                .all(|pl| pl.x * c.x + pl.y * c.y + pl.z * c.z + pl.w >= -radius)
+        };
+        for (di, d) in draws.iter().enumerate() {
+            // Skip non-color batches (distortion draws in its own pass;
+            // DontRenderSystem batches don't draw) — engine analogue: those
+            // never reach the transparent `add_element` path.
+            if !pg.is_color_batch(d.batch as usize) {
+                continue;
+            }
+            let pos = glam::Vec3::from(d.sort_pos);
+            // Opt-in per-emitter frustum cull (loose-tag radius caveat: a 0
+            // estimate falls back to a point test). Off by default.
+            if cull && d.radius > 0.0 && !sphere_visible(pos, d.radius) {
+                continue;
+            }
+            let layer = match d.sort_layer {
+                1 => TransparentSortLayer::Pre,
+                3 => TransparentSortLayer::Post,
+                _ => TransparentSortLayer::Normal,
+            };
+            transparency_renderer.add_element(
+                d.sort_pos,
+                None,     // point-only (no sort plane) — engine passes NULL
+                0.0,      // radius
+                d.offset, // sort_bias * 0.05
+                layer,
+                TransparentDispatch::EmitterInstance { draw_index: di as u32 },
+            );
+        }
     }
 
     // =================================================================

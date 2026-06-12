@@ -145,7 +145,9 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // term `vert_color × albedo` gets the real albedo, not a stale/zero
     // G-buffer texel.
     var albedo: vec4<f32>;
-    let misc = vec4<f32>(0.0);
+    // misc.xyz carries world-space view_dir (fragment→camera) for albedo
+    // variants that need it (chameleon's N·V); .w reserved.
+    let misc = vec4<f32>(view_dir, 0.0);
     calc_albedo(texcoord, &albedo, normal, misc);
 
     // HLSL line 836:

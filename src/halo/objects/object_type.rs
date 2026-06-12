@@ -80,4 +80,28 @@ impl ObjectType {
             Self::EffectScenery => *b"efsc",
         }
     }
+
+    /// Inverse of [`Self::tag_group_fourcc`] — map a tag-reference group
+    /// FOURCC back to its `ObjectType`. Used when spawning a tag named by
+    /// a generic `tag_reference` (e.g. a model-variant child object whose
+    /// group is `vehi`/`weap`). `None` for non-object groups.
+    pub fn from_group_fourcc(group: [u8; 4]) -> Option<Self> {
+        Some(match &group {
+            b"bipd" => Self::Biped,
+            b"vehi" => Self::Vehicle,
+            b"weap" => Self::Weapon,
+            b"eqip" => Self::Equipment,
+            b"term" => Self::Terminal,
+            b"proj" => Self::Projectile,
+            b"scen" => Self::Scenery,
+            b"mach" => Self::Machine,
+            b"ctrl" => Self::Control,
+            b"ssce" => Self::SoundScenery,
+            b"bloc" => Self::Crate,
+            b"crea" => Self::Creature,
+            b"gint" => Self::Giant,
+            b"efsc" => Self::EffectScenery,
+            _ => return None,
+        })
+    }
 }

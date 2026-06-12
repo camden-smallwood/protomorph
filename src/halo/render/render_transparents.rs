@@ -110,6 +110,11 @@ pub enum TransparentDispatch {
         object_slot: u32,
         mesh_index: u16,
         part_index: u16,
+        /// Object's resolved dynamic-env cubemap probe index (engine
+        /// `c_dynamic_cubemap_sample`). Selects `GpuMaterial::
+        /// bind_group_probes[idx]` when the material has per-probe cube
+        /// variants; `None` → the rasg-default `bind_group`.
+        probe_index: Option<u16>,
     },
     /// Sky model transparent part. Engine
     /// `c_object_renderer::submit_and_render_sky @ 0x1806E4950` queues
@@ -121,6 +126,26 @@ pub enum TransparentDispatch {
         mesh_index: u16,
         part_index: u16,
     },
+    /// A single particle EMITTER of a single live instance (engine
+    /// `c_particle_emitter::submit @0x180568FA0` registers one element PER
+    /// EMITTER at `get_position_world`; `render_callback` draws only that
+    /// emitter's rows). `draw_index` indexes
+    /// `EffectStore::emitter_draws`; the draw reads its batch + per-row
+    /// spans and dispatches `ParticleGpu::draw_emitter`. Replaces the old
+    /// per-BATCH `Particle` whose single averaged centroid mis-sorted
+    /// multi-instance systems (s3d_turf's 11 steam vents share one batch).
+    EmitterInstance {
+        draw_index: u32,
+    },
+    /// Patchy-fog fullscreen composite. Engine `c_player_view::
+    /// queue_patchy_fog @ 0x18068BFB0` registers it with `radius = 0`
+    /// (point sort) and `offset = transparent_sort_distance` at a
+    /// centroid that same distance along camera forward — so its
+    /// `z_sort` resolves to ~0 and it draws LAST within its layer:
+    /// every transparent/particle in the layer composites first and
+    /// gets fogged over. Drawn via `PatchyFogPass::draw` (prepared
+    /// once per frame before the transparents pass).
+    PatchyFog,
 }
 
 /// `s_transparent_types` (render_transparents.h:32-44, 0xB0 bytes).
@@ -391,9 +416,27 @@ impl TransparencyRenderer {
         for i in start..end {
             self.sorted_order[i] = i as u16;
         }
-        // Stage 1: stable sort by (sort_layer asc, z_sort desc) —
-        // `transparent_layer_and_z_sort_proc @ 0x1806CE870`. Higher
-        // z_sort = farther = drawn first (back-to-front).
+        // Stage 1: stable sort by (sort_layer ASC, z_sort desc) —
+        // `transparent_layer_and_z_sort_proc @ 0x1806CE870`, verified
+        // against BOTH engine sort paths (the debug bubble sort and the
+        // production `qsort_2byte`/`templated_sort<short>::qsort`). The
+        // proc returns true ⟺ `a` sorts to a HIGHER index = drawn LATER
+        // = on top:
+        //   diff layer: proc = (layer_a > layer_b) → higher layer on top
+        //   same layer: proc = (z_a > z_b)         → farther on top (?)
+        // So the engine sorts LAYERS ASCENDING: pre-pass(1) drawn first
+        // (bottom), normal(2), post(3) last (top). The patchy-fog tag
+        // authors `transparent_sort_layer = pre-pass`, so the engine
+        // draws it BEFORE normal transparents — it does NOT cover the
+        // railing/drips; those blend via their own per-shader atmosphere
+        // inscatter, not by the fog pass painting over them.
+        //
+        // NOTE the z stays DESCENDING here (farther first = back-to-front)
+        // — protomorph's deliberate, user-verified (construct planetoid)
+        // divergence from the binary's literal ascending-z partition,
+        // because back-to-front is what correct alpha-over needs and the
+        // engine's stage-2 plane sort (which we mostly gate off) is what
+        // makes its front-to-back partition come out right in practice.
         {
             let elements = &self.transparents;
             self.sorted_order[start..end].sort_by(|&a, &b| {
@@ -661,7 +704,7 @@ impl TransparencyRenderer {
 
         rpass.set_bind_group(
             0,
-            &ctx.shared.camera_bind_group_sl,
+            &ctx.shared.camera_bind_group_transparent,
             &[
                 crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
                 // atmosphere @ binding 2 — default; per-element binds below
@@ -734,7 +777,7 @@ impl TransparencyRenderer {
                     };
                     rpass.set_bind_group(
                         0,
-                        &ctx.shared.camera_bind_group_sl,
+                        &ctx.shared.camera_bind_group_transparent,
                         // [1]=atmosphere @ binding 2 (BSP cluster default);
                         // last = dominant_light @ binding 13.
                         &[
@@ -825,7 +868,7 @@ impl TransparencyRenderer {
                     // custom fog doesn't leak into this instance).
                     rpass.set_bind_group(
                         0,
-                        &ctx.shared.camera_bind_group_sl,
+                        &ctx.shared.camera_bind_group_transparent,
                         &[
                             lighting_offset,
                             crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
@@ -864,7 +907,7 @@ impl TransparencyRenderer {
                         0..1,
                     );
                 }
-                TransparentDispatch::Object { object_slot, mesh_index, part_index } => {
+                TransparentDispatch::Object { object_slot, mesh_index, part_index, probe_index } => {
                     // Object transparent (vehicles, FX scenery — waterfalls,
                     // man cannons, tower pulses). Bridges the object render
                     // list into the transparency pool. Mirrors the BSP-side
@@ -885,7 +928,7 @@ impl TransparencyRenderer {
                     // preceding SkyMeshPart's setting so it doesn't leak here).
                     rpass.set_bind_group(
                         0,
-                        &ctx.shared.camera_bind_group_sl,
+                        &ctx.shared.camera_bind_group_transparent,
                         &[
                             crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
                             material.atmosphere_offset,
@@ -895,8 +938,18 @@ impl TransparencyRenderer {
                     );
                     rpass.set_pipeline(&material.artifacts.pipeline);
                     rpass.set_bind_group(1, &ctx.shared.model_bind_group, &[model_offset]);
-                    // Path B: cbuffer slot dynamic; offset 0.
-                    rpass.set_bind_group(2, &material.bind_group, &[0u32]);
+                    // Per-cluster dynamic-env cube: pick this object's probe
+                    // variant when the material has them (engine
+                    // `render_method_submit_dynamic_cubemap`); else the
+                    // rasg-default `bind_group`. Path B: cbuffer offset 0.
+                    let obj_bind_group = match probe_index {
+                        Some(p) if !material.bind_group_probes.is_empty() => material
+                            .bind_group_probes
+                            .get(p as usize)
+                            .unwrap_or(&material.bind_group),
+                        _ => &material.bind_group,
+                    };
+                    rpass.set_bind_group(2, obj_bind_group, &[0u32]);
                     rpass.set_bind_group(3, &ctx.shared.node_matrices_bind_group, &[nm_offset]);
                     rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     rpass.set_index_buffer(
@@ -965,7 +1018,7 @@ impl TransparencyRenderer {
                     // setup_default_lighting fallback).
                     rpass.set_bind_group(
                         0,
-                        &ctx.shared.camera_bind_group_sl,
+                        &ctx.shared.camera_bind_group_transparent,
                         &[
                             crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
                             // Per-shader atmosphere override — transparent sky
@@ -1009,6 +1062,53 @@ impl TransparencyRenderer {
                     rpass.draw_indexed(
                         part.index_start..part.index_start + part.index_count,
                         0, 0..1,
+                    );
+                }
+                TransparentDispatch::EmitterInstance { draw_index } => {
+                    // Draw exactly this emitter-instance's rows so it
+                    // composites at its OWN world depth (engine
+                    // `c_particle_emitter::render_callback` →
+                    // `c_particle_emitter_gpu::render`). The particle
+                    // pipeline binds its OWN group0 (camera + grid +
+                    // frame_params + scene-depth, a different layout than
+                    // the structure camera group), so restore the structure
+                    // group0 afterward for the next BSP/object element
+                    // (those arms rely on the once-before-loop binding and
+                    // don't rebind group 0 themselves).
+                    if let Some(d) = ctx.game.effects.emitter_draws.get(draw_index as usize) {
+                        let s = d.span_start as usize;
+                        let e = s + d.span_count as usize;
+                        if let Some(spans) = ctx.game.effects.emitter_draw_spans.get(s..e) {
+                            ctx.particle_gpu.draw_emitter(rpass, d.batch as usize, spans);
+                        }
+                    }
+                    rpass.set_bind_group(
+                        0,
+                        &ctx.shared.camera_bind_group_transparent,
+                        &[
+                            crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                            crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
+                            crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
+                            crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                        ],
+                    );
+                }
+                TransparentDispatch::PatchyFog => {
+                    // Fullscreen multiply-add fog composite (engine
+                    // `render_patchy_fog_callback`). Sorted at z_sort≈0 so
+                    // everything in its layer has already drawn and gets
+                    // fogged. Binds its OWN group 0 → restore the structure
+                    // camera group afterward (same contract as Particle).
+                    ctx.patchy_fog_pass.draw(rpass);
+                    rpass.set_bind_group(
+                        0,
+                        &ctx.shared.camera_bind_group_transparent,
+                        &[
+                            crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                            crate::halo::render::shared::ATMOSPHERE_DEFAULT_OFFSET,
+                            crate::halo::render::shared::SIMPLE_LIGHTS_DEFAULT_OFFSET,
+                            crate::halo::render::shared::ENGINE_LIGHTING_DEFAULT_OFFSET,
+                        ],
                     );
                 }
             }

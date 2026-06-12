@@ -1,30 +1,48 @@
-// `albedo_fx.hlsl::calc_albedo_chameleon_ps` — STAND-IN.
+// `albedo_fx.hlsl::calc_albedo_chameleon_ps` — engine-faithful port.
+//
+// Ported verbatim from the Halo Online shader source
+// (`ShaderGenerator/halo_online_shaders/albedo.fx`), the authoritative
+// source these s3d/community shaders were authored against. The MCC
+// `gpix` corpus omits the body (compiled inline), but the HO source
+// matched our prior reverse-engineering everywhere except the angle
+// factor: the engine uses true camera-angle `pow(max(N·V, 0), power)`,
+// NOT the old `1 - n.z` world-up stand-in (which shifted with surface
+// curvature but not with the camera — visibly wrong for the MP-armor
+// paint effect).
 //
 // The chameleon rmop (`shaders/shader_options/albedo_chameleon`)
 // declares: base_map, detail_map, chameleon_color0..3 (4 colors),
-// chameleon_color_offset1, chameleon_color_offset2 (2 piecewise
-// positions in [0,1]), chameleon_fresnel_power. No corresponding
-// `calc_albedo_chameleon_ps` body exists in the MCC HLSL corpus we
-// extracted — Bungie either inlined the body or it was added in a
-// later MCC update that the extractor missed. This file is a
-// **best-effort port**, not engine-verbatim.
+// chameleon_color_offset1/2 (piecewise positions in [0,1]),
+// chameleon_fresnel_power.
 //
-// The engine effect is view-angle-dependent paint shift between 4
-// colors (used by Master Chief's MP armor). Without an authoritative
-// HLSL anchor, we approximate the angle factor via the bumped surface
-// normal's alignment with world-up: `factor = pow(1 - n.z, fresnel_power)`.
-// Bumped normal varies per pixel so the color shift is visible across
-// curved surfaces; it is NOT camera-angle correct (engine uses N·V).
-//
-// Color blend: piecewise lerp across the 4 colors with the 2 offsets:
-//   factor ∈ [0, offset1)  → lerp(color0, color1)
-//   factor ∈ [offset1, offset2) → lerp(color1, color2)
-//   factor ∈ [offset2, 1]  → lerp(color2, color3)
-//
-// Final: `albedo = base.rgb * (detail.rgb * DETAIL_MULTIPLIER) * chameleon_color`.
-//
-// When the engine chameleon HLSL surfaces or someone reverse-engineers
-// it, swap this body for the verbatim port.
+// `view_dir` (world-space fragment→camera) is threaded in via `misc.xyz`
+// from the entry point: the engine passes it as a separate `calc_albedo_*_ps`
+// argument; protomorph's reduced `calc_albedo` interface reuses the
+// otherwise-unused `misc` channel for it.
+
+// `calc_chameleon` (albedo.fx) — verbatim. dp = pow(max(N·V, 0), power)
+// is the camera-angle factor; piecewise lerp across the 4 colors at
+// offset1/offset2. Shared by all chameleon albedo variants.
+fn calc_chameleon(normal: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
+    let dp = pow(max(dot(normal, view_dir), 0.0), material.chameleon_fresnel_power.x);
+    let off1 = material.chameleon_color_offset1.x;
+    let off2 = material.chameleon_color_offset2.x;
+
+    var col0 = material.chameleon_color0.rgb;
+    var col1 = material.chameleon_color1.rgb;
+    var lrp = dp * (1.0 / off1);
+    if (dp > off1) {
+        col0 = material.chameleon_color1.rgb;
+        col1 = material.chameleon_color2.rgb;
+        lrp = (dp - off1) * (1.0 / (off2 - off1));
+    }
+    if (dp > off2) {
+        col0 = material.chameleon_color2.rgb;
+        col1 = material.chameleon_color3.rgb;
+        lrp = (dp - off2) * (1.0 / (1.0 - off2));
+    }
+    return mix(col0, col1, lrp);
+}
 
 fn calc_albedo_chameleon_ps(
     texcoord: vec2<f32>,
@@ -32,36 +50,14 @@ fn calc_albedo_chameleon_ps(
     normal: vec3<f32>,
     misc: vec4<f32>,
 ) {
-    let _u_misc = misc;
     let base = textureSample(base_map, base_map_sampler, transform_texcoord(texcoord, material.base_map_xform));
     let detail = textureSample(detail_map, detail_map_sampler, transform_texcoord(texcoord, material.detail_map_xform));
 
-    // Stand-in fresnel factor — engine would use 1 - dot(N, V). Without
-    // view direction in this function's signature, approximate via
-    // 1 - n.z (alignment with world-up axis).
-    let n = normalize(normal);
-    let cos_factor = saturate(1.0 - abs(n.z));
-    let power = max(material.chameleon_fresnel_power.x, 1.0e-3);
-    let factor = pow(cos_factor, power);
+    let color = calc_chameleon(normalize(normal), misc.xyz);
 
-    let off1 = clamp(material.chameleon_color_offset1.x, 0.0, 1.0);
-    let off2 = clamp(material.chameleon_color_offset2.x, off1, 1.0);
-
-    var chameleon_color: vec3<f32>;
-    if (factor < off1) {
-        let t = factor / max(off1, 1.0e-3);
-        chameleon_color = mix(material.chameleon_color0.rgb, material.chameleon_color1.rgb, t);
-    } else if (factor < off2) {
-        let t = (factor - off1) / max(off2 - off1, 1.0e-3);
-        chameleon_color = mix(material.chameleon_color1.rgb, material.chameleon_color2.rgb, t);
-    } else {
-        let t = (factor - off2) / max(1.0 - off2, 1.0e-3);
-        chameleon_color = mix(material.chameleon_color2.rgb, material.chameleon_color3.rgb, t);
-    }
-
-    (*albedo).r = base.r * (detail.r * DETAIL_MULTIPLIER) * chameleon_color.r;
-    (*albedo).g = base.g * (detail.g * DETAIL_MULTIPLIER) * chameleon_color.g;
-    (*albedo).b = base.b * (detail.b * DETAIL_MULTIPLIER) * chameleon_color.b;
+    (*albedo).r = base.r * (detail.r * DETAIL_MULTIPLIER) * color.r;
+    (*albedo).g = base.g * (detail.g * DETAIL_MULTIPLIER) * color.g;
+    (*albedo).b = base.b * (detail.b * DETAIL_MULTIPLIER) * color.b;
     (*albedo).a = base.a * detail.a;
 }
 

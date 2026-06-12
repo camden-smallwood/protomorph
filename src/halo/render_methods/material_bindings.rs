@@ -88,6 +88,15 @@ const RMSH_BASELINE_TEXTURES: &[(&str, bool)] = &[
     ("detail_map2", false),
     ("detail_map3", false),
     ("detail_map_overlay", false),
+    // `overlay` category (overlays_fx.hlsl) — the halogram's cell-like
+    // inner layer (multiply_and_additive_detail). overlay_multiply_map
+    // multiplies the lit color; overlay_map × overlay_detail_map add.
+    ("overlay_map", false),
+    ("overlay_detail_map", false),
+    ("overlay_multiply_map", false),
+    // `warp` category (warp_fx.hlsl) — offsets the working texcoord by
+    // warp_map.xy × (warp_amount_x, warp_amount_y).
+    ("warp_map", false),
     ("height_map", false),
     // env_mapping/dynamic — two cubemaps blended per-frame. Until
     // Phase G2 (per-cluster dynamic env probes) lands, these resolve

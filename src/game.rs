@@ -2,7 +2,7 @@ use crate::halo::camera::FlyingCamera;
 use crate::halo::geometry::ModelData;
 use crate::halo::objects::{ObjectIndex, ObjectStore};
 use crate::halo::render::Renderer;
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use std::collections::HashSet;
 use std::path::Path;
 use winit::keyboard::KeyCode;
@@ -54,6 +54,17 @@ struct PendingAttachment {
 
 pub struct GameState {
     pub objects: ObjectStore,
+    /// Effects attached to placed objects (scenery effe attachments).
+    /// Phase 1: loaded + instanced per placement; simulated/rendered in
+    /// later phases. See [`crate::halo::effects`].
+    pub effects: crate::halo::effects::EffectStore,
+    /// Indices into `effects.instances` of the atmosphere WEATHER effects
+    /// (rain/ash/dust). Unlike object-attached effects these are CAMERA-
+    /// RELATIVE — repositioned to the camera each frame (engine
+    /// `effect_refresh_location` keeps weather at the player's cluster), so
+    /// the emission volume always surrounds the viewer instead of sitting
+    /// at the fixed world origin it spawned at.
+    weather_instances: Vec<usize>,
     /// Collected during placement load; resolved into datum world transforms
     /// by [`Self::resolve_pending_attachments`] once every object exists.
     pending_attachments: Vec<PendingAttachment>,
@@ -108,6 +119,8 @@ impl GameState {
 
         let mut state = Self {
             objects: ObjectStore::new(),
+            effects: crate::halo::effects::EffectStore::new(),
+            weather_instances: Vec::new(),
             pending_attachments: Vec::new(),
             camera,
             model_data: Vec::new(),
@@ -332,6 +345,28 @@ impl GameState {
                             self.camera.rotation.x, respawns.len(),
                         );
                     }
+                    // Diagnostic: locate placed objects by tag name. Set
+                    // `PROTOMORPH_FIND_OBJECT=<substr>` to log the world
+                    // position of every placement whose palette tag path
+                    // contains <substr> — used to aim the camera at a
+                    // specific object (e.g. a shader carried by scenery).
+                    if let Ok(target) = std::env::var("PROTOMORPH_FIND_OBJECT") {
+                        let t = target.to_ascii_lowercase();
+                        for (kind, palette, placements) in loaded.all_placements() {
+                            for p in placements {
+                                if p.palette_index < 0 { continue; }
+                                let Some(pe) = palette.get(p.palette_index as usize) else { continue; };
+                                if pe.tag_path.to_ascii_lowercase().contains(&t) {
+                                    let pos = p.object_data.position;
+                                    eprintln!(
+                                        "[find_object] {kind} '{}' pos=({:.2}, {:.2}, {:.2})",
+                                        pe.tag_path, pos.x, pos.y, pos.z,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     // PROTOMORPH_CAMERA override applies LAST so it wins
                     // over respawn-point auto-positioning. Format:
                     // "x,y,z" or "x,y,z,yaw,pitch".
@@ -365,6 +400,7 @@ impl GameState {
                     // frame default sky probe.
                     let scenery_offsets = renderer.scenery_lighting_offsets.clone();
                     let crate_offsets = renderer.crate_lighting_offsets.clone();
+                    let vehicle_offsets = renderer.vehicle_lighting_offsets.clone();
                     let weapon_offsets = renderer.weapon_lighting_offsets.clone();
                     let equipment_offsets = renderer.equipment_lighting_offsets.clone();
                     let machine_offsets = renderer.machine_lighting_offsets.clone();
@@ -391,6 +427,38 @@ impl GameState {
                         "crate",
                         |_| false,
                         Some(&crate_offsets),
+                    );
+                    // Vehicles — placed like any other object. Loading them
+                    // also registers each into the object header table by name
+                    // so they participate as parents/children in
+                    // `resolve_pending_attachments` (e.g. a turret/scenery
+                    // child parented to a vehicle marker, or a vehicle parented
+                    // to a moving host). Vehicle object-definition effe
+                    // attachments are instanced via the shared palette path.
+                    self.load_visible_placements(
+                        renderer,
+                        &loaded.scenario,
+                        ObjectType::Vehicle,
+                        &loaded.scenario.vehicles,
+                        &loaded.scenario.vehicle_palette,
+                        &loaded.tags_root,
+                        "vehicle",
+                        |_| false,
+                        Some(&vehicle_offsets),
+                    );
+                    // Effect scenery (`csfe`) — objects that ARE a continuously
+                    // playing effect (guardian lift columns / man cannon). Their
+                    // effe attachment carries the effect; processed like scenery.
+                    self.load_visible_placements(
+                        renderer,
+                        &loaded.scenario,
+                        ObjectType::EffectScenery,
+                        &loaded.scenario.effect_scenery,
+                        &loaded.scenario.effect_scenery_palette,
+                        &loaded.tags_root,
+                        "effect_scenery",
+                        |_| false,
+                        None,
                     );
                     self.load_visible_placements(
                         renderer,
@@ -441,17 +509,159 @@ impl GameState {
                     // attachments now that every parent object (and the sky)
                     // exists.
                     self.resolve_pending_attachments(renderer, &loaded.scenario);
+
+                    // Atmosphere WEATHER effects — each `AtmosphereSettings`
+                    // entry (scenario.atmospheric → .sky_atm_parameters) can
+                    // name a `weather_effect` effe (rain/snow/dust/ash). Engine
+                    // `effect_new_weather @0x1802fbac0` spawns it at world
+                    // ORIGIN, unattached, with two reserved location vectors:
+                    //   `gravity`(string_id 180) = world-down (particles fall
+                    //   along it) and `up`(187) = world-up.
+                    // First cut: spawn one instance per UNIQUE weather effect
+                    // (engine spawns per active atmosphere setting on PVS change
+                    // + refreshes location to the active cluster — deferred; for
+                    // a static flycam a single origin spawn covers the level).
+                    if let Some(atm) = loaded.atmosphere.as_ref() {
+                        // Spawn ONLY the active atmosphere setting's weather —
+                        // engine `c_atmosphere_fog_interface::change_pvs
+                        // @0x1803af550` runs `effect_new_weather` per the
+                        // camera-cluster's active setting, not all settings.
+                        // Spawning every setting layered `snow_turf` (g=1.0,
+                        // falls ~2 wu/s) AND `snow_turf_calm` (g=0.01, barely
+                        // falls) → the near-static calm snow dragged the
+                        // apparent fall speed down ~3-5×. Use the primary
+                        // (first "Enable Atmosphere") setting; per-cluster
+                        // switching as the camera moves is a follow-up (needs
+                        // the cluster→setting lookup threaded into the CPU
+                        // pulse — the renderer's lookup gets `game` immutably).
+                        for setting in atm.primary_setting() {
+                            if setting.weather_effect.is_empty() {
+                                continue;
+                            }
+                            let Some(eidx) = self
+                                .effects
+                                .load_effect(&setting.weather_effect, &loaded.tags_root)
+                            else {
+                                continue;
+                            };
+                            // Location matrices in the effect's location-name
+                            // order (system.location indexes this). Reserved
+                            // direction names → world-axis bases (forward = +X):
+                            //   gravity → +X = world-DOWN; up → +X = world-UP.
+                            let loc_names = self.effects.effect_location_markers(eidx);
+                            let location_matrices: Vec<glam::Mat4> = loc_names
+                                .iter()
+                                .map(|n| match n.as_str() {
+                                    "gravity" => glam::Mat4::from_cols(
+                                        glam::vec4(0.0, 0.0, -1.0, 0.0), // forward = down
+                                        glam::vec4(0.0, 1.0, 0.0, 0.0),
+                                        glam::vec4(1.0, 0.0, 0.0, 0.0),
+                                        glam::vec4(0.0, 0.0, 0.0, 1.0), // origin
+                                    ),
+                                    "up" => glam::Mat4::from_cols(
+                                        glam::vec4(0.0, 0.0, 1.0, 0.0), // forward = up
+                                        glam::vec4(0.0, 1.0, 0.0, 0.0),
+                                        glam::vec4(-1.0, 0.0, 0.0, 0.0),
+                                        glam::vec4(0.0, 0.0, 0.0, 1.0),
+                                    ),
+                                    _ => glam::Mat4::IDENTITY,
+                                })
+                                .collect();
+                            let inst_idx = self.effects.instances.len();
+                            self.effects.spawn_instance(
+                                eidx,
+                                u32::MAX,         // no host → identity host @ origin
+                                String::new(),    // no marker
+                                glam::Vec3::ZERO, // engine global_origin3d (repositioned per frame)
+                                location_matrices,
+                                String::new(),    // empty primary_scale → always on
+                                true, // effect_new_weather: creation flags=26 → looping instance
+                            );
+                            // Mark as cluster-flagged weather so the particle
+                            // LOD uses the cluster effect_weight path, not the
+                            // distance band (see EffectInstance::weather).
+                            self.effects.instances[inst_idx].weather = true;
+                            self.weather_instances.push(inst_idx);
+                            eprintln!(
+                                "[weather] spawned '{}' (locations={:?})",
+                                setting.weather_effect, loc_names,
+                            );
+                        }
+                    }
+
+                    // Effects summary — what the particle subsystem will
+                    // simulate/render (Phase 2+).
+                    eprintln!(
+                        "[effects] total: {} effect tags, {} instances, {} live particle systems",
+                        self.effects.effects.len(),
+                        self.effects.instances.len(),
+                        self.effects.live_system_count(),
+                    );
+                    // Build per-emitter render batches (each loads its own
+                    // base/alpha/palette bitmaps) so the billboard pass
+                    // shades each particle system faithfully (Phase 4).
+                    let descriptors = self.effects.batch_descriptors();
+                    renderer.register_particle_batches(&descriptors, &loaded.tags_root);
+                    // Track R1: cache the unique light-volume base_map textures
+                    // so the per-frame strip render can bind them.
+                    let lv_base_maps: Vec<String> = self
+                        .effects
+                        .light_volumes
+                        .values()
+                        .map(|lv| lv.render.base_map.clone())
+                        .filter(|b| !b.is_empty())
+                        .collect();
+                    renderer.register_light_volume_textures(&lv_base_maps, &loaded.tags_root);
+                    for eff in &self.effects.effects {
+                        let inst = self
+                            .effects
+                            .instances
+                            .iter()
+                            .filter(|i| self.effects.effects[i.effect_index].path == eff.path)
+                            .count();
+                        eprintln!(
+                            "[effects]   {} — {} systems, {} instances [{}]",
+                            eff.path,
+                            eff.systems.len(),
+                            inst,
+                            eff.systems
+                                .iter()
+                                .map(|s| {
+                                    s.particle_path
+                                        .rsplit(['\\', '/'])
+                                        .next()
+                                        .unwrap_or(&s.particle_path)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                        if std::env::var("PROTOMORPH_DIAG_INST").is_ok() {
+                            for i in self
+                                .effects
+                                .instances
+                                .iter()
+                                .filter(|i| self.effects.effects[i.effect_index].path == eff.path)
+                            {
+                                eprintln!(
+                                    "[effects]     instance origin=({:.1},{:.1},{:.1})",
+                                    i.origin.x, i.origin.y, i.origin.z
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e) => eprintln!("[scenario] load failed: {e}"),
             }
         }
 
-        // Test models (grunt biped + wraith vehicle) removed — focus
-        // is riverworld scenario geometry. Wraith uses
-        // `environment_map / dynamic` (option 2) which we don't yet
-        // port; loading it triggers the dispatcher panic. Grunt
-        // animations + biped placement come back when Phase E lands
-        // (object_placement_data lifecycle from scenario.bipeds).
+        // Vehicle placements now load via `load_visible_placements`
+        // above (scenario.vehicles). Bipeds remain deferred until the
+        // object-animation lifecycle (Phase E) lands — animated units
+        // need the per-frame node/animation pipeline, not just a static
+        // placement. Note vehicles whose shaders use unported render-
+        // method options (e.g. `environment_map / dynamic`) fail loud at
+        // load per the engine-faithful policy — that surfaces what to
+        // port next rather than silently dropping the vehicle.
     }
 
     /// Walk a `[ObjectPlacement]` array + palette and create an object
@@ -566,9 +776,28 @@ impl GameState {
     ) {
         let mut palette_to_model: std::collections::HashMap<i16, Option<usize>> =
             std::collections::HashMap::new();
+        // Per-palette effect attachments: `(effect_store_index, marker)`
+        // resolved once per unique palette tag (alongside the model
+        // load) and replayed for every placement of that palette.
+        // Per palette: each effect attachment resolves to one or more instance
+        // VARIANTS (the inner `Vec<Mat4>` is one variant's per-location markers;
+        // a marker name that repeats → multiple variants, one per marker).
+        let mut palette_to_effects: std::collections::HashMap<
+            i16,
+            // (effect_store_index, marker, variants, primary_scale)
+            Vec<(usize, String, Vec<Vec<glam::Mat4>>, String)>,
+        > = std::collections::HashMap::new();
+        let mut effect_instance_count = 0usize;
         let mut loaded_count = 0usize;
         let mut skipped_marker = 0usize;
         let mut skipped_failed = 0usize;
+        // Per-path cache of uploaded model-variant child objects (a
+        // turret model shared by every host of the same variant — the 3
+        // riverworld warthogs reuse one chaingun upload). Keyed by the
+        // resolved child object tag path. `None` = load failed (skip).
+        let mut attached_child_models: std::collections::HashMap<String, Option<usize>> =
+            std::collections::HashMap::new();
+        let mut attached_child_count = 0usize;
         for (placement_index, p) in placements.iter().enumerate() {
             let idx = p.palette_index;
             if idx < 0 { continue; }
@@ -593,9 +822,155 @@ impl GameState {
                         );
                         None
                     } else {
+                        // Load the model first — its markers resolve the
+                        // effect LOCATION matrices (the marker rotation
+                        // that orients emission, e.g. null_up "marker").
                         // No catch_unwind — unsupported shader options
                         // panic the app per the engine-faithful policy.
-                        match crate::halo::loader::load_object(&path) {
+                        let load = crate::halo::loader::load_object(&path);
+                        // Resolve any effe attachments + their per-location
+                        // marker matrices (engine `attachments_new` →
+                        // `effect_new_from_object`; the location marker is
+                        // resolved against the host model).
+                        let attachments =
+                            crate::halo::loader::read_object_effect_attachments(&path);
+                        if !attachments.is_empty() {
+                            let model_ref = load.as_ref().ok();
+                            let mut resolved = Vec::new();
+                            for (effect_rel, marker, primary_scale) in attachments {
+                                if let Some(eidx) =
+                                    self.effects.load_effect(&effect_rel, tags_root)
+                                {
+                                    let loc_names =
+                                        self.effects.effect_location_markers(eidx);
+                                    if std::env::var("PROTOMORPH_DIAG_MARKERS").is_ok() {
+                                        let avail: Vec<String> = model_ref
+                                            .map(|m| {
+                                                m.marker_transforms
+                                                    .iter()
+                                                    .map(|(n, mtx)| {
+                                                        let f = mtx.transform_vector3(glam::Vec3::X);
+                                                        let u = mtx.transform_vector3(glam::Vec3::Z);
+                                                        format!(
+                                                            "{n}[fwd=({:.2},{:.2},{:.2}) up=({:.2},{:.2},{:.2})]",
+                                                            f.x, f.y, f.z, u.x, u.y, u.z,
+                                                        )
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        eprintln!(
+                                            "[markers] host={} effect={effect_rel} loc_names={loc_names:?} avail={avail:?}",
+                                            entry.tag_path,
+                                        );
+                                    }
+                                    // Resolve each location to ALL its markers
+                                    // — a marker name can repeat (the guardian
+                                    // minilift has 3 `fx_minilift_pad` markers,
+                                    // one per pad), and the engine emits the
+                                    // effect at every match. One instance/marker.
+                                    //
+                                    // Reserved direction names like "up" aren't
+                                    // authored marker groups, so they don't match
+                                    // by name. The engine (effect_build_locations
+                                    // @0x1803005f0 → string_id "up"==489) binds the
+                                    // reserved direction to the host object's
+                                    // primary marker. These fx hosts are the
+                                    // standalone `*.effect_scenery` placements whose
+                                    // model is the invisible `null_up` — a single
+                                    // marker named 'marker' oriented +X→+Z (straight
+                                    // up). Emission therefore rises along the host's
+                                    // up axis, and the host's PLACEMENT yaw aims it
+                                    // (man cannon −45°/135°, holy_light 0° → straight
+                                    // up). The old `Mat4::from_rotation_z(90°)` hack
+                                    // rotated +X→+Y (horizontal) instead, which fired
+                                    // holy_light on its side and the man cannon left.
+                                    let per_loc: Vec<Vec<glam::Mat4>> = loc_names
+                                        .iter()
+                                        .map(|n| {
+                                            let all = model_ref
+                                                .map(|m| m.marker_transforms_all(n))
+                                                .unwrap_or_default();
+                                            if !all.is_empty() {
+                                                return all;
+                                            }
+                                            // Unresolved reserved direction → host's
+                                            // single marker (object-local, like the
+                                            // resolved-marker path above). Only when
+                                            // the host has exactly one marker (the
+                                            // null-object convention); else identity.
+                                            let markers = model_ref
+                                                .map(|m| {
+                                                    m.marker_transforms
+                                                        .iter()
+                                                        .map(|(_, mtx)| *mtx)
+                                                        .collect::<Vec<_>>()
+                                                })
+                                                .unwrap_or_default();
+                                            let base = if markers.len() == 1 {
+                                                markers
+                                            } else {
+                                                vec![glam::Mat4::IDENTITY]
+                                            };
+                                            // Spin the lean azimuth about the host's
+                                            // LOCAL up axis (placement up), pre-composed
+                                            // with the marker so the vertical base is
+                                            // preserved. null_up's 'marker' has up-axis
+                                            // −X, so the emitter relative_direction's
+                                            // pitch leans the jet −X (sideways off the
+                                            // ramp). The visible launch markers (man
+                                            // cannon 'fire', guardian crate 'up') lean
+                                            // +Y — up the throat. A −90° spin about up
+                                            // turns −X→+Y (up the ramp) while leaving the
+                                            // vertical column unchanged (holy_light, a
+                                            // pure +Z jet, is invariant under up-axis
+                                            // rotation). Override via PROTOMORPH_UP_YAW.
+                                            let up_yaw_deg: f32 =
+                                                std::env::var("PROTOMORPH_UP_YAW")
+                                                    .ok()
+                                                    .and_then(|s| s.parse().ok())
+                                                    .unwrap_or(-90.0);
+                                            if up_yaw_deg != 0.0 {
+                                                let spin = glam::Mat4::from_rotation_z(
+                                                    up_yaw_deg.to_radians(),
+                                                );
+                                                base.into_iter()
+                                                    .map(|m| spin * m)
+                                                    .collect()
+                                            } else {
+                                                base
+                                            }
+                                        })
+                                        .collect();
+                                    let variant_count = per_loc
+                                        .iter()
+                                        .map(|v| v.len())
+                                        .max()
+                                        .unwrap_or(1)
+                                        .max(1);
+                                    let variants: Vec<Vec<glam::Mat4>> = (0..variant_count)
+                                        .map(|k| {
+                                            per_loc
+                                                .iter()
+                                                .map(|markers| {
+                                                    // k-th marker for this location;
+                                                    // single-marker locations are shared
+                                                    // across all variants (reuse last).
+                                                    *markers
+                                                        .get(k)
+                                                        .unwrap_or_else(|| markers.last().unwrap())
+                                                })
+                                                .collect()
+                                        })
+                                        .collect();
+                                    resolved.push((eidx, marker, variants, primary_scale));
+                                }
+                            }
+                            if !resolved.is_empty() {
+                                palette_to_effects.insert(idx, resolved);
+                            }
+                        }
+                        match load {
                             Ok(model) => {
                                 let r_idx = renderer.upload_model_data(&model);
                                 self.model_data.push(model);
@@ -642,11 +1017,16 @@ impl GameState {
                     object_type,
                     placement_index as u32,
                 );
+            // Engine `c_dynamic_cubemap_sample` — nearest scenario cubemap
+            // probe to this placement, for dynamic-env reflections.
+            let cubemap_probe =
+                renderer.nearest_object_cubemap_probe(Vec3::new(pos.x, pos.y, pos.z));
             {
                 let slot = self.objects.get_mut(obj);
                 slot.model_index = Some(model_idx);
                 slot.instance_within_model = instance_within_model;
                 slot.header_index = Some(header_index);
+                slot.cubemap_probe_index = cubemap_probe;
                 slot.position = Vec3::new(pos.x, pos.y, pos.z);
                 slot.rotation = Vec3::new(
                     rot.yaw.to_degrees(),
@@ -682,6 +1062,58 @@ impl GameState {
                 }
             }
 
+            // Model-variant child objects (turrets, etc.) — engine
+            // `model_variant_object_block`. The warthog's `default`
+            // variant attaches `chaingun.vehicle` at marker `turret`;
+            // the wraith attaches `mortar` + `anti_infantry`. Spawn each
+            // child snapped to its parent marker, recursing through the
+            // child's own variant. Children inherit the host's baked SH
+            // probe (co-located) and carry a `model_matrix_override`
+            // world (no scenario placement / header of their own).
+            {
+                let parent_world = self.objects.get(obj).model_matrix();
+                let parent_lighting = self.objects.get(obj).engine_lighting_offset;
+                let parent_path =
+                    blam_tags::paths::resolve_tag_path(tags_root, &entry.tag_path, ext_and_label);
+                let placement_variant = p.permutation_data.variant_name.clone();
+                attached_child_count += self.spawn_attached_children(
+                    renderer,
+                    tags_root,
+                    &parent_path,
+                    model_idx,
+                    parent_world,
+                    &placement_variant,
+                    parent_lighting,
+                    &mut attached_child_models,
+                    0,
+                );
+            }
+
+            // Instance any effe attachments this palette carries onto
+            // the placed object. The host's authoritative world matrix
+            // is resolved at render time from `header_index`; `pos` is
+            // the standalone fallback origin (Phase 1).
+            if let Some(attachments) = palette_to_effects.get(&idx) {
+                for (effect_index, marker, variants, primary_scale) in attachments {
+                    // One instance per marker variant (e.g. 3 minilift pads).
+                    for loc_matrices in variants {
+                        self.effects.spawn_instance(
+                            *effect_index,
+                            header_index,
+                            marker.clone(),
+                            Vec3::new(pos.x, pos.y, pos.z),
+                            loc_matrices.clone(),
+                            primary_scale.clone(),
+                            // effect_new_looping (attachments_new dispatches
+                            // effe attachments): creation flags |= 7 →
+                            // looping instance, event durations never apply.
+                            true,
+                        );
+                        effect_instance_count += 1;
+                    }
+                }
+            }
+
             // Parent-marker attachment: defer to a post-load pass so the
             // parent object (which may load in a later placement block, or be
             // the sky) is available + already attached first. Engine path:
@@ -704,6 +1136,224 @@ impl GameState {
             "[scenario]   {ext_and_label}: {} placements ({} unique tags), {} skipped, {} failed",
             loaded_count, unique_loaded, skipped_marker, skipped_failed,
         );
+        if effect_instance_count > 0 {
+            eprintln!(
+                "[effects]    {ext_and_label}: {} effect instances spawned",
+                effect_instance_count,
+            );
+        }
+        if attached_child_count > 0 {
+            eprintln!(
+                "[attach]     {ext_and_label}: {} model-variant child object(s) spawned (turrets etc.)",
+                attached_child_count,
+            );
+        }
+    }
+
+    /// Spawn the model-variant child objects ([`blam_tags::ModelVariantObject`])
+    /// a host object's active variant attaches, snapping each to its parent
+    /// marker and recursing through the child's own variant. Returns the
+    /// number of child objects spawned (including descendants).
+    ///
+    /// Engine path: `object_new` resolves the model variant and, for each
+    /// `model_variant_object_block` entry, spawns the child object and binds
+    /// it with `object_attach_to_marker` — the child's `child marker` is made
+    /// to coincide with the host's `parent marker`. With an empty `child
+    /// marker` (the common case: warthog/wraith default turrets) the child
+    /// origin sits at the parent marker, so `child_world = parent_world ×
+    /// parent_marker_local`. A non-empty child marker (wraith `anti_air`
+    /// `attach`) additionally pre-multiplies the child marker's inverse.
+    ///
+    /// Children are static in protomorph (no physics/turret aim), so the
+    /// resolved world is baked into a `model_matrix_override`; they have no
+    /// scenario placement, so no `header_index` and they inherit the host's
+    /// baked SH probe.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_attached_children(
+        &mut self,
+        renderer: &mut Renderer,
+        tags_root: &std::path::Path,
+        parent_object_path: &std::path::Path,
+        parent_model_idx: usize,
+        parent_world: Mat4,
+        variant_name: &str,
+        lighting_offset: Option<u32>,
+        child_model_cache: &mut std::collections::HashMap<String, Option<usize>>,
+        depth: u32,
+    ) -> usize {
+        // Cycle / runaway guard (a child referencing an ancestor variant).
+        if depth >= 8 {
+            eprintln!(
+                "[attach] child-object recursion depth limit hit at {} — stopping",
+                parent_object_path.display(),
+            );
+            return 0;
+        }
+        let children =
+            crate::halo::loader::read_model_variant_children(parent_object_path, variant_name);
+        let mut spawned = 0usize;
+        for child in children {
+            if child.child_object.is_empty() {
+                continue;
+            }
+            // Resolve the child object tag path from its group fourcc
+            // (vehi → .vehicle, weap → .weapon, …).
+            let ext = blam_tags::paths::group_tag_to_extension(u32::from_be_bytes(
+                child.child_object_group,
+            ))
+            .unwrap_or("vehicle");
+            let child_path =
+                blam_tags::paths::resolve_tag_path(tags_root, &child.child_object, ext);
+            let cache_key = child_path.to_string_lossy().to_string();
+
+            // Load + upload the child model once; reuse for repeat hosts.
+            let child_model_idx = match child_model_cache.get(&cache_key).copied() {
+                Some(v) => v,
+                None => {
+                    let result = if !child_path.exists() {
+                        eprintln!(
+                            "[attach] child object tag missing: {}",
+                            child_path.display()
+                        );
+                        None
+                    } else {
+                        match crate::halo::loader::load_object(&child_path) {
+                            Ok(model) => {
+                                let r_idx = renderer.upload_model_data(&model);
+                                self.model_data.push(model);
+                                Some(r_idx)
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[attach] child object load failed {}: {e}",
+                                    child.child_object,
+                                );
+                                None
+                            }
+                        }
+                    };
+                    child_model_cache.insert(cache_key.clone(), result);
+                    result
+                }
+            };
+            let Some(child_model_idx) = child_model_idx else {
+                continue;
+            };
+
+            // parent_marker (on the host) → its model-local matrix. Empty
+            // marker = host origin. A named-but-missing marker is a real
+            // mismatch worth logging; fall back to host origin so the
+            // child is at least visible.
+            let parent_marker_local = if child.parent_marker.is_empty() {
+                Mat4::IDENTITY
+            } else {
+                match renderer.model_marker_transform(parent_model_idx, &child.parent_marker) {
+                    Some(m) => m,
+                    None => {
+                        eprintln!(
+                            "[attach] host {} has no marker '{}' for child {} — attaching at origin",
+                            parent_object_path.display(),
+                            child.parent_marker,
+                            child.child_object,
+                        );
+                        Mat4::IDENTITY
+                    }
+                }
+            };
+            // child_marker (on the child) — make it coincide with the
+            // parent marker. Empty = child origin (identity).
+            let child_marker_local = if child.child_marker.is_empty() {
+                Mat4::IDENTITY
+            } else {
+                renderer
+                    .model_marker_transform(child_model_idx, &child.child_marker)
+                    .unwrap_or(Mat4::IDENTITY)
+            };
+            let child_world =
+                parent_world * parent_marker_local * child_marker_local.inverse();
+
+            // Give the child its own object-header entry (engine: the
+            // turret is a first-class `object_new`, not just geometry).
+            // This is what lets its render-method function lookups
+            // (`object_get_function_value`) resolve against ITS
+            // `functions[]` — without a header/datum the child has
+            // object_index 0xFFFFFFFF and authored functions like the
+            // mortar's `mortar_illum` self-illum return 0.
+            use crate::halo::objects::object_type::ObjectType;
+            let child_type = ObjectType::from_group_fourcc(child.child_object_group)
+                .unwrap_or(ObjectType::Vehicle);
+            let child_obj_def = crate::halo::tags::tag_get(
+                child_type.tag_group_fourcc(),
+                &child.child_object,
+            )
+            .and_then(|t| t.as_object_definition());
+            // Resolve the child's own variant_index (child variant name →
+            // its model's variants[]) for the `variant` compute case.
+            let child_variant_index = child_obj_def
+                .as_ref()
+                .filter(|d| !d.model.is_empty() && !child.child_variant_name.is_empty())
+                .and_then(|d| crate::halo::tags::tag_get(*b"hlmt", &d.model))
+                .and_then(|t| t.as_model())
+                .map(|m| {
+                    m.variant_names
+                        .iter()
+                        .position(|n| n == &child.child_variant_name)
+                        .map(|i| i as i8)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            let child_header = child_obj_def.as_ref().map(|def| {
+                crate::halo::objects::object_header_data::push_object(
+                    child_type,
+                    child.child_object.clone(),
+                    def.clone(),
+                    child_variant_index,
+                    child_world,
+                )
+            });
+
+            // Spawn the child object slot.
+            let inst = {
+                let count = self.placements_per_model.entry(child_model_idx).or_insert(0);
+                let assigned = *count;
+                *count += 1;
+                assigned
+            };
+            let child_cubemap_probe =
+                renderer.nearest_object_cubemap_probe(child_world.w_axis.truncate());
+            let obj = self.objects.new_object();
+            {
+                let slot = self.objects.get_mut(obj);
+                slot.model_index = Some(child_model_idx);
+                slot.instance_within_model = inst;
+                slot.header_index = child_header;
+                slot.cubemap_probe_index = child_cubemap_probe;
+                // World comes from the header datum when present (render reads
+                // `header_index → world_matrix`); keep the override as the
+                // fallback for the no-header path.
+                slot.model_matrix_override = Some(child_world);
+                slot.engine_lighting_offset = lighting_offset;
+                // Derive a readable position for any pos-based bookkeeping.
+                slot.position = child_world.w_axis.truncate();
+            }
+            spawned += 1;
+
+            // Recurse: the child's own variant may attach further objects
+            // (e.g. a turret with a sub-mount). `child variant name` ("" →
+            // the child object's default variant).
+            spawned += self.spawn_attached_children(
+                renderer,
+                tags_root,
+                &child_path,
+                child_model_idx,
+                child_world,
+                &child.child_variant_name,
+                lighting_offset,
+                child_model_cache,
+                depth + 1,
+            );
+        }
+        spawned
     }
 
     pub fn update(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
@@ -715,6 +1365,21 @@ impl GameState {
         if let Some(sky) = self.sky_object {
             self.objects.get_mut(sky).position = self.camera.position;
         }
+        // Particle CPU pulse — advance every effect instance's emitters,
+        // refilling `effects.pending_spawns` for the renderer's GPU
+        // scatter. Engine: the CPU half of `frame_advance_all_gpu`.
+        // Weather effects are camera-relative — anchor their emission to the
+        // viewer each frame (engine `effect_refresh_location`) so falling
+        // ash/rain/dust surrounds the player instead of sitting at the fixed
+        // world origin it spawned at.
+        let cam_pos = self.camera.position;
+        for &wi in &self.weather_instances {
+            self.effects.set_instance_origin(wi, cam_pos);
+        }
+        // Per-location particle LOD needs the camera position; fov_scale 1.0
+        // until the real camera field_of_view_scale is threaded (engine
+        // scales distance by it — wider FOV reads as farther).
+        self.effects.frame_advance(dt, cam_pos, 1.0);
         self.fps_counter.update(dt);
         self.total_time += dt;
     }

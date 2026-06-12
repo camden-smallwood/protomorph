@@ -252,10 +252,9 @@ pub struct ModelMeshPart {
     pub material_index: usize,
     pub index_start: u32,
     pub index_count: u32,
-    /// `e_geometry_part_type` (Ares `geometry_definitions_new.h:25`) —
-    /// 0=opaque_not_drawn, 1=opaque_shadow_only, 2=opaque_shadow_casting,
-    /// 3=opaque_non_shadowing, 4=transparent, 5=lightmap_only.
-    pub part_type: i8,
+    /// [`blam_tags::render_model::GeometryPartType`] (Ares
+    /// `e_geometry_part_type`).
+    pub part_type: blam_tags::render_model::GeometryPartType,
     /// Model-space transparent sort centroid — `RenderMeshPart.sort_position
     /// .position` (the part's authored `SortingPosition`). `None` for parts
     /// with no authored sort position (opaque / `transparent_sorting_index<0`).
@@ -347,5 +346,17 @@ impl ModelData {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, m)| *m)
+    }
+
+    /// ALL markers matching `name`, in declaration order. A marker name can
+    /// repeat (e.g. the guardian minilift has three `fx_minilift_pad` markers,
+    /// one per pad), and the engine emits an effect at each — so a location
+    /// must resolve to every match, not just the first.
+    pub fn marker_transforms_all(&self, name: &str) -> Vec<Mat4> {
+        self.marker_transforms
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, m)| *m)
+            .collect()
     }
 }

@@ -44,6 +44,15 @@ pub fn load(bitm_path: &Path) -> Option<InlineTexture> {
     load_image(bitm_path, 0)
 }
 
+/// Read the sprite-sheet `sequences[]` from a `.bitmap` tag (per-frame
+/// atlas sub-rects). Empty for plain (non-animated) textures. Used to
+/// bake particle sprite-sheet frame UVs at batch registration.
+pub fn load_sequences(bitm_path: &Path) -> Vec<blam_tags::bitmap::BitmapSequence> {
+    let Ok(tag) = TagFile::read(bitm_path) else { return Vec::new() };
+    let Ok(bitmap) = Bitmap::new(&tag) else { return Vec::new() };
+    bitmap.sequences()
+}
+
 /// Load every `bitmap_data` entry in a multi-image bitmap group. Used
 /// for the per-BSP cubemap atlas
 /// (`<scenario>_<bsp>_cubemaps.bitmap`) — each `bitmaps[i]` is a

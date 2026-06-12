@@ -638,6 +638,7 @@ pub fn submit_visibility_from_render_list(
                                 object_slot: object_slot as u32,
                                 mesh_index: mesh_idx as u16,
                                 part_index: part_idx as u16,
+                                probe_index: obj.cubemap_probe_index,
                             },
                         );
                     }

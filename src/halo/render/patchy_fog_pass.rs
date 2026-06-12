@@ -136,6 +136,12 @@ pub struct PatchyFogPass {
     noise_view: Option<wgpu::TextureView>,
     /// Holds the GPU texture alive while `noise_view` references it.
     _noise_texture: Option<wgpu::Texture>,
+    /// Per-frame bind group built by [`Self::prepare`] and consumed by
+    /// [`Self::draw`] when the fog's `TransparentDispatch::PatchyFog`
+    /// element comes up in the shared transparents rpass. Rebuilt every
+    /// frame the fog is active; `draw` is a no-op when the fog element
+    /// wasn't registered (so a stale group here is never dispatched).
+    frame_bind_group: Option<wgpu::BindGroup>,
 }
 
 impl PatchyFogPass {
@@ -311,12 +317,19 @@ impl PatchyFogPass {
             },
             // Engine uses `_z_buffer_mode_read` — depth-test on, no
             // write — but the shader samples scene_depth as a texture
-            // to compute near-surface fade, so we read depth via SRV
-            // and skip the depth-stencil attachment entirely (matches
-            // `shadow_apply_pass.rs` pattern). Visual result matches
-            // engine because the smoothstep fade in the PS handles
-            // the near-occluder transition.
-            depth_stencil: None,
+            // to compute near-surface fade, so the depth TEST is moot
+            // (compare Always, no write). The state must still be
+            // declared because the quad now draws INSIDE the shared
+            // transparents rpass (engine `queue_patchy_fog` routes it
+            // through `c_transparency_renderer`), whose read-only depth
+            // attachment the pipeline must match.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: Default::default(),
             multiview_mask: None,
             cache: None,
@@ -379,6 +392,7 @@ impl PatchyFogPass {
             index_buffer,
             noise_view: None,
             _noise_texture: None,
+            frame_bind_group: None,
         }
     }
 
@@ -491,27 +505,25 @@ impl PatchyFogPass {
         self._noise_texture = Some(texture);
     }
 
-    /// Phase 4 render entry. Uploads `params` + `atm` cbuffers, builds
-    /// the per-frame bind group, opens a render pass on `target_view`
-    /// (engine `_surface_screenshot_composite_depth` = our
-    /// `lighting_base`), and draws the 4-corner fog quad with
-    /// `_alpha_blend_multiply_add` blend.
+    /// Upload `params` + `atm` cbuffers and build the per-frame bind
+    /// group for [`Self::draw`]. The actual quad draw happens inside the
+    /// shared transparents rpass when the registered
+    /// `TransparentDispatch::PatchyFog` element's turn comes up — engine
+    /// `c_player_view::queue_patchy_fog @ 0x18068BFB0` routes the fog
+    /// through `c_transparency_renderer::add_element` the same way, so
+    /// transparents/particles sorted behind it draw FIRST and get fogged
+    /// over (the s3d_turf drip streaks + chameleon railing punched
+    /// through the fog when this was a standalone pre-transparents pass).
     ///
-    /// Engine: dispatched from `c_player_view::queue_patchy_fog @
-    /// 0x18068BFB0` via TransparencyRenderer at the global tag's
-    /// transparent_sort_layer / transparent_sort_distance. We invoke
-    /// directly between water + transparents until that integration
-    /// lands (Phase 5).
+    /// `noise_fallback` is bound when no scenario noise bitmap loaded
+    /// (constant ~0.5 → flat tint, useful for wiring checks).
     #[allow(clippy::too_many_arguments)]
-    pub fn render(
-        &self,
+    pub fn prepare(
+        &mut self,
         shared: &SharedResources,
-        encoder: &mut wgpu::CommandEncoder,
-        target_view: &wgpu::TextureView,
-        hdr_dark_target_view: &wgpu::TextureView,
         scene_depth_view: &wgpu::TextureView,
         scene_depth_sampler: &wgpu::Sampler,
-        noise_view: &wgpu::TextureView,
+        noise_fallback: &wgpu::TextureView,
         noise_sampler: &wgpu::Sampler,
         params: &PatchyFogParams,
         atm: &PatchyFogAtmosphere,
@@ -534,7 +546,8 @@ impl PatchyFogPass {
             bytemuck::bytes_of(&[exposure, exposure, exposure, debug_mode]),
         );
 
-        let bg = shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let noise_view = self.noise_view.as_ref().unwrap_or(noise_fallback);
+        self.frame_bind_group = Some(shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("patchy_fog_bg"),
             layout: &self.bgl,
             entries: &[
@@ -547,41 +560,21 @@ impl PatchyFogPass {
                 wgpu::BindGroupEntry { binding: 6, resource: self.inverse_view_projection_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: self.exposure_buffer.as_entire_binding() },
             ],
-        });
+        }));
+    }
 
-        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("patchy_fog"),
-            color_attachments: &[
-                Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                }),
-                // RT1 — `hdr_dark` (engine `_surface_screenshot_composite
-                // _cubemap`, the bloom-extract feed). Engine `convert_to_render
-                // _target` writes both per fragment.
-                Some(wgpu::RenderPassColorAttachment {
-                    view: hdr_dark_target_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                }),
-            ],
-            depth_stencil_attachment: None,
-            ..Default::default()
-        });
-        rp.set_pipeline(&self.pipeline);
-        rp.set_bind_group(0, &bg, &[]);
-        rp.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        rp.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-        rp.draw_indexed(0..6, 0, 0..1);
+    /// Draw the 4-corner fog quad with `_alpha_blend_multiply_add` blend
+    /// into the CURRENT rpass (the shared transparents pass — dual MRT
+    /// `lighting_base` + `hdr_dark`, read-only depth). Dispatched by the
+    /// `TransparentDispatch::PatchyFog` arm. No-op until [`Self::prepare`]
+    /// has run this frame's upload.
+    pub fn draw<'rp>(&'rp self, rpass: &mut wgpu::RenderPass<'rp>) {
+        let Some(bg) = &self.frame_bind_group else { return };
+        rpass.set_pipeline(&self.pipeline);
+        rpass.set_bind_group(0, bg, &[]);
+        rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        rpass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        rpass.draw_indexed(0..6, 0, 0..1);
     }
 }
 

@@ -517,6 +517,72 @@ pub fn pad_rmsh_material_cbuffer(
              render_methods/mod.rs (per feedback_wgsl_must_mirror_hlsl.md)"
         ),
     }
+
+    // `overlay` category (overlays_fx.hlsl) — composited onto the final lit
+    // color via `calc_overlay_ps`. The halogram's
+    // `multiply_and_additive_detail` (the cell-like inner layer) multiplies
+    // by overlay_multiply_map, then ADDS overlay_map × overlay_detail_map ×
+    // DETAIL_MULTIPLIER × overlay_tint × overlay_intensity.
+    match choices.get_or("overlay", "none") {
+        "none" => {}
+        "multiply_and_additive_detail" => {
+            force_xform_slot(cb, "overlay_map");
+            force_xform_slot(cb, "overlay_detail_map");
+            force_xform_slot(cb, "overlay_multiply_map");
+            ensure_slot(cb, "overlay_tint", false, [1.0, 1.0, 1.0, 1.0]);
+            ensure_slot(cb, "overlay_intensity", false, ONE_SCALAR);
+        }
+        n => panic!(
+            "[protomorph] unsupported overlay option '{n}' — add a cbuffer \
+             pad arm here AND a `pick_overlay` arm in render_methods/mod.rs"
+        ),
+    }
+
+    // `warp` category (warp_fx.hlsl) — texcoord offset by a warp map.
+    match choices.get_or("warp", "none") {
+        "none" => {}
+        "from_texture" => {
+            force_xform_slot(cb, "warp_map");
+            ensure_slot(cb, "warp_amount_x", false, ZERO);
+            ensure_slot(cb, "warp_amount_y", false, ZERO);
+        }
+        n => panic!(
+            "[protomorph] unsupported warp option '{n}' — add a cbuffer pad \
+             arm here AND a `pick_warp` arm in render_methods/mod.rs"
+        ),
+    }
+
+    // `edge_fade` category (overlays_fx.hlsl) — silhouette tint fade via
+    // `calc_edge_fade_ps`. `color × lerp(edge_tint, center_tint,
+    // pow(abs(view·n), edge_fade_power))`.
+    match choices.get_or("edge_fade", "none") {
+        "none" => {}
+        "simple" => {
+            ensure_slot(cb, "edge_fade_edge_tint", false, [1.0, 1.0, 1.0, 0.0]);
+            ensure_slot(cb, "edge_fade_center_tint", false, [1.0, 1.0, 1.0, 0.0]);
+            ensure_slot(cb, "edge_fade_power", false, ONE_SCALAR);
+        }
+        n => panic!(
+            "[protomorph] unsupported edge_fade option '{n}' — add a cbuffer \
+             pad arm here AND a `pick_edge_fade` arm in render_methods/mod.rs"
+        ),
+    }
+
+    // `soft_fade` category (common_fx.hlsl apply_soft_fade) — fresnel +
+    // soft-z fade scalars. `soft_fresnel_power` feeds the WGSL fresnel
+    // branch (`material.soft_fresnel_power.x`); `soft_z_range` is ensured
+    // for layout completeness even though the soft-z branch is deferred.
+    match choices.get_or("soft_fade", "off") {
+        "off" | "none" => {}
+        "on" => {
+            ensure_slot(cb, "soft_fresnel_power", false, ONE_SCALAR);
+            ensure_slot(cb, "soft_z_range", false, ONE_SCALAR);
+        }
+        n => panic!(
+            "[protomorph] unsupported soft_fade option '{n}' — add a cbuffer \
+             pad arm here AND a `pick_soft_fade` arm in render_methods/mod.rs"
+        ),
+    }
 }
 
 impl CbufferLayout {

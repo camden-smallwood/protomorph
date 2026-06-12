@@ -161,7 +161,9 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
         specular_mask = albedo_full.w;
         albedo = vec4<f32>(albedo_full.rgb, specular_mask);
     } else {
-        let misc = vec4<f32>(0.0);
+        // misc.xyz carries world-space view_dir (fragment→camera) for albedo
+        // variants that need it (chameleon's N·V); .w reserved.
+        let misc = vec4<f32>(view_dir, 0.0);
         var bump_normal_unnorm: vec3<f32>;
         calc_bumpmap(texcoord, in.fragment_to_camera_world, tangent, binormal, normal, &bump_normal_unnorm);
         calc_albedo(texcoord, &albedo, bump_normal_unnorm, misc);

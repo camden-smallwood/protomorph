@@ -209,6 +209,13 @@ pub(crate) struct GpuMesh {
 
 pub(crate) struct GpuMaterial {
     pub bind_group: wgpu::BindGroup,
+    /// Per-scenario-cubemap-probe variants of [`Self::bind_group`] — one
+    /// per probe, with the `dynamic_environment_map_*` cube slots pointed
+    /// at that probe's cube. Selected at draw by the object's resolved
+    /// `cubemap_probe_index` (engine `render_method_submit_dynamic_cubemap`).
+    /// Empty when the material samples no dynamic-env cube or no probe
+    /// atlas is loaded → draw uses `bind_group` (rasg-default cube).
+    pub bind_group_probes: Vec<wgpu::BindGroup>,
     /// Pipeline + cbuffer layout for this material's static-lighting
     /// variant (HLSL `static_sh_ps` / `static_per_pixel_ps`). Drives
     /// the lit-color output in `c_player_view::render_static_lighting`.
@@ -580,6 +587,11 @@ pub struct Renderer {
     /// `c_vertex_allocator` / `c_index_allocator` LRU pools.
     pub decal_gpu: crate::halo::render::render_decals::DecalGpuState,
 
+    /// GPU particle subsystem — the persistent RawParticleState grid +
+    /// spawn/update/render compute (effects: waterfall mist, etc.).
+    pub particle_gpu: crate::halo::gpu_particle::ParticleGpu,
+    pub light_volume_gpu: crate::halo::gpu_particle::light_volume::LightVolumeGpu,
+
     /// Engine-faithful per-frame camera visibility collection
     /// (Phase F-G). Populated by [`crate::halo::render::render_visibility::render_visibility_camera_collection_compute`]
     /// at the top of each frame; consumers read its region via
@@ -692,7 +704,20 @@ pub struct Renderer {
     /// nearest-airprobe-by-position. We bake the lookup at scenario load
     /// since both placement positions and airprobe positions are static.
     pub crate_lighting_offsets: Vec<Option<u32>>,
+    pub vehicle_lighting_offsets: Vec<Option<u32>>,
     pub weapon_lighting_offsets: Vec<Option<u32>>,
+    /// Per-scenario-cubemap-probe cube views for OBJECT dynamic-env
+    /// mapping — the same atlas the BSP per-cluster routing uses
+    /// (`<scenario>_<bsp>_cubemaps.bitmap`). Objects pick their nearest
+    /// probe by position (engine `c_dynamic_cubemap_sample`); the
+    /// resolved cube binds to the material's `dynamic_environment_map_*`
+    /// slots so glass/env-mapped objects reflect the real environment
+    /// instead of the rasg neutral default. Retained from BSP 0 at load
+    /// (single-BSP scenarios). Empty → no atlas → rasg default cube.
+    pub object_cubemap_probe_views: Vec<wgpu::TextureView>,
+    /// World positions of each `object_cubemap_probe_views` entry (1:1
+    /// with `scenario.cubemaps[]`), for nearest-probe selection.
+    pub object_cubemap_positions: Vec<glam::Vec3>,
     pub equipment_lighting_offsets: Vec<Option<u32>>,
     pub machine_lighting_offsets: Vec<Option<u32>>,
     pub control_lighting_offsets: Vec<Option<u32>>,
@@ -789,9 +814,16 @@ impl Renderer {
             //   variant (4× per-layer base+detail+bump+detail_bump +
             //   blend_map + rmsh-baseline union). Default cap is 16.
             //   Raise to 32 — comfortably above any single Halo shader.
+            // The particle update kernel binds 9 storage buffers (grid +
+            // physics + the 5 curve-eval tables + row-batch + the
+            // transition/periodic LUT); wgpu's portable default caps storage
+            // buffers per stage at 8. Metal (this app's target) supports 31,
+            // so raise to 12 (headroom). The two `..default()` fields below are
+            // already Metal-reliant in the same way.
             required_limits: wgpu::Limits {
                 max_bind_groups: 5,
                 max_sampled_textures_per_shader_stage: 32,
+                max_storage_buffers_per_shader_stage: 12,
                 ..wgpu::Limits::default()
             },
             ..Default::default()
@@ -851,7 +883,14 @@ impl Renderer {
         let gbuffer_normal_view = gbuffer
             .normal_texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        shared.set_gbuffer_views(gbuffer_albedo_view, gbuffer_normal_view);
+        // DepthOnly scene-depth view → transparent camera bind group's
+        // soft_z sampling (binding 15).
+        let gbuffer_depth_view = gbuffer.depth_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("scene_depth_soft_z"),
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
+        shared.set_gbuffer_views(gbuffer_albedo_view, gbuffer_normal_view, gbuffer_depth_view);
 
         // Producer passes first (downstream passes capture cubemap + sampler refs)
         let shadow_apply = shadow_apply_pass::ShadowApplyPass::new(&shared);
@@ -914,10 +953,14 @@ impl Renderer {
         let decorator_renderer =
             crate::halo::render::render_decorators::DecoratorRenderer::new(&shared);
         let sky_gpu = render_sky::SkyGpu::new(&shared);
+        let particle_gpu = crate::halo::gpu_particle::ParticleGpu::new(&shared);
+        let light_volume_gpu =
+            crate::halo::gpu_particle::light_volume::LightVolumeGpu::new(&shared);
 
         Self {
             surface,
             shared,
+            light_volume_gpu,
             gbuffer,
             intermediates,
             shadow_apply,
@@ -955,10 +998,13 @@ impl Renderer {
             scenario_camera_fx: None,
             scenery_lighting_offsets: Vec::new(),
             crate_lighting_offsets: Vec::new(),
+            vehicle_lighting_offsets: Vec::new(),
             weapon_lighting_offsets: Vec::new(),
             equipment_lighting_offsets: Vec::new(),
             machine_lighting_offsets: Vec::new(),
             control_lighting_offsets: Vec::new(),
+            object_cubemap_probe_views: Vec::new(),
+            object_cubemap_positions: Vec::new(),
             object_lighting_cache: Vec::new(),
             script_camera_fx: crate::halo::render::camera_fx_settings::defaulted_script_settings(),
             default_camera_fx: None,
@@ -970,6 +1016,7 @@ impl Renderer {
             rasterizer_globals: blam_tags::rasterizer_globals::RasterizerGlobals::default(),
             loaded_scenario: None,
             decal_gpu: crate::halo::render::render_decals::DecalGpuState::default(),
+            particle_gpu,
             camera_visibility: crate::halo::visibility::CVisibilityCollection::new(),
             visible_items: crate::halo::visibility::CVisibleItems::new(),
             portal_activation:
@@ -1028,6 +1075,210 @@ impl Renderer {
             .iter()
             .find(|(n, _)| n.as_str() == marker)
             .map(|(_, m)| *m)
+    }
+
+    /// Nearest object dynamic-env cubemap probe to `pos` — engine
+    /// `c_dynamic_cubemap_sample::search_for_cubemap_sample` picks the
+    /// nearest probe by 3D distance. `None` when no atlas is loaded (the
+    /// caller then binds the rasg `DefaultDynamicCubeMap` fallback, as the
+    /// engine does when `get_cluster_cubemap_index` returns -1).
+    pub(crate) fn nearest_object_cubemap_probe(&self, pos: glam::Vec3) -> Option<u16> {
+        if self.object_cubemap_positions.is_empty() {
+            return None;
+        }
+        let mut best = 0u16;
+        let mut best_d2 = f32::INFINITY;
+        for (i, p) in self.object_cubemap_positions.iter().enumerate() {
+            let d2 = (pos - *p).length_squared();
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = i as u16;
+            }
+        }
+        Some(best)
+    }
+
+    /// Load a tag-relative `.bitmap` to a sampled view. `None` if the
+    /// path is empty or the bitmap fails to load.
+    fn load_bitmap_view(
+        &self,
+        tags_root: &std::path::Path,
+        rel: &str,
+    ) -> Option<wgpu::TextureView> {
+        self.load_bitmap_view_dims(tags_root, rel).map(|(v, _, _)| v)
+    }
+
+    /// Like [`Self::load_bitmap_view`] but also returns the base-mip
+    /// `(width, height)` — needed to bake the particle sprite corner's
+    /// bitmap-aspect factor.
+    fn load_bitmap_view_dims(
+        &self,
+        tags_root: &std::path::Path,
+        rel: &str,
+    ) -> Option<(wgpu::TextureView, u32, u32)> {
+        if rel.is_empty() {
+            return None;
+        }
+        let abs = blam_tags::paths::resolve_tag_path(tags_root, rel, "bitmap");
+        let tex = crate::halo::bitmaps::load(&abs)?;
+        let (w, h) = (tex.width, tex.height);
+        let view = crate::halo::structures::bsp_gpu::upload_inline_texture(
+            &self.shared,
+            &tex,
+            crate::halo::render::SampleIntent::FollowCurve,
+        );
+        Some((view, w, h))
+    }
+
+    /// Build one render batch per particle system (loading each system's
+    /// base/alpha/palette bitmaps) and register them with the GPU
+    /// particle subsystem (Phase 4 per-system materials).
+    pub fn register_particle_batches(
+        &mut self,
+        descriptors: &[crate::halo::effects::BatchDescriptor],
+        tags_root: &std::path::Path,
+    ) {
+        use crate::halo::gpu_particle::BatchMaterial;
+        // Scene lightprobe DC color (engine `effect_lightprobe_get_lightmap_tint`
+        // = `light_probe_rgb[0] · 1/√(4π)`). protomorph reuses the scene
+        // lightprobe (per-emitter lightprobe indices are stubbed); read it
+        // once here since it's shared by every batch. SH band-0 constant
+        // `1/(2√π) = 1/√(4π) ≈ 0.2821`.
+        let li_dc: [f32; 3] = {
+            const Y00: f32 = 0.282_094_79;
+            let li = &self.lighting_interface;
+            [
+                Y00 * li.sh_probe_r[0],
+                Y00 * li.sh_probe_g[0],
+                Y00 * li.sh_probe_b[0],
+            ]
+        };
+        let mut materials = Vec::with_capacity(descriptors.len());
+        for d in descriptors {
+            let ri = &d.render_info;
+            // Engine `initialize_particle @0x18056ae10`: m_initial_color =
+            // white, then ×lightmap_tint (bit3 — the lightprobe DC) and/or
+            // ×diffuse_tint (bit4 — the probe's m_diffuse). m_diffuse isn't
+            // tracked separately, so bit4 reuses the DC ambient. HDR is
+            // carried directly in the float rgb, so the exponent .w stays 0.
+            let initial_color: [f32; 4] = {
+                let mut c = [1.0f32, 1.0, 1.0, 0.0];
+                if d.tint_from_lightmap {
+                    c[0] = li_dc[0];
+                    c[1] = li_dc[1];
+                    c[2] = li_dc[2];
+                }
+                if d.tint_from_diffuse {
+                    c[0] *= li_dc[0];
+                    c[1] *= li_dc[1];
+                    c[2] *= li_dc[2];
+                }
+                c
+            };
+            let (base, base_w, base_h) = self
+                .load_bitmap_view_dims(tags_root, &ri.base_map)
+                .map(|(v, w, h)| (v, w, h))
+                .unwrap_or_else(|| (self.particle_gpu.fallback_view(), 1, 1));
+            let alpha = self
+                .load_bitmap_view(tags_root, &ri.alpha_map)
+                .unwrap_or_else(|| self.particle_gpu.fallback_view());
+            let palette_view = ri
+                .palette
+                .as_deref()
+                .and_then(|p| self.load_bitmap_view(tags_root, p));
+            // Bake sprite-sheet frame UVs from the base bitmap's sequences,
+            // selected by the particle's first_sequence_index. Empty for
+            // plain (non-animated) bitmaps → render samples the full quad.
+            let sequences = crate::halo::bitmaps::load_sequences(
+                &blam_tags::paths::resolve_tag_path(tags_root, &ri.base_map, "bitmap"),
+            );
+            let frames = crate::halo::gpu_particle::bake_sprite_frames(
+                &sequences,
+                d.first_sequence_index,
+            );
+            if std::env::var("PROTOMORPH_DIAG_SPRITE").is_ok() {
+                // props[8] = particle_frame: c[0]=is_constant, c[1]=value.
+                let fp = &d.eval_tables.properties[8];
+                eprintln!(
+                    "[sprite] base={} seqs={} seq_idx={} frames={} frame_blend={} one_shot={} backwards={} | frame_prop const={} val={:.2} in_idx={}",
+                    ri.base_map,
+                    sequences.len(),
+                    d.first_sequence_index,
+                    frames.len(),
+                    ri.frame_blend,
+                    d.anim_one_shot,
+                    d.anim_backwards,
+                    fp.c[0],
+                    fp.c[1],
+                    fp.b[0],
+                );
+            }
+            let ph = &d.physics;
+            materials.push(BatchMaterial {
+                albedo: ri.albedo,
+                blend_mode: ri.blend_mode,
+                black_point: ri.black_point,
+                base_view: base,
+                alpha_view: alpha,
+                palette_view,
+                physics: [
+                    crate::halo::effects::particle_emitter::PARTICLE_GRAVITY * ph.gravity_mod,
+                    ph.air_friction,
+                    ph.rot_friction,
+                    0.0,
+                ],
+                corner: crate::halo::gpu_particle::default_sprite_corner(
+                    base_w,
+                    base_h,
+                    d.center_offset,
+                ),
+                rotation_offset: d.rotation_offset,
+                depth_fade: d.render_info.depth_fade,
+                fog: d.render_info.fog,
+                distortion: d.render_info.distortion,
+                billboard: d.billboard,
+                motion_blur_aspect_scale: d.motion_blur_aspect_scale,
+                near_range: d.near_range,
+                near_cutoff: d.near_cutoff,
+                edge_range: d.edge_range,
+                edge_cutoff: d.edge_cutoff,
+                intensity_affects_alpha: d.intensity_affects_alpha,
+                flip_u: d.flip_u,
+                flip_v: d.flip_v,
+                frames,
+                frame_blend: d.render_info.frame_blend,
+                anim_one_shot: d.anim_one_shot,
+                anim_backwards: d.anim_backwards,
+                eval: d.eval_tables.clone(),
+                initial_color,
+                renders: d.renders,
+            });
+        }
+        let size_scale = std::env::var("PROTOMORPH_PARTICLE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        self.particle_gpu
+            .register_batches(&self.shared, materials, size_scale);
+    }
+
+    /// Load + cache the `base_map` textures for the effect store's light
+    /// volumes (Track R1). Call once after the effects load. Each unique
+    /// bitmap path is loaded into [`light_volume::LightVolumeGpu`] so the
+    /// per-frame strip render can bind it without touching the tag cache.
+    pub fn register_light_volume_textures(
+        &mut self,
+        base_maps: &[String],
+        tags_root: &std::path::Path,
+    ) {
+        for bm in base_maps {
+            if bm.is_empty() || self.light_volume_gpu.has_texture(bm) {
+                continue;
+            }
+            if let Some(view) = self.load_bitmap_view(tags_root, bm) {
+                self.light_volume_gpu.register_texture(bm.clone(), view);
+            }
+        }
     }
 
     pub fn load_object_tag(&mut self, path: &std::path::Path) -> (usize, ModelData) {
@@ -1613,6 +1864,7 @@ impl Renderer {
         let Some(bsp) = loaded.active_bsps.first() else {
             self.scenery_lighting_offsets = Vec::new();
             self.crate_lighting_offsets = Vec::new();
+            self.vehicle_lighting_offsets = Vec::new();
             self.weapon_lighting_offsets = Vec::new();
             self.equipment_lighting_offsets = Vec::new();
             self.machine_lighting_offsets = Vec::new();
@@ -1622,6 +1874,7 @@ impl Renderer {
         let Some(lbsp) = bsp.lightmap.as_ref() else {
             self.scenery_lighting_offsets = Vec::new();
             self.crate_lighting_offsets = Vec::new();
+            self.vehicle_lighting_offsets = Vec::new();
             self.weapon_lighting_offsets = Vec::new();
             self.equipment_lighting_offsets = Vec::new();
             self.machine_lighting_offsets = Vec::new();
@@ -1631,6 +1884,7 @@ impl Renderer {
 
         let scenery = &loaded.scenario.scenery;
         let crates = &loaded.scenario.crates;
+        let vehicles = &loaded.scenario.vehicles;
         let weapons = &loaded.scenario.weapons;
         let equipment = &loaded.scenario.equipment;
         let machines = &loaded.scenario.machines;
@@ -1904,6 +2158,19 @@ impl Renderer {
                 probe_for(placement_position(&crates[i]), r, f, &label)
             },
         );
+        // Vehicles share the non-scenery dynamic fallback chain (no
+        // per-object scenery/device probe) — same as weapon/equipment:
+        // distant cluster lightprobe → airprobe → sky.
+        let vehicle_offsets = self.bake_object_lighting_offsets(
+            vehicles.len(),
+            ObjectType::Vehicle,
+            "vehicle",
+            |i, _| {
+                let (r, f) = obj_meta_for(ObjectType::Vehicle, i as u32);
+                let label = format!("vehicle:{i}");
+                probe_for(placement_position(&vehicles[i]), r, f, &label)
+            },
+        );
         let weapon_offsets = self.bake_object_lighting_offsets(
             weapons.len(),
             ObjectType::Weapon,
@@ -1975,6 +2242,7 @@ impl Renderer {
 
         self.scenery_lighting_offsets = scenery_offsets;
         self.crate_lighting_offsets = crate_offsets;
+        self.vehicle_lighting_offsets = vehicle_offsets;
         self.weapon_lighting_offsets = weapon_offsets;
         self.equipment_lighting_offsets = equipment_offsets;
         self.machine_lighting_offsets = machine_offsets;
@@ -1995,6 +2263,7 @@ impl Renderer {
                 let header_type = match ot {
                     ObjectType::Scenery => OT::Scenery,
                     ObjectType::Crate => OT::Crate,
+                    ObjectType::Vehicle => OT::Vehicle,
                     ObjectType::Weapon => OT::Weapon,
                     ObjectType::Equipment => OT::Equipment,
                     ObjectType::Machine => OT::Machine,
@@ -2014,6 +2283,7 @@ impl Renderer {
                 }
             };
         count_dispatch(ObjectType::Crate, crates.len(), &mut side_count, &mut deft_count);
+        count_dispatch(ObjectType::Vehicle, vehicles.len(), &mut side_count, &mut deft_count);
         count_dispatch(ObjectType::Weapon, weapons.len(), &mut side_count, &mut deft_count);
         count_dispatch(ObjectType::Equipment, equipment.len(), &mut side_count, &mut deft_count);
         count_dispatch(ObjectType::Machine, machines.len(), &mut side_count, &mut deft_count);
@@ -2526,6 +2796,20 @@ impl Renderer {
             bsp,
             scenario_cubemaps,
         );
+        // Retain the probe cube atlas for OBJECT dynamic-env mapping —
+        // objects resolve their nearest probe by position (engine
+        // `c_dynamic_cubemap_sample`) and bind it like the BSP per-cluster
+        // path. First BSP wins (single-BSP scenarios); TextureViews are
+        // Arc-cheap to clone.
+        if let Some(routing) = cubemap_routing.as_ref() {
+            if self.object_cubemap_probe_views.is_empty() && !routing.probe_views.is_empty() {
+                self.object_cubemap_probe_views = routing.probe_views.clone();
+                self.object_cubemap_positions = scenario_cubemaps
+                    .iter()
+                    .map(|c| glam::Vec3::new(c.position.x, c.position.y, c.position.z))
+                    .collect();
+            }
+        }
         let bsp_gpu = crate::halo::structures::BspGpu::from_loaded_bsp(
             &self.shared,
             &mut self.halo_pipelines,
@@ -2863,6 +3147,26 @@ impl Renderer {
                 for tb in &artifacts.bindings.textures {
                     let view = match mat.find_texture_by_name(&tb.name) {
                         Some(tex) => upload_view(tex, sample_intent_for_param(&tb.name)),
+                        // Dynamic-env cube slots (`dynamic_environment_map_*`,
+                        // and a fallback `environment_map`) get the rasg
+                        // `DefaultDynamicCubeMap` as the BASE view (engine's
+                        // fallback when the cluster has no cubemap). The
+                        // `bind_group_probes` built below OVERRIDE these slots
+                        // with the object's nearest cluster cubemap (engine
+                        // `render_method_submit_dynamic_cubemap`), so glass /
+                        // env-mapped objects reflect the real environment. The
+                        // base view is used only when no probe atlas is loaded.
+                        None if tb.is_cube
+                            && (tb.name.starts_with("dynamic_environment_map")
+                                || tb.name == "environment_map") =>
+                        {
+                            self.shared
+                                .fallback_textures
+                                .default_bitmap_view(
+                                    blam_tags::rasterizer_globals::DefaultBitmap::DefaultDynamicCubeMap,
+                                )
+                                .clone()
+                        }
                         None => fallback_view_for_param(&self.shared, &tb.name, tb.is_cube),
                     };
                     texture_views.push((tb.slot, view));
@@ -2983,6 +3287,55 @@ impl Renderer {
                         layout: &artifacts.material_bgl,
                         entries: &entries,
                     });
+                // Per-cluster dynamic-env cube variants — engine
+                // `render_method_submit_dynamic_cubemap` binds the object's
+                // CLUSTER cubemap (resolved by `c_dynamic_cubemap_sample`) to
+                // the `dynamic_environment_map_*` sampler. We mirror the BSP
+                // per-probe approach: one bind group per scenario cubemap probe
+                // (overriding only the dynamic-env cube slots), selected at draw
+                // by the object's resolved `cubemap_probe_index`. Built only for
+                // materials that actually sample a dynamic-env cube AND when a
+                // probe atlas is loaded; empty otherwise → draw uses `bind_group`
+                // (the rasg-default base, = MCC's stripped-cubemap fallback).
+                let dyn_env_slots: Vec<u32> = artifacts
+                    .bindings
+                    .textures
+                    .iter()
+                    .filter(|tb| tb.is_cube && tb.name.starts_with("dynamic_environment_map"))
+                    .map(|tb| tb.slot)
+                    .collect();
+                let bind_group_probes: Vec<wgpu::BindGroup> =
+                    if dyn_env_slots.is_empty() || self.object_cubemap_probe_views.is_empty() {
+                        Vec::new()
+                    } else {
+                        let device = &self.shared.device;
+                        let sampler_cbuffer_entries = &entries[texture_views.len()..];
+                        self.object_cubemap_probe_views
+                            .iter()
+                            .map(|probe_view| {
+                                let mut probe_entries: Vec<wgpu::BindGroupEntry> =
+                                    Vec::with_capacity(entries.len());
+                                for (slot, view) in &texture_views {
+                                    let v = if dyn_env_slots.contains(slot) {
+                                        probe_view
+                                    } else {
+                                        view
+                                    };
+                                    probe_entries.push(wgpu::BindGroupEntry {
+                                        binding: *slot,
+                                        resource: wgpu::BindingResource::TextureView(v),
+                                    });
+                                }
+                                // Samplers + cbuffer are identical across probes.
+                                probe_entries.extend(sampler_cbuffer_entries.iter().cloned());
+                                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some("material_bg_probe"),
+                                    layout: &artifacts.material_bgl,
+                                    entries: &probe_entries,
+                                })
+                            })
+                            .collect()
+                    };
                 // Albedo variant shares the same bindings (textures +
                 // sampler + props cbuffer) but lives behind a separate
                 // pipeline_layout / material_bgl, so wgpu requires its
@@ -3192,6 +3545,7 @@ impl Renderer {
 
                 GpuMaterial {
                     bind_group,
+                    bind_group_probes,
                     artifacts,
                     artifacts_albedo: Some(artifacts_albedo),
                     bind_group_albedo: Some(bind_group_albedo),
@@ -3429,8 +3783,15 @@ impl Renderer {
             .gbuffer
             .normal_texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        // Fresh DepthOnly-aspect scene-depth view for the transparent
+        // camera bind group's soft_z sampling (binding 15).
+        let gbuffer_depth_view = self.gbuffer.depth_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("scene_depth_soft_z"),
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
         self.shared
-            .set_gbuffer_views(gbuffer_albedo_view, gbuffer_normal_view);
+            .set_gbuffer_views(gbuffer_albedo_view, gbuffer_normal_view, gbuffer_depth_view);
         self.shared.rebuild_camera_bind_group();
         // The water extern bind group references the freshly-allocated
         // scene_ldr_snapshot + scene_depth views at @group(2); rebuild
@@ -3444,6 +3805,8 @@ impl Renderer {
         self.final_composite_pass.resize(&self.shared, &self.gbuffer, &self.intermediates);
         // Re-allocate aux_bloom + rebuild composite bind group with new view.
         self.screen_postprocess.resize(&self.shared);
+        // Distortion accumulation + scene-copy targets track the viewport.
+        self.particle_gpu.resize(&self.shared.device, width, height);
         // Bind-group cache invalidation — intermediates rebuilt above
         // means cached views' addresses are dead. Drop cached entries
         // so the next frame rebuilds with the new pointers.
@@ -3482,6 +3845,23 @@ impl Renderer {
         // Tick rate: 30 Hz canonical (engine `game_time_get()`).
         let game_ticks = (game.total_time * 30.0) as i32;
         self.scripted_exposure_game_globals.update_scripted_exposure(game_ticks);
+
+        // Particle spawn → integrate. Scatter this frame's CPU-pulsed
+        // spawn requests into the persistent grid (engine `spawn_all`),
+        // then age + apply physics over the whole grid (`frame_advance_all`).
+        // Billboard render (Phase 4) follows in the main pass.
+        self.particle_gpu.dispatch_spawn(
+            &self.shared,
+            &game.effects.pending_spawns,
+            &game.effects.pending_slots,
+        );
+        self.particle_gpu.dispatch_update(
+            &self.shared,
+            game.delta_time,
+            &game.effects.batch_self_accel,
+            &game.effects.batch_state,
+            game.effects.row_pool.batch_table(),
+        );
 
         // L3 master per-frame blender — port of
         // `c_player_view::setup_camera_fx_parameters @ 0x180689C20`.
@@ -3795,6 +4175,14 @@ impl Renderer {
             .player_window[0]
             .camera_fx_values
             .get_illum_render_scale(&self.scripted_exposure_game_globals);
+        if std::env::var_os("PROTOMORPH_DIAG_ILLUM").is_some() {
+            let cfx = &self.render_game_state.player_window[0].camera_fx_values;
+            eprintln!(
+                "[illum] illum_render_scale={:.4} self_illum_exposure={:.4} self_illum_preferred={:.4} self_illum_scale={:.4} m_exposure={:.4} render_exposure={:.3}",
+                self.illum_render_scale, cfx.self_illum_exposure, cfx.self_illum_preferred,
+                cfx.self_illum_scale, cfx.exposure.exposure, self.render_exposure,
+            );
+        }
         // `c_lights_view::g_render_light_intensity` is a class-level static.
         // Per `scenario/loader.rs:215` + `:1398`, protomorph fixes it at 1.0
         // (the engine default — `g_render_set_light_intensity` HSC mutates).

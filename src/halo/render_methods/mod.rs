@@ -58,6 +58,14 @@ pub struct CategoryChoices {
     /// `(category_name, chosen_option_name)` pairs sorted by category_name.
     /// Empty for stub materials (load failures).
     pairs: Vec<(String, String)>,
+    /// Category names whose chosen option is NON-DEFAULT (rmsh option
+    /// index != 0 — i.e. not the rmdf's neutral `none`/`off`/`default`
+    /// option[0]). Recorded at `resolve` time (the only place the rmdf
+    /// option ordering is known). Drives the fail-loud guard in
+    /// `assemble`: a non-default option in a category the chosen subclass
+    /// path doesn't render would silently produce a wrong shader, so we
+    /// panic instead. Sorted; subset of `pairs`' category names.
+    non_default: Vec<String>,
 }
 
 impl CategoryChoices {
@@ -65,6 +73,7 @@ impl CategoryChoices {
     /// rmdf, pick the option named at `rmsh.options[i]` and record
     /// `(category.category_name, option.option_name)`.
     pub fn resolve(rm: &RenderMethod, rmdf: &RenderMethodDefinition) -> Self {
+        let mut non_default: Vec<String> = Vec::new();
         let mut pairs: Vec<(String, String)> = rmdf.categories.iter().enumerate()
             .filter_map(|(cat_idx, category)| {
                 if category.category_name.is_empty() { return None; }
@@ -79,6 +88,12 @@ impl CategoryChoices {
                         0
                     }
                 };
+                // Option index 0 is the rmdf's neutral default (none/off/
+                // default/the category's identity); anything else is a
+                // meaningful choice the assembly MUST consume.
+                if opt_idx != 0 {
+                    non_default.push(category.category_name.clone());
+                }
                 let option_name = match category.options.get(opt_idx) {
                     Some(o) => o.option_name.clone(),
                     None => {
@@ -94,7 +109,15 @@ impl CategoryChoices {
             })
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        Self { pairs }
+        non_default.sort();
+        Self { pairs, non_default }
+    }
+
+    /// Category names whose chosen option is non-default (rmdf option index
+    /// != 0). The assemble guard panics on any of these its subclass path
+    /// doesn't consume.
+    pub fn non_default(&self) -> &[String] {
+        &self.non_default
     }
 
     /// Look up the chosen option_name for a category. Returns `None`
@@ -118,7 +141,9 @@ impl CategoryChoices {
     /// Build directly from sorted pairs. Caller is responsible for
     /// sorting by `category_name` (keeps `Hash + Eq` deterministic).
     pub fn from_pairs(pairs: Vec<(String, String)>) -> Self {
-        Self { pairs }
+        // Manual construction (no rmdf) → no non-default tracking; the
+        // assemble guard is a no-op for these.
+        Self { pairs, non_default: Vec::new() }
     }
 }
 
@@ -627,7 +652,16 @@ pub fn assemble(
             wgsl.push('\n');
             wgsl.push_str(pick_bump(bump));
             wgsl.push('\n');
-            wgsl.push_str(pick_parallax(parallax));
+            // `warp` and `parallax` both define `calc_parallax` (the working-
+            // texcoord producer); they're mutually exclusive. The engine
+            // routes warp into the parallax slot — so emit the warp fragment
+            // when warp != none, else the parallax fragment.
+            let warp = choices.get_or("warp", "none");
+            if warp != "none" {
+                wgsl.push_str(pick_warp(warp));
+            } else {
+                wgsl.push_str(pick_parallax(parallax));
+            }
             wgsl.push('\n');
             wgsl.push_str(pick_alpha_test(alpha_test));
             wgsl.push('\n');
@@ -639,6 +673,77 @@ pub fn assemble(
             wgsl.push('\n');
             wgsl.push_str(pick_self_illum(choices.get_or("self_illumination", "none")));
             wgsl.push('\n');
+            // overlay + edge_fade compose onto the final lit color (engine
+            // APPLY_OVERLAYS; entry point calls calc_overlay_ps then
+            // calc_edge_fade_ps). Always included so the entry's calls
+            // resolve; `none` variants are no-ops.
+            wgsl.push_str(pick_overlay(choices.get_or("overlay", "none")));
+            wgsl.push('\n');
+            wgsl.push_str(pick_edge_fade(choices.get_or("edge_fade", "none")));
+            wgsl.push('\n');
+            // soft_fade (common_fx.hlsl apply_soft_fade) — fades the
+            // material by a fresnel and/or soft-z depth term, applied to
+            // albedo right after it's computed in the entry point. Always
+            // emits an `apply_soft_fade` definition (the entry calls it
+            // unconditionally); `off`/absent → no-op. `use_soft_fresnel`/
+            // `use_soft_z` are per-material PARAM(bool)s resolved here.
+            let alpha_blend = choices.get_or("blend_mode", "opaque") == "alpha_blend";
+            wgsl.push_str(&pick_soft_fade(choices.get_or("soft_fade", "off"), rm, alpha_blend));
+            wgsl.push('\n');
+
+            // Fail-loud on a silently-dropped render-method category.
+            // Project policy: no silent shader fallbacks. This path
+            // consumes the categories below (rmhg additionally FORCES
+            // bump/alpha_test/specular_mask/material_model/environment_
+            // mapping/parallax off per halogram_fx.hlsl, so they count as
+            // handled). Any OTHER category set to a non-default option
+            // (rmdf option index != 0) is not rendered — it would produce
+            // a wrong shader without warning. The guardian hologram
+            // exposed two: `overlay = multiply_and_additive_detail` (the
+            // cell-like inner layer) and `edge_fade = simple` (silhouette
+            // fade), both silently lost. Panic so they get implemented or
+            // explicitly overridden, not quietly mis-rendered.
+            const RMSH_HANDLED: &[&str] = &[
+                "albedo", "bump_mapping", "alpha_test", "specular_mask",
+                "material_model", "environment_mapping", "parallax",
+                "self_illumination", "blend_mode", "overlay", "edge_fade",
+                "warp", "soft_fade",
+                // `distortion` is ADDITIVE in the engine: the shader's
+                // primary entry point (static_sh_ps etc.) renders its
+                // colour identically whether or not distortion is on; the
+                // category only enables a SEPARATE displacement-accumulation
+                // entry (displacement_hlsl.hlsl) drawn into the warp buffer
+                // that the full-screen distortion pass applies. So letting
+                // the colour path render the surface normally is faithful —
+                // the only deferred piece is the heat-haze ripple (the
+                // existing particle-distortion accumulate→warp infra can be
+                // reused for it; tracked as a follow-up). These s3d distortion
+                // shaders are alpha_blend/additive water/energy surfaces; they
+                // render correctly minus the ripple.
+                "distortion",
+            ];
+            // Behavioral categories that change WHEN/WHETHER a material
+            // draws, not its shaded output — intentionally ignored for
+            // protomorph's static world view (no first-person arm, no
+            // per-vertex CPU attr animation path). Dropping these is
+            // correct, not a silent mis-render, so they don't panic.
+            // `misc` = first_person_{never,sometimes,always}; the FP-only
+            // behavior is irrelevant when we render the world view.
+            const RMSH_IGNORED: &[&str] = &["misc", "misc_attr_animation"];
+            for cat in choices.non_default() {
+                let c = cat.as_str();
+                if !RMSH_HANDLED.contains(&c) && !RMSH_IGNORED.contains(&c) {
+                    panic!(
+                        "render_method ({}) category '{cat}' = '{}' is a non-default option that \
+                         the rmsh/rmcs/rmhg shader path does NOT render — it would be silently \
+                         dropped, producing a wrong shader. Implement the category or override it. \
+                         (Found auditing the guardian halogram: overlay=multiply_and_additive_detail \
+                         + edge_fade=simple.)",
+                        std::str::from_utf8(&group_fourcc).unwrap_or("?"),
+                        choices.get_or(cat, "?"),
+                    );
+                }
+            }
 
             // Entry-point umbrella (vs_main + fs_main). Apply per-variant
             // blend_fx.hlsl substitutions (multiplicative branch enable +
@@ -1215,6 +1320,106 @@ fn pick_self_illum(option_name: &str) -> &'static str {
         | "ml_add_five_change_color" => include_str!("../../../assets/halo_shaders/self_illumination_halogram_fx_multilayer.wgsl"),
         "scope_blur"               => include_str!("../../../assets/halo_shaders/self_illumination_halogram_fx_scope_blur.wgsl"),
         n                          => unsupported_option("self_illumination", n, "self_illumination_fx.hlsl"),
+    }
+}
+
+/// `overlay` category — `overlays_fx.hlsl`. Composited onto the final lit
+/// color (after radiance, before extinction/exposure) via `calc_overlay_ps`
+/// in the entry point, mirroring the engine `APPLY_OVERLAYS` macro.
+fn pick_overlay(option_name: &str) -> &'static str {
+    match option_name {
+        "none"                          => include_str!("../../../assets/halo_shaders/overlays_fx_none.wgsl"),
+        "additive"                      => include_str!("../../../assets/halo_shaders/overlays_fx_additive.wgsl"),
+        "additive_detail"               => include_str!("../../../assets/halo_shaders/overlays_fx_additive_detail.wgsl"),
+        "multiply"                      => include_str!("../../../assets/halo_shaders/overlays_fx_multiply.wgsl"),
+        "multiply_and_additive_detail"  => include_str!("../../../assets/halo_shaders/overlays_fx_multiply_and_additive_detail.wgsl"),
+        n                               => unsupported_option("overlay", n, "overlays_fx.hlsl"),
+    }
+}
+
+/// `warp` category — `warp_fx.hlsl`. Shares the `calc_parallax` texcoord-
+/// producer slot (mutually exclusive with parallax — the engine #defines
+/// `calc_parallax_ps` to the warp function when warp is set). The `none`
+/// case is handled by the assembler falling back to `pick_parallax`.
+fn pick_warp(option_name: &str) -> &'static str {
+    match option_name {
+        "from_texture" => include_str!("../../../assets/halo_shaders/warp_fx_from_texture.wgsl"),
+        n              => unsupported_option("warp", n, "warp_fx.hlsl"),
+    }
+}
+
+/// `edge_fade` category — `overlays_fx.hlsl`. Applied after the overlay via
+/// `calc_edge_fade_ps(color, view_dot_normal)` in the entry point.
+fn pick_edge_fade(option_name: &str) -> &'static str {
+    match option_name {
+        "none"   => include_str!("../../../assets/halo_shaders/edge_fade_fx_none.wgsl"),
+        "simple" => include_str!("../../../assets/halo_shaders/edge_fade_fx_simple.wgsl"),
+        n        => unsupported_option("edge_fade", n, "overlays_fx.hlsl"),
+    }
+}
+
+/// `soft_fade` category — common_fx.hlsl `apply_soft_fade_{off,on}`.
+/// Always returns an `apply_soft_fade` definition (the entry point calls
+/// it unconditionally); `off`/absent → no-op. The per-material
+/// `use_soft_fresnel` / `use_soft_z` PARAM(bool)s are resolved here (like
+/// `no_dynamic_lights`) so each HLSL branch is emitted only when set.
+///
+/// `use_soft_z` (the scene-depth soft-particle fade) is fail-loud
+/// DEFERRED: it needs `scene_depth` bound into the transparent material
+/// group, and every shipped material that sets it is in a level that also
+/// requires the (unported) distortion displacement subsystem — so it
+/// clears no level yet and is best landed alongside distortion. The
+/// `apply_soft_fade` signature already carries `frag_device_z`/`vpos` so
+/// adding the branch later is localized.
+fn pick_soft_fade(option_name: &str, rm: &ResolvedRenderMethod, alpha_blend: bool) -> String {
+    let resolve_bool = |n: &str| {
+        matches!(
+            rm.find(n).map(|p| &p.source),
+            Some(ParameterSource::Inline(ResolvedValue::Bool(true)))
+        )
+    };
+    match option_name {
+        "off" | "none" => {
+            include_str!("../../../assets/halo_shaders/soft_fade_fx_off.wgsl").to_string()
+        }
+        "on" => {
+            // use_soft_fresnel branch (common_fx.hlsl:73-76). When unset,
+            // `val` stays 1 and apply_soft_fade is an effective no-op.
+            let fresnel = if resolve_bool("use_soft_fresnel") {
+                "    let fresnel_dp = sf_calc_fresnel_dp(wnorm, wview);\n\
+                 \x20   val *= pow(fresnel_dp, material.soft_fresnel_power.x);"
+            } else {
+                "    // use_soft_fresnel = false → fresnel term skipped"
+            };
+            // use_soft_z branch (common_fx.hlsl:77-82). Fades the surface
+            // as it nears scene geometry behind it (soft-particle effect):
+            //   val *= get_softness(z_to_w(depth_map.r), linearDepth, soft_z_range)
+            //        = saturate((scene_dist - frag_dist) * soft_z_range)
+            // `scene_depth_tex` is the read-only scene depth bound at
+            // camera_bgl binding 15 (only real in the transparent pass).
+            // `vpos` (= clip_position.xy) is the fragment's pixel coord →
+            // point-load the scene depth at the same pixel. Both distances
+            // use `sf_linear_depth` (camera-projection reconstruction).
+            let soft_z = if resolve_bool("use_soft_z") {
+                "    let sz_scene = sf_linear_depth(textureLoad(scene_depth_tex, vec2<i32>(vpos), 0));\n\
+                 \x20   let sz_frag = sf_linear_depth(frag_device_z);\n\
+                 \x20   val *= saturate((sz_scene - sz_frag) * material.soft_z_range.x);"
+            } else {
+                "    // use_soft_z = false → scene-depth fade skipped"
+            };
+            // BLEND_MODE(alpha_blend) → fade alpha; else fade rgb
+            // (common_fx.hlsl:83-87).
+            let apply = if alpha_blend {
+                "    (*albedo).w = (*albedo).w * val;"
+            } else {
+                "    (*albedo) = vec4<f32>((*albedo).xyz * val, (*albedo).w);"
+            };
+            include_str!("../../../assets/halo_shaders/soft_fade_fx_on.wgsl")
+                .replace("__SOFT_FADE_FRESNEL__", fresnel)
+                .replace("__SOFT_FADE_SOFTZ__", soft_z)
+                .replace("__SOFT_FADE_APPLY__", apply)
+        }
+        n => unsupported_option("soft_fade", n, "common_fx.hlsl"),
     }
 }
 

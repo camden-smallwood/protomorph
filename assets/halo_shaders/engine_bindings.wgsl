@@ -251,6 +251,20 @@ struct MiscBoolPs {
 }
 @group(0) @binding(14) var<uniform> misc_bool_ps: MiscBoolPs;
 
+// Scene depth buffer (read-only, DepthOnly aspect). Sampled by the
+// `soft_fade` category's `use_soft_z` branch (common_fx.hlsl:77-82) to
+// fade a transparent surface as it approaches scene geometry (the soft-
+// particle effect). Engine equivalent: `depth_map` PARAM_SAMPLER_2D.
+//
+// Only bound to a REAL view in `camera_bind_group_transparent`, used by
+// the transparent pass where the depth attachment is READ-ONLY
+// (`depth_ops: None`) so the same texture can be both depth-tested and
+// sampled. The default + `_sl` camera bind groups (used in passes that
+// WRITE depth) bind a 1×1 placeholder here — legal because no opaque/
+// albedo material enables `use_soft_z`, so this binding is declared-but-
+// unused in those passes (wgpu permits unused layout bindings).
+@group(0) @binding(15) var scene_depth_tex: texture_depth_2d;
+
 // `apply_underwater_fog` — engine port of the underwater-fog mix used
 // by every transparent PS when the camera is below water. Mirrors
 // `water_ripple_hlsl.hlsl:919-920` (fullscreen pass) and

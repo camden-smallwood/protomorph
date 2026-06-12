@@ -88,8 +88,18 @@ pub fn load_object(crate_path: &Path) -> Result<ModelData, HaloLoadError> {
     let rm = RenderModel::from_tag(&rm_tag).map_err(HaloLoadError::Extract)?;
     let render_meshes = RenderModel::derive_render_meshes(&rm_tag).map_err(HaloLoadError::Extract)?;
 
+    // Resolve the active model variant so per-region permutation
+    // selection draws the right (undamaged) meshes. Uses the object's
+    // `default_model_variant` (engine `model_get_variant`: name → the
+    // `default` variant → variant 0). Per-PLACEMENT variant overrides
+    // (campaign damage/color variants) are deferred — the per-palette
+    // model cache is keyed by tag only today.
+    let model_def = blam_tags::Model::from_tag(&model_tag).ok();
+    let active_variant =
+        model_def.as_ref().and_then(|m| m.variant(&obj_def.default_model_variant));
+
     let materials = load_materials(&rm, &tags_root);
-    let mut model = convert(&rm, &render_meshes, materials);
+    let mut model = convert(&rm, &render_meshes, materials, active_variant);
     model.authored_bounding_sphere = if obj_def.has_authored_bounding_sphere() {
         let o = obj_def.bounding_offset;
         Some(glam::Vec4::new(o.x, o.y, o.z, obj_def.bounding_radius))
@@ -147,6 +157,87 @@ pub fn load_object(crate_path: &Path) -> Result<ModelData, HaloLoadError> {
     Ok(model)
 }
 
+/// Read the `effe` attachments off an object tag. Returns
+/// `(effect_rel_path, marker)` pairs — the tag-relative path of each
+/// attached `.effect` and the marker it binds to. Empty when the tag
+/// has no effect attachments (the common case).
+///
+/// Engine equivalent: `attachments_new @0x1807E2F60` walks
+/// `object_definition.attachments[]` and dispatches each by group;
+/// `effe` entries queue an effect via `effect_new_from_object`. Here we
+/// only surface the data so the [`crate::halo::effects`] subsystem can
+/// instantiate it. `lens`/`snd!`/`cont`/`lsnd`/`ligh` attachments are
+/// ignored for now (other attachment types land with their subsystems).
+/// Returns `(effect_path, marker, primary_scale)` per `effe` attachment.
+/// `primary_scale` is the object-function name (`s_object_attachment::
+/// primary scale`) that gates the attachment's intensity at runtime —
+/// the engine scales the effect by `object_get_function_value(object,
+/// primary_scale)` (e.g. the energy sword's `blade_effects`/
+/// `turning_on_effects`, 0 until the blade is drawn). Empty = always on.
+pub fn read_object_effect_attachments(
+    object_path: &Path,
+) -> Vec<(String, String, String)> {
+    let Ok(tag) = TagFile::read(object_path) else {
+        return Vec::new();
+    };
+    let obj_def = blam_tags::object::ObjectDefinition::from_tag(&tag)
+        .unwrap_or_default();
+    obj_def
+        .attachments
+        .iter()
+        .filter(|a| &a.type_group == b"effe" && !a.type_ref.is_empty())
+        .map(|a| (a.type_ref.clone(), a.marker.clone(), a.primary_scale.clone()))
+        .collect()
+}
+
+/// Read the child objects an object's active model variant attaches —
+/// the engine `model_variant_object_block` (e.g. the warthog's `turret`
+/// marker → `chaingun.vehicle`, the wraith's `mortar`+`anti_infantry`).
+///
+/// `placement_variant` is the scenario placement's authored variant
+/// name; when empty the object's `default model variant` is used. Walks
+/// `object → model (hlmt) → variants[match] → objects[]`. Returns an
+/// empty vec when the object has no model, no matching variant, or the
+/// variant attaches nothing.
+///
+/// Engine path: during `object_new`, `model_get_variant` selects the
+/// variant and each `objects[]` entry is spawned and bound via
+/// `object_attach_to_marker` (child's `child marker` → parent's
+/// `parent marker`).
+pub fn read_model_variant_children(
+    object_path: &Path,
+    placement_variant: &str,
+) -> Vec<blam_tags::ModelVariantObject> {
+    let Some(tags_root) = derive_tags_root(object_path) else {
+        return Vec::new();
+    };
+    let Ok(obj_tag) = TagFile::read(object_path) else {
+        return Vec::new();
+    };
+    let obj_def =
+        blam_tags::object::ObjectDefinition::from_tag(&obj_tag).unwrap_or_default();
+    if obj_def.model.is_empty() {
+        return Vec::new();
+    }
+    let model_path = resolve_tag_path(&tags_root, &obj_def.model, "model");
+    let Ok(model_tag) = TagFile::read(&model_path) else {
+        return Vec::new();
+    };
+    let Ok(model) = blam_tags::Model::from_tag(&model_tag) else {
+        return Vec::new();
+    };
+    // Placement variant overrides the object default ("" → default).
+    let effective = if placement_variant.is_empty() {
+        obj_def.default_model_variant.as_str()
+    } else {
+        placement_variant
+    };
+    model
+        .variant(effective)
+        .map(|v| v.objects.clone())
+        .unwrap_or_default()
+}
+
 /// `.model` (hlmt) tag `model object data[0]` auto-bake sphere — the
 /// cache builder fills this with a vertex-walked sphere even when the
 /// object tag's `bounding_radius` is 0 ("use autogen" convention).
@@ -173,11 +264,18 @@ fn read_model_object_data_sphere(model_tag: &TagFile) -> Option<glam::Vec4> {
     Some(glam::Vec4::new(off.x, off.y, off.z, radius))
 }
 
-fn convert(rm: &RenderModel, render_meshes: &[RenderMesh], materials: Vec<MaterialData>) -> ModelData {
-    // v1 mesh selection: first permutation of each region. For damage
-    // states / color variants, this picks the "intact" / "default"
-    // entry. Most static scenery has 1 region × 1 perm so it's a no-op.
-    let selected = select_meshes(rm, render_meshes.len());
+fn convert(
+    rm: &RenderModel,
+    render_meshes: &[RenderMesh],
+    materials: Vec<MaterialData>,
+    variant: Option<&blam_tags::ModelVariant>,
+) -> ModelData {
+    // Mesh selection: per region, the active variant designates the
+    // permutation to draw BY NAME (`select_meshes`). For the undamaged
+    // default variant this resolves to each region's base permutation —
+    // independent of the render_model's authored permutation order
+    // (which is NOT base-first for every region, e.g. wraith cockpit).
+    let selected = select_meshes(rm, render_meshes.len(), variant);
 
     // Object-local node-**world** bind-pose matrices. Halo stores nodes
     // parent-before-child with parent-relative TRS, so one forward pass
@@ -256,11 +354,21 @@ fn convert(rm: &RenderModel, render_meshes: &[RenderMesh], materials: Vec<Materi
             let node = (marker.node_index.max(0) as usize)
                 .min(node_world_matrices.len().saturating_sub(1));
             let nw = node_world_matrices.get(node).copied().unwrap_or(Mat4::IDENTITY);
+            let q = quat_from_real(marker.rotation);
             let local = Mat4::from_rotation_translation(
-                quat_from_real(marker.rotation),
+                q,
                 real_point_to_vec3(marker.translation),
             );
-            marker_transforms.push((group.name.clone(), nw * local));
+            let composed = nw * local;
+            if std::env::var("PROTOMORPH_DIAG_MARKER_QUAT").is_ok() {
+                let r = marker.rotation;
+                let f = composed.transform_vector3(glam::Vec3::X);
+                eprintln!(
+                    "[mquat] '{}' raw_quat(i,j,k,w)=({:.3},{:.3},{:.3},{:.3}) decoded_fwd(+X)=({:.3},{:.3},{:.3})",
+                    group.name, r.i, r.j, r.k, r.w, f.x, f.y, f.z,
+                );
+            }
+            marker_transforms.push((group.name.clone(), composed));
         }
     }
 
@@ -998,11 +1106,39 @@ fn push_bitmap(
 /// `region_index` sort key (the region-loop counter in
 /// `submit_object_mesh_parts`), threaded onto each mesh for region-ordered
 /// transparent sorting.
-fn select_meshes(rm: &RenderModel, mesh_count: usize) -> Vec<(usize, u8)> {
+///
+/// Per region, the permutation to draw is chosen by NAME from the active
+/// model variant (`ModelVariant::region_base_permutation`), mirroring the
+/// engine's `render_model_definition_find_region_permutation_by_name`. The
+/// render_model's authored permutation ORDER is NOT meaningful: e.g. the
+/// wraith's `cockpit` region lists the damaged `medium` permutation FIRST
+/// and `base` second, so the old "first permutation" heuristic drew a
+/// damaged cockpit. Fallbacks (no variant / unlisted region): a permutation
+/// literally named `base`/`default`, else the first.
+fn select_meshes(
+    rm: &RenderModel,
+    mesh_count: usize,
+    variant: Option<&blam_tags::ModelVariant>,
+) -> Vec<(usize, u8)> {
     let mut out: Vec<(usize, u8)> = Vec::new();
     for (ri, region) in rm.regions.iter().enumerate() {
-        let Some(perm) = region.permutations.first() else { continue };
-        if perm.mesh_index < 0 || perm.mesh_count <= 0 { continue; }
+        if region.permutations.is_empty() {
+            continue;
+        }
+        let perm = variant
+            .and_then(|v| v.region_base_permutation(&region.name))
+            .and_then(|pname| region.permutations.iter().find(|p| p.name == pname))
+            .or_else(|| {
+                region
+                    .permutations
+                    .iter()
+                    .find(|p| p.name == "base" || p.name == "default")
+            })
+            .or_else(|| region.permutations.first());
+        let Some(perm) = perm else { continue };
+        if perm.mesh_index < 0 || perm.mesh_count <= 0 {
+            continue;
+        }
         for off in 0..perm.mesh_count as i32 {
             let mi = perm.mesh_index as i32 + off;
             if mi < 0 || (mi as usize) >= mesh_count { continue; }

@@ -93,13 +93,12 @@ pub struct BspMeshPart {
     pub material_index: u16,
     pub index_start: u32,
     pub index_count: u32,
-    /// `e_geometry_part_type` (Ares `geometry_definitions_new.h:25`):
-    /// 0=opaque_not_drawn, 1=opaque_shadow_only, 2=opaque_shadow_casting,
-    /// 3=opaque_non_shadowing, 4=transparent, 5=lightmap_only.
-    /// Used by `submit_visibility` to compute cluster_part.flags
-    /// (`is_transparent ? 4 : (part_type & 3)`); the render passes mask
-    /// against `flags` to filter parts.
-    pub part_type: i8,
+    /// [`GeometryPartType`] (Ares `e_geometry_part_type`). Used by
+    /// `submit_visibility` to compute cluster_part.flags
+    /// (`is_transparent ? Transparent : (type & 3)`) AND the
+    /// `part_is_renderable` gate (which skips `LightmapOnly`); the render
+    /// passes mask against `flags` to filter parts.
+    pub part_type: blam_tags::render_model::GeometryPartType,
     /// Model-space transparent sort centroid — `RenderMeshPart.sort_position
     /// .position`. BSP geometry is world-space (identity transform), so for
     /// cluster parts this is already the world centroid; instance parts

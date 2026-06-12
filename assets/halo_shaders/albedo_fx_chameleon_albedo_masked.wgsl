@@ -1,20 +1,43 @@
-// `albedo_fx.hlsl::calc_albedo_chameleon_albedo_masked_ps` — STAND-IN.
+// `albedo_fx.hlsl::calc_albedo_chameleon_albedo_masked_ps` — engine-faithful port.
 //
-// Third chameleon variant. Distinct rmop param set vs `chameleon` /
-// `chameleon_masked`:
-//   base_map         — primary base
-//   albedo_color     — tint for base_map sample
-//   base_masked_map  — secondary base (used where mask=1)
-//   albedo_masked_color — tint for base_masked_map sample
-//   chameleon_mask_map  — gates the chameleon paint shift
+// Verbatim from Halo Online `albedo.fx`. Third chameleon variant; rmop
+// params:
+//   base_map / albedo_color           — primary base (tinted, rgba)
+//   base_masked_map / albedo_masked_color — secondary base (tinted, rgba)
+//   chameleon_mask_map                — selects base vs base_masked
 //   chameleon_color0..3, offsets, fresnel_power — view-angle shift
 //
-// Effect: blend two diffuse textures (base + base_masked) by the
-// chameleon mask, then apply the chameleon color shift on top.
-//
-// Same caveats as `albedo_fx_chameleon.wgsl` — no engine HLSL function
-// body is in the extracted MCC corpus; approximation uses bumped
-// normal's world-up alignment in place of N·V fresnel.
+// Engine structure (was previously mis-blended): the chameleon shift is
+// applied to ONLY the masked base, then the two bases are lerp'd by the
+// mask — NOT applied to the combined diffuse:
+//   base        = sample(base_map)        * albedo_color
+//   base_masked = sample(base_masked_map) * albedo_masked_color
+//   base_masked.rgb *= calc_chameleon(N, V)
+//   albedo = lerp(base, base_masked, mask)
+// `view_dir` (world-space) arrives via `misc.xyz`; angle factor is the
+// engine's N·V (not the old `1 - n.z` stand-in).
+
+// `calc_chameleon` (albedo.fx) — verbatim; see albedo_fx_chameleon.wgsl.
+fn calc_chameleon(normal: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
+    let dp = pow(max(dot(normal, view_dir), 0.0), material.chameleon_fresnel_power.x);
+    let off1 = material.chameleon_color_offset1.x;
+    let off2 = material.chameleon_color_offset2.x;
+
+    var col0 = material.chameleon_color0.rgb;
+    var col1 = material.chameleon_color1.rgb;
+    var lrp = dp * (1.0 / off1);
+    if (dp > off1) {
+        col0 = material.chameleon_color1.rgb;
+        col1 = material.chameleon_color2.rgb;
+        lrp = (dp - off1) * (1.0 / (off2 - off1));
+    }
+    if (dp > off2) {
+        col0 = material.chameleon_color2.rgb;
+        col1 = material.chameleon_color3.rgb;
+        lrp = (dp - off2) * (1.0 / (1.0 - off2));
+    }
+    return mix(col0, col1, lrp);
+}
 
 fn calc_albedo_chameleon_albedo_masked_ps(
     texcoord: vec2<f32>,
@@ -22,45 +45,13 @@ fn calc_albedo_chameleon_albedo_masked_ps(
     normal: vec3<f32>,
     misc: vec4<f32>,
 ) {
-    let _u_misc = misc;
-    let base = textureSample(base_map, base_map_sampler, transform_texcoord(texcoord, material.base_map_xform));
-    let base_masked = textureSample(base_masked_map, base_masked_map_sampler, transform_texcoord(texcoord, material.base_masked_map_xform));
-    let mask_sample = textureSample(chameleon_mask_map, chameleon_mask_map_sampler, texcoord).r;
+    let base = textureSample(base_map, base_map_sampler, transform_texcoord(texcoord, material.base_map_xform)) * material.albedo_color;
+    let base_masked = textureSample(base_masked_map, base_masked_map_sampler, transform_texcoord(texcoord, material.base_masked_map_xform)) * material.albedo_masked_color;
+    let mask = textureSample(chameleon_mask_map, chameleon_mask_map_sampler, texcoord).r;
 
-    // Blend base_map vs base_masked_map by the mask, each tinted.
-    let base_tinted = base.rgb * material.albedo_color.rgb;
-    let masked_tinted = base_masked.rgb * material.albedo_masked_color.rgb;
-    let diffuse_rgb = mix(base_tinted, masked_tinted, mask_sample);
-
-    // Stand-in fresnel — see `albedo_fx_chameleon.wgsl`.
-    let n = normalize(normal);
-    let cos_factor = saturate(1.0 - abs(n.z));
-    let power = max(material.chameleon_fresnel_power.x, 1.0e-3);
-    let factor = pow(cos_factor, power);
-
-    let off1 = clamp(material.chameleon_color_offset1.x, 0.0, 1.0);
-    let off2 = clamp(material.chameleon_color_offset2.x, off1, 1.0);
-
-    var chameleon_color: vec3<f32>;
-    if (factor < off1) {
-        let t = factor / max(off1, 1.0e-3);
-        chameleon_color = mix(material.chameleon_color0.rgb, material.chameleon_color1.rgb, t);
-    } else if (factor < off2) {
-        let t = (factor - off1) / max(off2 - off1, 1.0e-3);
-        chameleon_color = mix(material.chameleon_color1.rgb, material.chameleon_color2.rgb, t);
-    } else {
-        let t = (factor - off2) / max(1.0 - off2, 1.0e-3);
-        chameleon_color = mix(material.chameleon_color2.rgb, material.chameleon_color3.rgb, t);
-    }
-
-    // Chameleon shift gated by mask: outside mask = unaltered diffuse.
-    let final_tint = mix(vec3<f32>(1.0), chameleon_color, mask_sample);
-
-    (*albedo).r = diffuse_rgb.r * final_tint.r;
-    (*albedo).g = diffuse_rgb.g * final_tint.g;
-    (*albedo).b = diffuse_rgb.b * final_tint.b;
-    // Alpha: linear blend follows the diffuse choice.
-    (*albedo).a = mix(base.a * material.albedo_color.a, base_masked.a * material.albedo_masked_color.a, mask_sample);
+    // Chameleon tints ONLY the masked base, then lerp the two bases by mask.
+    let masked_rgb = base_masked.rgb * calc_chameleon(normalize(normal), misc.xyz);
+    (*albedo) = mix(base, vec4<f32>(masked_rgb, base_masked.a), mask);
 }
 
 fn calc_albedo(texcoord: vec2<f32>, albedo: ptr<function, vec4<f32>>, normal: vec3<f32>, misc: vec4<f32>) {
