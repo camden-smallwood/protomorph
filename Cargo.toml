@@ -21,3 +21,6 @@ rand = "0.9"
 rfd = "0.17.2"
 wgpu = "28.0"
 winit = "0.30"
+
+[dev-dependencies]
+naga = { version = "28.0", features = ["wgsl-in"] }
