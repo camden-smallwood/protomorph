@@ -29,9 +29,6 @@ use crate::halo::structures::clusters::PackedClusterReference;
 pub const MAXIMUM_PROJECTIONS_PER_VISIBILITY_REGION: usize = 6;
 pub const MAXIMUM_CLUSTERS_PER_VISIBILITY_REGION: usize = 128;
 pub const MAXIMUM_VOLUMES_PER_VISIBILITY_REGION: usize = 512;
-pub const MAXIMUM_INTERSECTIONS_PER_VISIBILITY_REGION: usize = 1024;
-pub const MAXIMUM_SECTIONS_PER_RENDERABLE_REGION: usize = 1024;
-pub const MAXIMUM_VOLUME_REFERENCES_PER_RENDERABLE_REGION: usize = 4096;
 
 // =============================================================================
 // Visibility primitives — Ares `visibility.h:17-87`
@@ -224,15 +221,6 @@ pub struct SVisibilityRegion {
 
 const _: () = assert!(std::mem::size_of::<SVisibilityRegion>() == 195_648);
 
-impl SVisibilityRegion {
-    /// Zero-initialised region.
-    pub fn new_zeroed() -> Box<Self> {
-        // Stack-allocating 195KB risks a guard-page hit on threads with
-        // small default stacks; box it.
-        Box::new(Self::default())
-    }
-}
-
 impl Default for SVisibilityRegion {
     fn default() -> Self {
         Self {
@@ -250,49 +238,3 @@ impl Default for SVisibilityRegion {
     }
 }
 
-// =============================================================================
-// Accessors — Ares `visibility.cpp:17-48`
-// =============================================================================
-
-/// `visibility_region_get_cluster @ 0x180393650`. Bounds-checked
-/// access into `region.clusters[]`.
-pub fn visibility_region_get_cluster(
-    region: &SVisibilityRegion,
-    region_cluster_index: i32,
-) -> Option<&VisibilityCluster> {
-    if region_cluster_index < 0 || region_cluster_index >= region.cluster_count as i32 {
-        return None;
-    }
-    Some(&region.clusters[region_cluster_index as usize])
-}
-
-/// `visibility_region_get_volume @ 0x180393760`. Bounds-checked
-/// access into `region.volumes[]`.
-pub fn visibility_region_get_volume(
-    region: &SVisibilityRegion,
-    region_volume_index: i32,
-) -> Option<&VisibilityVolume> {
-    if region_volume_index < 0 || region_volume_index >= region.volume_count as i32 {
-        return None;
-    }
-    Some(&region.volumes[region_volume_index as usize])
-}
-
-/// `visibility_region_get_cluster_volume @ 0x1803936C0`. The N-th
-/// volume of `cluster` for the given projection. Equivalent to
-/// `visibility_region_get_volume(region, cluster.first_volume_indices[projection] + cluster_volume_index)`.
-pub fn visibility_region_get_cluster_volume<'a>(
-    region: &'a SVisibilityRegion,
-    cluster: &VisibilityCluster,
-    projection_index: i32,
-    cluster_volume_index: i32,
-) -> Option<&'a VisibilityVolume> {
-    if projection_index < 0 || projection_index >= region.projection_count as i32 {
-        return None;
-    }
-    let first = cluster.first_volume_indices[projection_index as usize] as i32;
-    if first < 0 {
-        return None;
-    }
-    visibility_region_get_volume(region, first + cluster_volume_index)
-}

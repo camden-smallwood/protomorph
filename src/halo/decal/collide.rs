@@ -75,6 +75,8 @@ use blam_tags::structure_bsp::{Bsp3d, BspInstance, BspInstanceDefinition};
 use crate::halo::structures::collision_bsp::{collision_bsp_test_vector, flag, CollisionBspResult};
 use blam_tags::math::RealMatrix4x3;
 
+use crate::halo::math::matrix_math::matrix4x3_transform_point_arr;
+
 use super::instance_raycast::{instance_matrix, try_single_instance_hit, InstanceHit};
 use super::orchestrator::DecalCollisionResult;
 
@@ -746,20 +748,9 @@ fn point_in_cylinder(
         height_axis[2] * cylinder_height,
     ];
     let base_local = [0.0, 0.0, cylinder_height * -0.5];
-    let base_world = matrix4x3_transform_point(cyl, base_local);
+    let base_world = matrix4x3_transform_point_arr(cyl, base_local);
     let dist_sq = point_to_line_distance_squared3d(point, base_world, height_vec);
     dist_sq <= cylinder_radius * cylinder_radius
-}
-
-/// Engine `matrix4x3_transform_point` — apply the matrix's basis +
-/// scale + translation to a local-space point.
-fn matrix4x3_transform_point(m: &RealMatrix4x3, p: [f32; 3]) -> [f32; 3] {
-    let s = m.scale;
-    [
-        m.position.x + s * (p[0] * m.forward.i + p[1] * m.left.i + p[2] * m.up.i),
-        m.position.y + s * (p[0] * m.forward.j + p[1] * m.left.j + p[2] * m.up.j),
-        m.position.z + s * (p[0] * m.forward.k + p[1] * m.left.k + p[2] * m.up.k),
-    ]
 }
 
 /// Engine `point_to_line_distance_squared3d` — squared perpendicular

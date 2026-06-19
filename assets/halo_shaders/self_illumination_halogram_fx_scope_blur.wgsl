@@ -11,7 +11,8 @@
 //   texStep = float2(0.001736 / 2.0, 0.003125 / 2.0)
 //          ≈ float2(0.000868, 0.001563)
 
-const SCOPE_BLUR_TEX_STEP: vec2<f32> = vec2<f32>(0.000868, 0.001563);
+// HLSL: float2(0.001736/2.0, 0.003125/2.0) = (0.000868, 0.0015625).
+const SCOPE_BLUR_TEX_STEP: vec2<f32> = vec2<f32>(0.000868, 0.0015625);
 
 fn calc_self_illumination_scope_blur_ps(
     texcoord_in: vec2<f32>,

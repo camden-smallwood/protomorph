@@ -4,9 +4,9 @@
 //! The bulk of the cbuffer comes from `mat.cbuffer.bytes` — the
 //! cache-build replay (`resolve_pixel_user_cbuffer`) packed
 //! `rmt2.float_constants[]` slot values from rmsh+rmop. A small set of
-//! engine externs (per-unit color schemes, etc.) live in
-//! [`crate::halo::loader::EXTERN_SLOTS`] and aren't routed by the rmt2 — those
-//! are overlaid here from typed `MaterialData` fields.
+//! engine externs (per-unit color schemes, etc.) live in dedicated
+//! extern slots and aren't routed by the rmt2 — those are overlaid
+//! here from typed `MaterialData` fields.
 
 use crate::halo::render_methods::cbuffer::CbufferLayout;
 use crate::halo::render_methods::materials::MaterialData;

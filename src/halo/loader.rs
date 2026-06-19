@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use blam_tags::math::{RealPoint3d, RealQuaternion, RealVector3d};
+use blam_tags::math::{RealPoint3d, RealVector3d};
 use blam_tags::paths::{derive_tags_root, resolve_tag_path, tag_ref_path};
 use blam_tags::render_method::{
     compile_real_constant_at_time, resolve_pixel_user_cbuffer, BitmapBinding, CbufferSlot,
@@ -9,10 +9,11 @@ use blam_tags::render_method::{
 };
 use blam_tags::{RenderMesh, RenderModel, RenderModelError, RenderVertex, TagFile};
 use blam_tags::TagReadError;
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat4, Vec3};
 use half::f16;
 
 use crate::halo::bitmaps;
+use crate::halo::math::matrix_math::quat_from_real;
 use crate::halo::render_methods::materials::{MaterialData, MaterialTexture, MaterialTextureUsage};
 use crate::halo::geometry::{
     oct_encode_snorm8, pack_tangent_with_sign, pack_weights_unorm8,
@@ -98,7 +99,24 @@ pub fn load_object(crate_path: &Path) -> Result<ModelData, HaloLoadError> {
     let active_variant =
         model_def.as_ref().and_then(|m| m.variant(&obj_def.default_model_variant));
 
-    let materials = load_materials(&rm, &tags_root);
+    let mut materials = load_materials(&rm, &tags_root);
+    // Resolve this object's change colors and overlay them onto the
+    // `primary/secondary_change_color` shader externs. The engine binds
+    // each object's runtime change colors to these slots per draw
+    // (`render_object_update_change_colors @0x180697cb0` →
+    // `object_get_change_color`); without it, change-color albedo
+    // shaders read the rmop default (zero) and tint their masked regions
+    // to black (e.g. the snow scorpion's `two_change_color` turret).
+    let variant_name = active_variant.map(|v| v.name.as_str()).unwrap_or("");
+    let change_colors = resolve_object_change_colors(&obj_def, variant_name);
+    for mat in &mut materials {
+        if let Some(c) = change_colors.first() {
+            mat.primary_change_color = *c;
+        }
+        if let Some(c) = change_colors.get(1) {
+            mat.secondary_change_color = *c;
+        }
+    }
     let mut model = convert(&rm, &render_meshes, materials, active_variant);
     model.authored_bounding_sphere = if obj_def.has_authored_bounding_sphere() {
         let o = obj_def.bounding_offset;
@@ -155,6 +173,58 @@ pub fn load_object(crate_path: &Path) -> Result<ModelData, HaloLoadError> {
     }
 
     Ok(model)
+}
+
+/// Resolve an object's initial change colors from its
+/// `object_definition.change colors[]` block, keyed by the active model
+/// variant — the engine `object_set_initial_change_colors @0x1807dc0f0`.
+///
+/// Per change-color index the engine starts from the global default
+/// `*off_1810D4CA0` (verified = pure white `(1,1,1)`), then — when the
+/// scenario placement supplies no override — selects an
+/// `initial permutations` entry whose `variant name` is empty (matches
+/// any) or equals the object's active variant, weighted-randomly by a
+/// position-derived seed, and interpolates `color lower/upper bound`.
+/// When no permutation matches the active variant, the color stays at
+/// the white default.
+///
+/// This is exactly why the snow scorpion's turret reads white here: its
+/// change-color permutations are tagged `snow`/`desert`, but
+/// `scorpion_snow.model`'s only variant is `default` — so nothing
+/// matches and both colors fall back to white, leaving the
+/// `two_change_color` albedo to show its base map unmodified (the grey
+/// snow camo), instead of tinting the masked camo regions to black.
+///
+/// Approximations vs the engine (documented, immaterial for the fixed
+/// `lower == upper`, single-match-per-variant case that covers Halo 3's
+/// vehicles): we pick the *first* matching permutation rather than the
+/// position-seeded weighted draw, take the `lower bound` for the lerp
+/// (engine `u` is also position-derived), skip the per-frame
+/// change-color *functions* (gameplay controllers — empty on the
+/// scorpion; protomorph evaluates object functions to 0 at rest), and
+/// ignore per-placement overrides (`active change colors` is 0 on every
+/// placement observed; `load_object` has no placement context).
+fn resolve_object_change_colors(
+    obj_def: &blam_tags::object::ObjectDefinition,
+    variant_name: &str,
+) -> Vec<Vec3> {
+    // Engine global default `*off_1810D4CA0` = (1,1,1).
+    const WHITE: Vec3 = Vec3::ONE;
+    obj_def
+        .change_colors
+        .iter()
+        .map(|block| {
+            block
+                .initial_permutations
+                .iter()
+                .find(|ip| ip.variant_name.is_empty() || ip.variant_name == variant_name)
+                .map(|ip| {
+                    let c = ip.color_lower_bound;
+                    Vec3::new(c.red, c.green, c.blue)
+                })
+                .unwrap_or(WHITE)
+        })
+        .collect()
 }
 
 /// Read the `effe` attachments off an object tag. Returns
@@ -776,11 +846,6 @@ pub const WGSL_REQUIRED_SLOTS: &[(&str, [f32; 4], bool)] = &[
     ("secondary_change_color", [0.0, 0.0, 0.0, 0.0], false),
 ];
 
-/// Engine externs that `serialize_material` overlays from typed
-/// MaterialData fields. Subset of WGSL_REQUIRED_SLOTS that takes
-/// per-material values (everyone else uses defaults).
-pub const EXTERN_SLOTS: &[&str] = &["primary_change_color", "secondary_change_color"];
-
 /// Ensure every `WGSL_REQUIRED_SLOTS` name has a cbuffer slot — append
 /// missing ones with their default values + xform flag. Defensive
 /// padding so the WGSL fragments compile regardless of which rmt2
@@ -1055,6 +1120,36 @@ fn build_material_from_resolved(
     // texture — the shader reads spec mask from `albedo.a` (sampled from
     // base_map). When walker surfaces a different `specular_mask` rmdf
     // option (e.g. `specular_mask_from_texture`), we'll branch here.
+
+    // Diagnostic: `PROTOMORPH_DUMP_MAT=<substr>` dumps the resolved
+    // shader inputs (bitmap paths, loaded texture dims, cbuffer slots)
+    // for any material whose name contains <substr>. Used to diff the
+    // same shader across two scenarios.
+    if let Ok(want) = std::env::var("PROTOMORPH_DUMP_MAT") {
+        if mat.name.to_ascii_lowercase().contains(&want.to_ascii_lowercase()) {
+            eprintln!("[dump_mat] === {} (animated={}) ===", mat.name, mat.is_animated);
+            for p in &resolved.parameters {
+                if let ParameterSource::Inline(ResolvedValue::Bitmap(b)) = &p.source {
+                    eprintln!("[dump_mat]   bitmap  {:28} -> {}", p.name, b.bitmap_path);
+                }
+            }
+            for t in &mat.textures {
+                eprintln!(
+                    "[dump_mat]   loaded  {:28} {}x{} mip={} layers={} fmt={:?}",
+                    t.name, t.texture.width, t.texture.height,
+                    t.texture.mip_count, t.texture.layers, t.texture.format,
+                );
+            }
+            eprintln!("[dump_mat]   cbuffer total_bytes={}", mat.cbuffer.total_bytes);
+            for s in &mat.cbuffer.slots {
+                eprintln!(
+                    "[dump_mat]   cb @{:>4} (16-aligned={}) {:28} xform={} {:?}",
+                    s.byte_offset, s.byte_offset % 16 == 0,
+                    s.source_name, s.is_xform, s.value,
+                );
+            }
+        }
+    }
     mat
 }
 
@@ -1290,10 +1385,6 @@ fn convert_vertex(v: &RenderVertex) -> ModelVertex {
 fn arbitrary_tangent(normal: Vec3) -> Vec3 {
     let basis = if normal.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
     (basis - normal * basis.dot(normal)).normalize_or_zero()
-}
-
-fn quat_from_real(q: RealQuaternion) -> Quat {
-    Quat::from_xyzw(q.i, q.j, q.k, q.w)
 }
 
 fn real_point_to_vec3(p: RealPoint3d) -> Vec3 {

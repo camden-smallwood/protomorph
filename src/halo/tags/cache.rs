@@ -156,48 +156,6 @@ impl LoadedTag {
             _ => None,
         }
     }
-    pub fn as_vehicle_definition(&self) -> Option<Arc<VehicleDefinition>> {
-        match self {
-            LoadedTag::Vehicle(a) => Some(a.clone()),
-            _ => None,
-        }
-    }
-    pub fn as_giant_definition(&self) -> Option<Arc<GiantDefinition>> {
-        match self {
-            LoadedTag::Giant(a) => Some(a.clone()),
-            _ => None,
-        }
-    }
-    pub fn as_creature_definition(&self) -> Option<Arc<CreatureDefinition>> {
-        match self {
-            LoadedTag::Creature(a) => Some(a.clone()),
-            _ => None,
-        }
-    }
-    pub fn as_scenery_definition(&self) -> Option<Arc<SceneryDefinition>> {
-        match self {
-            LoadedTag::Scenery(a) => Some(a.clone()),
-            _ => None,
-        }
-    }
-    pub fn as_crate_definition(&self) -> Option<Arc<CrateDefinition>> {
-        match self {
-            LoadedTag::Crate(a) => Some(a.clone()),
-            _ => None,
-        }
-    }
-    pub fn as_sound_scenery_definition(&self) -> Option<Arc<SoundSceneryDefinition>> {
-        match self {
-            LoadedTag::SoundScenery(a) => Some(a.clone()),
-            _ => None,
-        }
-    }
-    pub fn as_effect_scenery_definition(&self) -> Option<Arc<EffectSceneryDefinition>> {
-        match self {
-            LoadedTag::EffectScenery(a) => Some(a.clone()),
-            _ => None,
-        }
-    }
     pub fn as_projectile_definition(&self) -> Option<Arc<ProjectileDefinition>> {
         match self {
             LoadedTag::Projectile(a) => Some(a.clone()),
@@ -283,13 +241,6 @@ pub fn tag_init(tags_root: PathBuf) {
     let mut g = cache().write().unwrap();
     g.tags_root = Some(tags_root);
     g.entries.clear();
-}
-
-/// Clear all cached entries (e.g. between scenarios).
-pub fn tag_reset() {
-    let mut g = cache().write().unwrap();
-    g.entries.clear();
-    g.tags_root = None;
 }
 
 /// Engine `tag_get(group, name)` equivalent. Returns the loaded tag

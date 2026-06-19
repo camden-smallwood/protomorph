@@ -5,4 +5,4 @@
 
 pub mod cache;
 
-pub use cache::{tag_get, tag_init, tag_reset, FourCC, LoadedModel, LoadedTag};
+pub use cache::{tag_get, tag_init};

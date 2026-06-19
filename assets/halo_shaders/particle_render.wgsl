@@ -609,18 +609,24 @@ fn fs_particle(in: VsOut) -> FsOut {
         // vanished behind the platform lip. Per-fragment matches the engine's
         // hardware depth test. Reverse-Z: bigger depth = closer.
         let frag_d = in.clip.z;
-        if (mat.extra.y != 0.0) {
-            // soft fade (depth_fade category on): linearize both (near/depth),
-            // fade the intersection over `range` world units.
-            var scene_z = 1.0e30; // sky / far → no fade
-            if (scene_d > 0.0) { scene_z = frame.v.z / scene_d; }
-            let frag_z = frame.v.z / max(frag_d, 1.0e-6);
-            let range = max(frame.v.w, 1.0e-4);
-            alpha = alpha * saturate((scene_z - frag_z) / range);
-        } else if (scene_d > 0.0 && frag_d < scene_d) {
-            // hard occlusion only (category off): fragment behind opaque
-            // geometry (smaller reverse-Z depth) is killed; no thinning in front.
-            alpha = 0.0;
+        // frame.v2.y != 0 (PROTOMORPH_NO_PARTICLE_DEPTH) disables ALL particle
+        // depth interaction (soft fade AND hard occlusion) — a diagnostic to
+        // isolate whether a vanishing layer is occluded by scene_depth
+        // (opaque + water).
+        if (frame.v2.y == 0.0) {
+            if (mat.extra.y != 0.0) {
+                // soft fade (depth_fade category on): linearize both (near/depth),
+                // fade the intersection over `range` world units.
+                var scene_z = 1.0e30; // sky / far → no fade
+                if (scene_d > 0.0) { scene_z = frame.v.z / scene_d; }
+                let frag_z = frame.v.z / max(frag_d, 1.0e-6);
+                let range = max(frame.v.w, 1.0e-4);
+                alpha = alpha * saturate((scene_z - frag_z) / range);
+            } else if (scene_d > 0.0 && frag_d < scene_d) {
+                // hard occlusion only (category off): fragment behind opaque
+                // geometry (smaller reverse-Z depth) is killed; no thinning in front.
+                alpha = 0.0;
+            }
         }
     }
 
@@ -667,7 +673,10 @@ fn fs_distortion(in: VsOut) -> @location(0) vec4<f32> {
     // the same signed format). Subtracting 0.5 here was the bug: it injected a
     // constant -0.5 skew, warping everything one direction.
     let base = textureSample(base_tex, samp, in.uv);
-    let local = base.xy;
+    // Engine compute_normalized_distortion (particle_render_hlsl.hlsl:884)
+    // flips the v-component of the sampled displacement before orienting it
+    // by the billboard basis: `blended.y = -blended.y`.
+    let local = vec2<f32>(base.x, -base.y);
 
     var alpha = in.color.a;
     // Soft depth fade so the shimmer fades into occluding geometry, matching

@@ -57,17 +57,10 @@ impl Default for ECollectionShape {
 /// indices; engine ORs them into the `flags: long` field of
 /// `s_visibility_input`.
 pub mod visibility_collection_flags {
-    pub const USING_REGION_INTERSECTION: u32 = 1 << 0;
-    pub const RENDER_DEBUG: u32 = 1 << 1;
-    pub const IGNORE_PORTAL_VOLUMES: u32 = 1 << 2;
-    pub const IGNORE_LIGHTS: u32 = 1 << 3;
-    pub const IGNORE_STRUCTURE: u32 = 1 << 4;
-    pub const IGNORE_OBJECTS: u32 = 1 << 5;
     /// Bit 6 (= 0x40). Set by `render_visibility_camera_collection_compute`
     /// when `debug_pvs_render_all` is on; switches camera path from
     /// projections walker to PVS-only.
     pub const USE_PVS_VISIBILITY: u32 = 1 << 6;
-    pub const FORCE_FRUSTUM_VISIBILITY: u32 = 1 << 7;
     /// Bit 8 (= 0x100). Set by `render_visibility_camera_collection_compute`
     /// when `single_cluster_only` is true (debug + special view modes).
     pub const SINGLE_CLUSTER_ONLY: u32 = 1 << 8;

@@ -72,32 +72,6 @@ pub fn build_working_portal_stack_setup_seed_working_portal(
 }
 
 // =============================================================================
-// `copy_working_portal @ 0x18050A7F0`
-// =============================================================================
-
-/// Duplicate an existing working portal into a new slot, with a
-/// possibly different cluster_reference. Returns the new index.
-pub fn copy_working_portal(
-    stack: &mut SWorkingPortalStack,
-    src_index: i16,
-    new_cluster_reference: PackedClusterReference,
-    do_not_traverse: bool,
-) -> Option<i16> {
-    let src = stack.get(src_index)?.clone();
-    let idx = stack.push_default()?;
-    let dst = stack.get_mut(idx).unwrap();
-    dst.parent_working_portal_index = src.parent_working_portal_index;
-    dst.portal_reference = src.portal_reference;
-    dst.cluster_reference = new_cluster_reference;
-    dst.created_volume_index = src.created_volume_index;
-    dst.hull = src.hull;
-    dst.nearest_z = src.nearest_z;
-    dst.killed_by_index = src.killed_by_index;
-    dst.do_not_traverse = do_not_traverse;
-    Some(idx)
-}
-
-// =============================================================================
 // `search_working_portal_parents @ 0x180509DB0`
 // `search_working_portal_parents_0 @ 0x180509E50`
 // =============================================================================

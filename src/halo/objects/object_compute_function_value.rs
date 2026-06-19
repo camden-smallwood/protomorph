@@ -59,7 +59,7 @@ pub fn object_compute_function_value(
     let _ = function_owner_definition_index;
 
     // Engine `v15` — the magnitude before the LABEL_93 clamp.
-    let mut magnitude: f32;
+    let magnitude: f32;
     // Engine `v14` — the `recognized` return. Starts true; cleared by the
     // default arm so the chain dispatcher knows to try the next step.
     let mut recognized = true;

@@ -23,21 +23,12 @@
 //! Source: `Ares/source/render_methods/render_method_submit.h`,
 //! `lighting_interface.h`. dllcache `setup_default_lighting`.
 
-use glam::{Vec3, Vec4};
-
 /// Packs the cluster reference Halo uses across structure code:
 /// `bsp_index:8 | cluster_index:8` in a u16.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClusterRef {
     pub bsp_index: u8,
     pub cluster_index: u8,
-}
-
-impl ClusterRef {
-    pub const NONE: Self = Self { bsp_index: 0xFF, cluster_index: 0xFF };
-    pub fn is_none(self) -> bool {
-        self.bsp_index == 0xFF && self.cluster_index == 0xFF
-    }
 }
 
 /// 4-channel color used for change_colors + emblem palette.
@@ -47,10 +38,6 @@ pub struct Color4 {
     pub g: f32,
     pub b: f32,
     pub a: f32,
-}
-
-impl Color4 {
-    pub const ZERO: Self = Self { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
 }
 
 /// Mirrors `c_render_method_data` static globals (per-draw state).
@@ -96,45 +83,4 @@ pub struct CRenderMethodData {
     // (UI-only path; gameplay codes 631..636 are object-side).
 }
 
-impl CRenderMethodData {
-    /// Reset to per-frame defaults. Mirrors what `c_player_view::render`
-    /// does pre-pass — zeroes the user cbuffer bases and invalidates
-    /// the per-draw cache.
-    pub fn pass_pre_init(&mut self) {
-        self.valid = false;
-        self.lightmap_bsp_index = -1;
-        self.lightmap_cluster_reference = ClusterRef::NONE;
-        self.lightmap_instance_index = -1;
-        self.cubemap_blend_factor = 0.0;
-        self.cubemap_dynamic_0_index = -1;
-        self.cubemap_dynamic_0_cluster_reference = ClusterRef::NONE;
-        self.cubemap_dynamic_1_index = -1;
-        self.cubemap_dynamic_1_cluster_reference = ClusterRef::NONE;
-        self.change_colors = [Color4::ZERO; 4];
-    }
-
-    /// Mirrors `render_method_submit_data` for cluster draws — sets
-    /// the lightmap target cluster and clears object-only fields.
-    pub fn submit_cluster(&mut self, bsp_index: u8, cluster_ref: ClusterRef) {
-        self.valid = true;
-        self.lightmap_bsp_index = bsp_index as i16;
-        self.lightmap_cluster_reference = cluster_ref;
-        self.lightmap_instance_index = -1;
-        self.change_colors = [Color4::ZERO; 4];
-    }
-
-    /// Mirrors `render_method_submit_data` for instance draws.
-    pub fn submit_instance(
-        &mut self,
-        bsp_index: u8,
-        instance_index: i16,
-        instance_cluster_ref: ClusterRef,
-    ) {
-        self.valid = true;
-        self.lightmap_bsp_index = bsp_index as i16;
-        self.lightmap_cluster_reference = instance_cluster_ref;
-        self.lightmap_instance_index = instance_index;
-        self.change_colors = [Color4::ZERO; 4];
-    }
-}
 

@@ -61,6 +61,14 @@ struct CompositeParams {
     /// `m_tone_curve_white_point`. Engine default
     /// (WHITE=1.0, m_tone_curve=true): `(1.0, 1.5000, 0.0, -0.5000)`.
     tone_curve_constants: vec4<f32>,
+    /// Engine `intensity` cbuffer (slot 0x1D0000) = `(natural, bloom,
+    /// bling, persist)`. The shader-18 (`copy_target.hlsl:50-53`) weighted
+    /// combine of the separate scene / bloom / bling / persist buffers.
+    /// protomorph: natural=1.0; bloom=1.0 (bloom_intensity is baked into
+    /// the bloom pyramid upstream in `postprocess_bloom_buffer`, so it's
+    /// not re-applied here); bling=`m_bling_intensity` (0 when inactive);
+    /// persist=0 (persist buffer not ported).
+    intensity: vec4<f32>,
 }
 
 @group(0) @binding(0) var t_src: texture_2d<f32>;
@@ -83,6 +91,13 @@ struct CompositeParams {
 /// per-pixel sharp/blurry weight from focus distance.
 @group(0) @binding(11) var t_scene_depth: texture_depth_2d;
 @group(0) @binding(12) var s_scene_depth: sampler;
+/// Bling/star buffer — engine `copy_target.hlsl` sampler 3
+/// (`g_star_buffer` from `bling_generate`). Sampled SEPARATELY from
+/// bloom and weighted by `intensity.z` in the same composite pass, per
+/// the engine's single-pass combine (no pre-fuse). Holds 0 when bling is
+/// inactive, and `intensity.z` is 0 then too, so the term vanishes.
+@group(0) @binding(13) var t_bling: texture_2d<f32>;
+@group(0) @binding(14) var s_bling: sampler;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -131,8 +146,34 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let bloom = textureSample(t_bloom, s_bloom, in.uv).rgb;
 
-    // CALC_BLEND default (PC path): combined + bloom.
-    var blend: vec3<f32> = combined + bloom;
+    // Bling/star term. When bling is inactive `bling_generate` is skipped,
+    // so the star buffer (`aux_star`) is NEVER cleared/written this frame
+    // and holds uninitialized / stale content — which is NaN or Inf on
+    // Metal. `intensity.z` is 0 then, but `0 * NaN = NaN` (IEEE), which
+    // would poison the entire composite → opaque black boxes wherever the
+    // garbage tiles land. Guard on the weight so the term contributes
+    // EXACTLY 0 when off, and sanitize the sample so an active-but-Inf
+    // spike (bright HDR source) can't blow the composite to NaN either.
+    var bling_term = vec3<f32>(0.0);
+    if (u.intensity.z != 0.0) {
+        let bling = textureSample(t_bling, s_bling, in.uv).rgb;
+        // Sanitize the spike sample to a finite range. Metal's min/max
+        // (and thus clamp) are NaN-suppressing — they return the finite
+        // operand — so `clamp` maps NaN→0 and Inf→65504 reliably, without
+        // depending on a `v != v` NaN test (which Metal's default fast-math
+        // assumes-no-NaN may optimize away). 65504 = max half-float.
+        let safe_bling = clamp(bling, vec3<f32>(0.0), vec3<f32>(65504.0));
+        bling_term = u.intensity.z * safe_bling;
+    }
+
+    // Engine `copy_target.hlsl:50-53` (shader 18 = copy_accumulation_target):
+    // single-pass weighted combine of the SEPARATE scene / bloom / bling
+    // buffers (no pre-fuse). `blend = natural*combined + bloom_int*bloom +
+    // bling_int*bling (+ persist*persist)`. bloom_intensity is baked into the
+    // pyramid upstream so intensity.y=1; persist not ported.
+    var blend: vec3<f32> = u.intensity.x * combined
+                         + u.intensity.y * bloom
+                         + bling_term;
 
     // Hue/saturation 4×4 (final_composite_base_hlsl.hlsl:103).
     blend = (u.hue_saturation_matrix * vec4<f32>(blend, 1.0)).rgb;

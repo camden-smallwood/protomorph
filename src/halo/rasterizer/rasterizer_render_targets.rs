@@ -26,27 +26,6 @@ impl SurfaceSpecializationFlags {
     /// `_surface_specialization_flag_tiled_surface` — Xbox-360 EDRAM
     /// tile-managed surface. Ignored on PC / wgpu.
     pub const TILED_SURFACE: u32 = 0x02;
-    /// `_surface_specialization_flag_screen_sized_texture` — texture
-    /// mips sized to screen.
-    pub const SCREEN_SIZED_TEXTURE: u32 = 0x04;
-    /// `_surface_specialization_flag_HDRformat` — TYPELESS root that
-    /// gets aliased into multiple typed views.
-    pub const HDR_FORMAT: u32 = 0x08;
-    /// `_surface_specialization_flag_EDRAM_tile_width_aligned` — Xbox
-    /// EDRAM tile alignment. PC: no-op.
-    pub const EDRAM_TILE_WIDTH_ALIGNED: u32 = 0x10;
-    /// `_surface_specialization_flag_splitscreen_res` — resize per
-    /// splitscreen quadrant.
-    pub const SPLITSCREEN_RES: u32 = 0x20;
-    /// `_surface_specialization_flag_alias_to_buffer_end` — alias
-    /// offset is computed from end-of-buffer instead of start.
-    pub const ALIAS_TO_BUFFER_END: u32 = 0x40;
-    /// `_surface_specialization_flag_read_only_alias` — view-only
-    /// alias; no write path.
-    pub const READ_ONLY_ALIAS: u32 = 0x80;
-    /// `_surface_specialization_flag_stencil_shader_view` — extra SRV
-    /// for stencil sampling.
-    pub const STENCIL_SHADER_VIEW: u32 = 0x100;
 
     #[inline]
     pub const fn has(self, flag: u32) -> bool {

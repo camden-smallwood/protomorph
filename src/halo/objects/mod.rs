@@ -4,36 +4,12 @@
 // 2026-05-09 audit (zero-call-site dead skeletons).
 pub mod crates;
 pub mod object_compute_function_value;
-pub mod object_constants;
 pub mod object_datum;
 pub mod object_function_get_function_value;
 pub mod object_get_function_value;
 pub mod object_header_data;
 pub mod object_type;
 pub mod object_type_compute_function_value;
-
-/// Shared smoke-port helper used by every un-ported
-/// `<type>_compute_function_value` stub. Engine-faithful behavior:
-/// when a `*_compute_function_value` does not recognize `function`,
-/// it returns `false` so the caller (`object_get_function_value`)
-/// can fall through to the model `s_object_function_definition[]`
-/// walk (Phase 5b — `ObjectDefinition::functions[]`) and ultimately
-/// to LABEL_82 if even that fails.
-///
-/// The walker resolves authored chains (`bar` ← `foo` ← `one` on
-/// `marinebeacon.scenery`), so the FALSE RETURN from this stub is
-/// usually NOT a bug — it's the legitimate handoff path. Logging
-/// here would double-log every authored-chain resolution, so we
-/// stay silent. The genuinely-unresolved cases surface at LABEL_82
-/// in `object_get_function_value::warn_failed_once`, which is the
-/// engine's actual diagnostic signal and gives us the real inventory
-/// of state-driven names that need a type-compute body port.
-///
-/// Parameters are retained on the signature so callers don't need to
-/// change when a stub is replaced by an engine-faithful body — the
-/// new body uses them, the stub ignores them.
-#[inline]
-pub fn warn_unported_compute(_type_function: &str, _object_index: u32, _requested: &str) {}
 
 use glam::{Mat4, Vec3};
 
@@ -204,10 +180,6 @@ impl ObjectStore {
         self.objects[index.0]
             .as_mut()
             .expect("object slot is empty")
-    }
-
-    pub fn delete(&mut self, index: ObjectIndex) {
-        self.objects[index.0] = None;
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (ObjectIndex, &ObjectData)> {

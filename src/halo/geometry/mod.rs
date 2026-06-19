@@ -335,19 +335,6 @@ pub struct ModelData {
 }
 
 impl ModelData {
-    /// Object-local world matrix of a named marker (precomputed at load
-    /// into `marker_transforms`). Compose with the object's world matrix
-    /// to get the marker's world transform — the attach point for
-    /// parented children (engine
-    /// `internal_object_get_markers_by_string_id`). `None` if no marker
-    /// matches `name`.
-    pub fn marker_transform(&self, name: &str) -> Option<Mat4> {
-        self.marker_transforms
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, m)| *m)
-    }
-
     /// ALL markers matching `name`, in declaration order. A marker name can
     /// repeat (e.g. the guardian minilift has three `fx_minilift_pad` markers,
     /// one per pad), and the engine emits an effect at each — so a location

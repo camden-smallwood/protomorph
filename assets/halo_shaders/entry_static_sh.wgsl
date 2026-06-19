@@ -170,6 +170,9 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
         calc_bumpmap(texcoord, in.fragment_to_camera_world, tangent, binormal, normal, &bump_normal_unnorm);
         calc_albedo(texcoord, &albedo, bump_normal_unnorm, misc);
         bump_normal = normalize(bump_normal_unnorm + 1e-6 * normal);
+        // Two-sided transparent surfaces (glass): face the normal toward the
+        // camera (engine decorators_hlsl.hlsl:265). See entry_static_per_pixel.
+        bump_normal = bump_normal * sign(dot(bump_normal, in.fragment_to_camera_world));
         calc_specular_mask(texcoord, albedo.w, &specular_mask);
     }
 
@@ -271,8 +274,11 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     var alpha_out: f32 = __ALPHA_CHANNEL_OUTPUT__;
     if (BLEND_MULTIPLICATIVE_ENABLED > 0.5) {
         // HLSL `#ifdef BLEND_MULTIPLICATIVE` — no lighting, no fog, no exposure.
-        // APPLY_OVERLAYS not yet ported (no decal-overlay materials shipped).
-        out_rgb = (albedo_for_illum + self_illum_radiance) * BLEND_MULTIPLICATIVE_FACTOR;
+        // APPLY_OVERLAYS runs BEFORE the multiply factor (entry_points_fx.hlsl:254-256).
+        out_rgb = albedo_for_illum + self_illum_radiance;
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
+        out_rgb = out_rgb * BLEND_MULTIPLICATIVE_FACTOR;
     } else if (BLEND_FRESNEL_ENABLED > 0.5) {
         // HLSL `#elif defined(BLEND_FRESNEL)` (entry_points_fx.hlsl:258) —
         // glass. Diffuse is PREMULTIPLIED by albedo.w (coverage-weighted
@@ -286,10 +292,10 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
             + mat.specular_color.xyz;
         // HLSL APPLY_OVERLAYS(out_color, texcoord, view_dot_normal) —
         // overlay then edge_fade, BEFORE extinction/exposure. view_dot_normal
-        // = dot(view, normal); in tangent space the normal is (0,0,1) so it
-        // is the tangent-space view dir's z.
+        // = dot(view_dir, bump_normal) (entry_points_fx.hlsl:339) — the
+        // BUMP-perturbed normal, not the geometric vertex normal.
         out_rgb = calc_overlay_ps(out_rgb, texcoord);
-        out_rgb = calc_edge_fade_ps(out_rgb, view_dir_in_tangent_space.z);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
         out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
         alpha_out = saturate(mat.specular_color.w + albedo.w);
     } else {
@@ -301,7 +307,7 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
         // HLSL APPLY_OVERLAYS — overlay (multiply_and_additive_detail = the
         // halogram cell layer) then edge_fade, before extinction/exposure.
         out_rgb = calc_overlay_ps(out_rgb, texcoord);
-        out_rgb = calc_edge_fade_ps(out_rgb, view_dir_in_tangent_space.z);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
         out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
     }
     // Underwater fog is applied by the separate `render_underwater_fog`

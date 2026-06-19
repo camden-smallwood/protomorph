@@ -8,10 +8,9 @@
 //! `c_player_view`'s OWN protected/public methods.
 
 use crate::halo::camera::CameraUniforms;
-use crate::game::GameState;
 use crate::halo::geometry::{ModelUniforms, MAXIMUM_NUMBER_OF_MODEL_NODES};
 use crate::halo::rasterizer::{SplitscreenRes, Surface};
-use crate::halo::render::env_probe_pass::GpuSkyParams;
+use crate::halo::render::atmosphere_fog_interface::GpuSkyParams;
 use crate::halo::render::render_cameras::RealRectangle2d;
 use crate::halo::render::render_patchy_fog::PatchyFog;
 use crate::halo::render::shared::{FrameContext, RenderPass};
@@ -77,7 +76,7 @@ pub struct PlayerView {
     pub window_game_state: PlayerWindowGameState,
     pub render_exposure: f32,
     pub illum_render_scale: f32,
-    pub observer_depth_of_field: ObserverDepthOfField,
+    pub observer_depth_of_field: crate::halo::camera::observer::ObserverDepthOfField,
     pub patchy_fog: PatchyFog,
     pub last_frame_motion_blur_state: MotionBlurState,
 
@@ -215,8 +214,22 @@ impl PlayerView {
         // animated slot byte ranges; protomorph re-resolves and
         // rewrites the whole cbuffer. Same final bytes, more work. See
         // `BspGpu::update_animated_cbuffers` doc for the tradeoff.
+        // DIAGNOSTIC: `PROTOMORPH_FREEZE_ANIM=1` pins the animation clock
+        // at t=0 so all material scroll/pulse freezes (values frozen, but
+        // the per-frame cbuffer re-upload STILL runs).
+        // `PROTOMORPH_NO_ANIM_UPLOAD=1` skips the re-upload ENTIRELY so the
+        // props buffer keeps its load-time bake — used to isolate whether
+        // an animated-material flicker comes from the per-frame
+        // `queue.write_buffer` upload act (vs the values it writes).
+        let anim_time = if std::env::var_os("PROTOMORPH_FREEZE_ANIM").is_some() {
+            0.0
+        } else {
+            game.total_time
+        };
+        let skip_anim_upload = std::env::var_os("PROTOMORPH_NO_ANIM_UPLOAD").is_some();
+        if !skip_anim_upload {
         for bsp_gpu in &renderer.structure_renderer.bsps {
-            bsp_gpu.update_animated_cbuffers(&renderer.shared.queue, game.total_time);
+            bsp_gpu.update_animated_cbuffers(&renderer.shared.queue, anim_time);
         }
         // Object-side animated cbuffers — engine path is the same
         // `update_constants @ 0x180685300` walker; the BSP/object split
@@ -242,7 +255,7 @@ impl PlayerView {
             if model.animated_materials.is_empty() { continue; }
             let object_index = obj.header_index.unwrap_or(u32::MAX);
             let ctx = ObjectBoundContext {
-                eval_time: game.total_time,
+                eval_time: anim_time,
                 object_index,
                 owner_tag_index: u32::MAX,
             };
@@ -255,8 +268,9 @@ impl PlayerView {
             }
         }
         if let Some(sky) = renderer.sky_model.as_ref() {
-            sky.update_animated_cbuffers(&renderer.shared.queue, game.total_time);
+            sky.update_animated_cbuffers(&renderer.shared.queue, anim_time);
         }
+        } // end `if !skip_anim_upload`
 
         // Text prepare happens later with frame_ctx
 
@@ -333,18 +347,25 @@ impl PlayerView {
                 true
             };
         renderer.render_list.clear();
-        renderer.render_list.extend(
-            game.objects
-                .iter()
-                .filter(|(idx, _)| game.sky_object.map(|s| s.0) != Some(idx.0))
-                .filter_map(|(idx, obj)| {
-                    let model_idx = obj.model_index?;
-                    if !object_in_frustum(obj, model_idx) {
-                        return None;
-                    }
-                    Some((idx, model_idx))
-                }),
-        );
+        // DIAGNOSTIC (PROTOMORPH_NO_OBJECTS=1): render BSP structure + sky only,
+        // skipping ALL placed objects (vehicles/weapons/scenery/etc). Bisection
+        // tool for the huge-BSP first-frame freeze — leaves the object render
+        // list empty so the object opaque + transparent draw loops are no-ops.
+        let skip_objects = std::env::var_os("PROTOMORPH_NO_OBJECTS").is_some();
+        if !skip_objects {
+            renderer.render_list.extend(
+                game.objects
+                    .iter()
+                    .filter(|(idx, _)| game.sky_object.map(|s| s.0) != Some(idx.0))
+                    .filter_map(|(idx, obj)| {
+                        let model_idx = obj.model_index?;
+                        if !object_in_frustum(obj, model_idx) {
+                            return None;
+                        }
+                        Some((idx, model_idx))
+                    }),
+            );
+        }
         let mut render_list = std::mem::take(&mut renderer.render_list);
 
         // Upload camera uniforms
@@ -403,21 +424,33 @@ impl PlayerView {
             // scenario-scale value (riverworld is ~few hundred meters).
             const VISIBILITY_Z_FAR: f32 = 1024.0;
 
-            crate::halo::render::render_visibility::render_visibility_camera_collection_compute(
-                &observer,
-                game.camera.near_clip,
-                VISIBILITY_Z_FAR,
-                &projection,
-                camera_loc.cluster_reference,
-                /* user_index */ 0,
-                /* player_window_index */ 0,
-                /* single_cluster_only */ false,
-                /* debug_pvs_render_all */ false,
-                &scenario_arc,
-                &renderer.portal_activation,
-                &mut renderer.camera_visibility,
-                &mut renderer.visible_items,
-            );
+            // PENDING: collection-fill (F6/F7) not wired; walker output
+            // unused — gated off to save CPU. The walker fills
+            // `camera_visibility.m_input.region` (PVS) and `visible_items`
+            // (CVisibleItems), but neither is consumed yet:
+            // `CVisibilityCollection::compute` discards `visible_items`
+            // (`let _ = visible_items`), and the `camera_visibility_region`
+            // it would feed into `FrameContext` is written but never read
+            // (decorator/BSP culling still uses ad-hoc frustum tests). It
+            // burns CPU each frame feeding nothing, so it's off by default;
+            // set `PROTOMORPH_VISIBILITY_WALK=1` to exercise it.
+            if std::env::var("PROTOMORPH_VISIBILITY_WALK").is_ok() {
+                crate::halo::render::render_visibility::render_visibility_camera_collection_compute(
+                    &observer,
+                    game.camera.near_clip,
+                    VISIBILITY_Z_FAR,
+                    &projection,
+                    camera_loc.cluster_reference,
+                    /* user_index */ 0,
+                    /* player_window_index */ 0,
+                    /* single_cluster_only */ false,
+                    /* debug_pvs_render_all */ false,
+                    &scenario_arc,
+                    &renderer.portal_activation,
+                    &mut renderer.camera_visibility,
+                    &mut renderer.visible_items,
+                );
+            }
 
             let _ = camera_loc;
         }
@@ -529,6 +562,8 @@ impl PlayerView {
         let atmosphere_payload = {
             let palette = &renderer.scenario_active_bsp_atmosphere_palette;
             let clusters = &renderer.scenario_active_bsp_clusters;
+            let cluster_portals = &renderer.scenario_active_bsp_cluster_portals;
+            let cluster_planes = &renderer.scenario_active_bsp_planes;
             let interface = &mut renderer.atmosphere_fog_interface;
             let sky_sun = renderer.scenario_sky_sun;
             let view_exposure = renderer.scenario_view_exposure;
@@ -538,7 +573,7 @@ impl PlayerView {
                     // Resolve eye cluster (engine `observer_build_result_from_point_and_vectors`
                     // → `c_observer::m_cluster_reference`; we use the cached
                     // active-BSP cluster bounds containment test).
-                    let cluster_idx = crate::halo::render::env_probe_pass::find_cluster_for_eye(
+                    let cluster_idx = crate::halo::render::atmosphere_fog_interface::find_cluster_for_eye(
                         clusters, eye_pos,
                     );
                     let cluster_atm_idx = cluster_idx
@@ -554,8 +589,12 @@ impl PlayerView {
                     interface.compute_cluster_weights(
                         sky_atm,
                         palette,
+                        clusters,
+                        cluster_portals,
+                        cluster_planes,
                         starting_cluster,
                         cluster_atm_idx,
+                        eye_pos,
                     );
                     // Phase 4 — accumulator (reset + populate). Engine reuses
                     // the same buffer frame-to-frame; we zero each frame
@@ -576,7 +615,7 @@ impl PlayerView {
                             sky_atm.atmosphere_settings.len(),
                         )
                         .and_then(|i| sky_atm.atmosphere_settings.get(i));
-                    crate::halo::render::env_probe_pass::GpuAtmosphereData::from_weighted_parameters(
+                    crate::halo::render::atmosphere_fog_interface::GpuAtmosphereData::from_weighted_parameters(
                         &interface.default_parameters,
                         picked_setting,
                         view_exposure,
@@ -589,7 +628,7 @@ impl PlayerView {
                     // happen in normal flow).
                     renderer.scenario_atmosphere
                 }
-                _ => crate::halo::render::env_probe_pass::GpuAtmosphereData::neutral(),
+                _ => crate::halo::render::atmosphere_fog_interface::GpuAtmosphereData::neutral(),
             }
         };
         // Build the per-render-method atmosphere TABLE and upload it in one
@@ -605,7 +644,7 @@ impl PlayerView {
         // atmosphere override in `render_method_submit_volatile_per_shader`.
         {
             use crate::halo::render::atmosphere_fog_interface::WeightedAtmosphereParameters;
-            use crate::halo::render::env_probe_pass::GpuAtmosphereData;
+            use crate::halo::render::atmosphere_fog_interface::GpuAtmosphereData;
             use crate::halo::render::shared::{
                 ATMOSPHERE_DISABLED_OFFSET, ATMOSPHERE_SETTING_BASE_OFFSET, ATMOSPHERE_STRIDE,
                 ATMOSPHERE_TABLE_ENTRIES, MAX_ATMOSPHERE_SETTINGS,
@@ -900,6 +939,34 @@ impl PlayerView {
                     label: Some("encoder"),
                 });
 
+        // DIAGNOSTIC (PROTOMORPH_GPU_BISECT=1): on the FIRST frame, submit the
+        // command buffer + block on the GPU after each major pass, flushing a
+        // log line. The GPU hang surfaces inside the offending pass, so the
+        // LAST "[gpu_bisect] survived: X" printed names the pass that ran
+        // clean; the hang is in the NEXT pass. Pinpoints which GPU operation
+        // wedges the device on s3d_sky_bridgenew.
+        let gpu_bisect =
+            std::env::var_os("PROTOMORPH_GPU_BISECT").is_some() && renderer.frame_counter == 0;
+        macro_rules! bisect {
+            ($name:expr) => {
+                if gpu_bisect {
+                    renderer
+                        .shared
+                        .queue
+                        .submit(std::iter::once(encoder.finish()));
+                    eprintln!("[gpu_bisect] submitted, waiting on GPU after: {}", $name);
+                    let _ = renderer.shared.device.poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    });
+                    eprintln!("[gpu_bisect] survived: {}", $name);
+                    encoder = renderer.shared.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor { label: Some("bisect_encoder") },
+                    );
+                }
+            };
+        }
+
         // EnvProbePass record disabled — see prepare-phase comment above.
         // Per-frame wind globals upload (must run BEFORE the albedo
         // rpass opens — queue.write_buffer cannot run inside a pass).
@@ -992,6 +1059,13 @@ impl PlayerView {
         // strips `render_sky_modify_node_matrices` to `return 1;`. Sky
         // meshes render at their authored world coords; nothing to upload.
 
+        // Bisect BEFORE albedo: submitting the (empty) encoder flushes ALL
+        // pending queue.write_buffer/write_texture uploads — the load-time BSP
+        // buffers, lightmap atlas, cubemap probes, per-instance SH buffers, and
+        // this frame's decal/wind/particle uploads. If the GPU wedges HERE, the
+        // hang is a malformed UPLOAD, not a render pass.
+        bisect!("queued uploads (load buffers/textures + per-frame writes)");
+
         encoder.push_debug_group("render_albedo");
         self.render_albedo(
             &mut encoder,
@@ -999,6 +1073,7 @@ impl PlayerView {
             &mut renderer.transparency_renderer,
         );
         encoder.pop_debug_group();
+        bisect!("render_albedo");
 
         // `c_player_view::render_static_lighting @ 0x18068aea0` —
         // re-walks the geometry sorted by render_albedo, computes the
@@ -1011,6 +1086,24 @@ impl PlayerView {
             &mut renderer.transparency_renderer,
         );
         encoder.pop_debug_group();
+        bisect!("render_static_lighting");
+
+        // Snapshot scene depth into the sample copy NOW — opaque depth is
+        // final (render_albedo wrote it, render_static_lighting only
+        // read-attached it and its pass has closed) and nothing between
+        // here and the transparent/water passes writes scene depth (the
+        // shadow + dynamic-light passes are additive color / shadow-map
+        // only). Doing it here — BEFORE the object-shadow apply pass —
+        // is essential: that pass reconstructs receiver world-position
+        // from `depth_sample_view`, so it must read THIS frame's depth.
+        // (Previously the copy ran just before render_water, leaving the
+        // shadow apply to sample last frame's depth → object shadows
+        // swam/lagged a frame as the camera moved.) Sampling the copy
+        // rather than the live attachment also avoids the attachment/
+        // shader-read alias that flickers depth-tested transparents on
+        // TBDR GPUs (Apple Silicon) — see `GBuffer::depth_sample_view`.
+        // No pass may have the depth attached when this runs.
+        renderer.gbuffer.copy_depth_for_sampling(&mut encoder);
 
         // S1 — engine-faithful per-object shadow generate + apply.
         //
@@ -1429,6 +1522,13 @@ impl PlayerView {
                         caster_index,
                         sub_res,
                     );
+                    // Tracks whether the alpha-test pipeline is currently
+                    // bound so we only `set_pipeline` on transitions (most
+                    // parts are opaque and contiguous). The opaque pipeline is
+                    // bound by `begin_generate_pass`; group 0 (per-caster
+                    // uniform) persists across the switch since both pipelines
+                    // share the same group-0 layout.
+                    let mut alpha_test_bound = false;
                     for mesh in &model.meshes {
                         rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         rpass.set_index_buffer(
@@ -1451,16 +1551,36 @@ impl PlayerView {
                             use crate::halo::render::structure_renderer::{
                                 mesh_part_flags, part_type_to_flags,
                             };
-                            let transparent = model
-                                .materials
-                                .get(part.material_index)
-                                .map(|m| m.is_transparent)
-                                .unwrap_or(false);
+                            let material = model.materials.get(part.material_index);
+                            let transparent =
+                                material.map(|m| m.is_transparent).unwrap_or(false);
                             let casts = part_type_to_flags(part.part_type)
                                 & mesh_part_flags::SHADOW_CASTING
                                 != 0;
                             if transparent || !casts {
                                 continue;
+                            }
+                            // Alpha-tested opaque parts (grates, chain-link,
+                            // foliage props) discard masked texels in the
+                            // shadow PS so they cast holey shadows. Switch to
+                            // the alpha-test pipeline + bind the material's
+                            // @group(1) alpha-test resources; switch back to
+                            // the opaque pipeline for the next plain part.
+                            match material.and_then(|m| m.shadow_alpha_test_bg.as_ref()) {
+                                Some(at_bg) => {
+                                    rpass.set_pipeline(
+                                        renderer.shadow_apply.generate_alpha_test_pipeline(),
+                                    );
+                                    rpass.set_bind_group(1, at_bg, &[]);
+                                    alpha_test_bound = true;
+                                }
+                                None if alpha_test_bound => {
+                                    rpass.set_pipeline(
+                                        renderer.shadow_apply.generate_pipeline(),
+                                    );
+                                    alpha_test_bound = false;
+                                }
+                                None => {}
                             }
                             rpass.draw_indexed(
                                 part.index_start..part.index_start + part.index_count,
@@ -1486,6 +1606,7 @@ impl PlayerView {
                     &renderer.gbuffer.normal_view,
                     frame_ctx.game.camera.view,
                     frame_ctx.game.camera.projection,
+                    frame_ctx.game.camera.position.into(),
                     world_to_shadow,
                     caster_light_dir,
                     /* opacity = */ 0.85,
@@ -1517,18 +1638,23 @@ impl PlayerView {
         // `lighting_base` by ambient occlusion before water/transparents
         // sample the LDR snapshot. Reads depth + normal MRT (written by
         // render_albedo). No-op if the active cfxs has SSAO disabled.
-        renderer.screen_postprocess.render_ssao(
-            &renderer.shared,
-            &mut encoder,
-            renderer.scenario_camera_fx.as_ref().and_then(|c| c.ssao.as_ref()),
-            frame_ctx.game.camera.view,
-            frame_ctx.game.camera.field_of_view,
-            frame_ctx.game.camera.aspect_ratio,
-            frame_ctx.game.camera.near_clip,
-            &renderer.gbuffer.depth_sample_view,
-            &renderer.gbuffer.normal_view,
-            &renderer.intermediates.lighting_base_view,
-        );
+        // DIAGNOSTIC (PROTOMORPH_NO_SSAO=1): skip the SSAO pass — bisection
+        // for the s3d_sky_bridgenew first-frame GPU hang.
+        if std::env::var_os("PROTOMORPH_NO_SSAO").is_none() {
+            renderer.screen_postprocess.render_ssao(
+                &renderer.shared,
+                &mut encoder,
+                renderer.scenario_camera_fx.as_ref().and_then(|c| c.ssao.as_ref()),
+                frame_ctx.game.camera.view,
+                frame_ctx.game.camera.field_of_view,
+                frame_ctx.game.camera.aspect_ratio,
+                frame_ctx.game.camera.near_clip,
+                &renderer.gbuffer.depth_sample_view,
+                &renderer.gbuffer.normal_view,
+                &renderer.intermediates.lighting_base_view,
+            );
+        }
+        bisect!("render_ssao");
 
         // `c_player_view::render_lights` — dynamic-lights pass.
         // Sits between render_static_lighting and render_water in
@@ -1582,6 +1708,10 @@ impl PlayerView {
         );
         encoder.pop_debug_group();
 
+        // (Scene-depth snapshot for sampling now happens right after
+        // render_static_lighting — see `copy_depth_for_sampling` there —
+        // so the object-shadow apply pass reads current-frame depth.)
+
         // `c_player_view::render_water @ 0x18068c120` — water-shading
         // pass. Per dllcache flow, this sits between
         // `render_first_person(0)` and `render_transparents`, gated on
@@ -1599,6 +1729,7 @@ impl PlayerView {
         renderer.water_renderer.render_underwater_fog(&mut encoder, &frame_ctx);
         renderer.water_renderer.render_shading(&mut encoder, &frame_ctx);
         encoder.pop_debug_group();
+        bisect!("scene_ldr_snapshot + render_water");
 
         // Effects (color particles) now draw INSIDE the shared transparents
         // rpass (F-full) so they sort in global depth order against
@@ -1645,6 +1776,7 @@ impl PlayerView {
         encoder.push_debug_group("render_transparents");
         self.render_transparents(&mut encoder, &frame_ctx, &mut renderer.transparency_renderer);
         encoder.pop_debug_group();
+        bisect!("render_particles + render_transparents");
 
         // Light volumes (Track R1): the roll-locked light-shaft strips
         // (vehicle headlights, searchlights, grav lifts). Rebuilt each frame
@@ -1709,6 +1841,7 @@ impl PlayerView {
             &scripted_globals,
             g_exposure_stops,
         );
+        bisect!("postprocess_player_view (bloom/exposure)");
         // Engine `update_sampled_exposure(camera->m_exposure, v8)` —
         // push the freshly-scheduled ring slot into the FIFO so the
         // next `setup_camera_fx_parameters` reads it (after the 3-frame
@@ -1760,9 +1893,16 @@ impl PlayerView {
             dof_focus,
             renderer.screen_postprocess.settings_internal.tone_curve,
             renderer.screen_postprocess.settings_internal.tone_curve_white_point,
+            renderer.screen_postprocess.bling_scale(),
         );
 
-        if renderer.final_composite_pass.is_enabled(&frame_ctx) {
+        // DIAGNOSTIC (PROTOMORPH_NO_COMPOSITE=1): skip the final composite +
+        // lightshafts + swapchain blit (presents an unwritten frame). Bisection
+        // for the s3d_sky_bridgenew first-frame GPU hang — isolates whether the
+        // hang is in the composite/blit (fullscreen, content-independent) vs.
+        // the scene/lighting passes recorded earlier in the same command buffer.
+        let skip_composite = std::env::var_os("PROTOMORPH_NO_COMPOSITE").is_some();
+        if !skip_composite && renderer.final_composite_pass.is_enabled(&frame_ctx) {
             // Stage 1 — engine `copy_accumulation_target` body. Composite
             // lighting_base + bloom + cg + DoF into `accum_hdr_view`.
             encoder.push_debug_group("copy_accumulation_target");
@@ -1818,6 +1958,10 @@ impl PlayerView {
                 .record_blit_to_swapchain(&mut encoder, &frame_ctx);
             encoder.pop_debug_group();
         }
+        bisect!("final_composite + blit_to_swapchain");
+        if gpu_bisect {
+            eprintln!("[gpu_bisect] all passes survived — hang (if any) is in present()/swapchain");
+        }
 
         // Auto-exposure GPU dispatch is now inlined inside
         // `postprocess_player_view` via the engine-faithful
@@ -1829,6 +1973,19 @@ impl PlayerView {
 
         renderer.shared.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        // DIAGNOSTIC: `PROTOMORPH_SYNC_FRAMES=1` drains the GPU queue every
+        // frame (no frame pipelining). Tests whether an animated-material
+        // flicker is a write/read race on the persistent per-frame-updated
+        // props buffer (the engine avoids this with a per-draw dynamic
+        // constant-buffer ring; protomorph overwrites one persistent
+        // buffer via queue.write_buffer). If the flicker stops with this
+        // set, the fix is to double-buffer / ring the props pool.
+        if std::env::var_os("PROTOMORPH_SYNC_FRAMES").is_some() {
+            let _ = renderer.shared.device.poll(
+                wgpu::PollType::Wait { submission_index: None, timeout: None },
+            );
+        }
 
         // Post-submit phase — start async map for the exposure slot
         // we just submitted. The callback fires on a driver thread
@@ -1849,31 +2006,6 @@ impl PlayerView {
         renderer.render_list = render_list;
 
     }
-
-    /// `c_player_view::setup_camera(player_window_index, player_window_count,
-    /// player_window_arrangement, user_index, observer, freeze_render_camera)`.
-    pub fn setup_camera(
-        &mut self,
-        _player_window_index: i32,
-        _player_window_count: i32,
-        _player_window_arrangement: i32,
-        _user_index: i32,
-        _freeze_render_camera: bool,
-    ) {
-        todo!("c_player_view::setup_camera — phase 4");
-    }
-
-    // `c_player_view::setup_camera_fx_parameters @ 0x180689C20` is
-    // implemented on `Renderer` (see `Renderer::setup_camera_fx_parameters`)
-    // because the orchestrator owns the cfxs source resolution + exposure
-    // FIFO + screen_postprocess snapshot refresh. PlayerView holds none
-    // of those.
-
-    /// `c_player_view::create_frame_textures(long)`.
-    pub fn create_frame_textures(&mut self, _player_window_index: i32) { todo!() }
-
-    /// `c_player_view::restore_to_display_surface()`.
-    pub fn restore_to_display_surface(&mut self) { todo!() }
 
     /// `c_player_view::render_albedo()` — first-pass G-buffer fill.
     /// Body: dllcache `0x18068abc0`. Engine equivalent of
@@ -2275,14 +2407,6 @@ impl PlayerView {
         true
     }
 
-
-    /// `c_player_view::render_dynamic_lights(ldr, hdr, depth)`.
-    pub fn render_dynamic_lights(&mut self, _ldr: Surface, _hdr: Surface, _depth: Surface) {
-        todo!("phase 10")
-    }
-
-    pub fn render_lightmap_shadows(&mut self) { todo!() }
-
     /// `c_player_view::render_transparents()`.
     /// Body: dllcache `0x18068b3b0`.
     ///
@@ -2394,7 +2518,7 @@ impl PlayerView {
     /// order against glass/water/sky (engine `c_particle_emitter::submit
     /// @0x180568FA0` → `c_transparency_renderer::add_element(position_world,
     /// NULL plane, sort_layer)`). Drawn by `TransparentDispatch::Particle`
-    /// via `ParticleGpu::draw_batch`. The per-batch world centroid is the
+    /// via `ParticleGpu::draw_emitter`. The per-batch world centroid is the
     /// sphere center rebuilt each frame in `EffectStore::frame_advance`.
     ///
     /// Opt-in frustum cull (`PROTOMORPH_PARTICLE_CULL=1`): same loose-tag
@@ -2470,155 +2594,12 @@ impl PlayerView {
             );
         }
     }
-
-    // =================================================================
-    // Engine frame-loop pass stubs — P4 stub registry
-    //
-    // Each stub corresponds to a `c_player_view::*` engine function
-    // called from `c_player_view::render @ 0x180688BA0`. Bodies are
-    // empty no-ops; P10 (missing passes) fills them in. The frame-loop
-    // structural port can reference these by name and they will not
-    // panic.
-    //
-    // Engine call sequence: see `reference_engine_frame_loop_full.md`.
-    // =================================================================
-
-    /// `c_player_view::submit_distortions @ 0x18068b5f0`. Builds the
-    /// distortion accumulator into `_surface_aux_mini2` via the
-    /// `_effect_pass_distortion` effect-pass dispatcher + a
-    /// half-res draw. **Stub — P10 fills in.**
-    pub fn submit_distortions(&mut self) {}
-
-    /// `c_player_view::generate_distortions_callback` — inner draw
-    /// callback used by `submit_distortions`'s occlusion-submit path.
-    pub fn generate_distortions(&mut self) {}
-
-    /// `c_player_view::apply_distortions @ 0x18068b8b0`. Fullscreen
-    /// composite of the distortion accumulator onto the framebuffer,
-    /// with optional motion-blur path when last-frame state is close
-    /// to current. **Stub — P10 fills in.**
-    pub fn apply_distortions(&mut self) {}
-
-    /// `c_player_view`'s LDR/HDR depth restore helper.
-    pub fn restore_ldr_hdr_depth_buffers(&mut self) {}
-
-    /// `c_player_view::queue_patchy_fog`. Sets up the patchy-fog draw
-    /// before transparents render.
-    pub fn queue_patchy_fog(&mut self) {}
-
-    /// `c_player_view::render_first_person(render_only_transparents) @ 0x18068a5d0`.
-    /// Snapshots player camera into m_first_person_view, override_projection +
-    /// enable_squish, then renders FP weapon model. Called twice from
-    /// the frame loop: param=0 (opaque pass) and param=1 (transparent
-    /// pass). **Stub — P10 fills in.**
-    pub fn render_first_person(&mut self, _render_only_transparents: bool) {}
-
-    /// `c_player_view::render_first_person_albedo @ 0x18068a920`.
-    /// FP weapon G-buffer write. Runs inside `render_albedo`. **Stub.**
-    pub fn render_first_person_albedo(&mut self) {}
-
-    /// `c_player_view::render_lens_flares @ 0x18068ab40`. Walks light
-    /// tags for lens flare attachments + draws sprites with prior-
-    /// frame occlusion-query gating. **Stub — P10 fills in.**
-    pub fn render_lens_flares(&mut self) {}
-
-    /// `c_player_view::render_water`. Water surface pass between SL
-    /// targets bind and transparents. Today's protomorph has a
-    /// working impl in `render_water.rs`. **Stub here — the live
-    /// impl is invoked directly until P4 frame loop port lands.**
-    pub fn render_water(&mut self) {}
-
-    /// `c_player_view::animate_water`. Per-frame water-interaction
-    /// height/slope animation step.
-    pub fn animate_water(&mut self) {}
-
-    /// `c_object_renderer::submit_attachments` / `c_lights_view::submit_attachments`.
-    /// Builds the per-frame draw list of object/light attachments.
-    pub fn submit_attachments(&mut self) {}
-
-    /// `c_player_view::render_misc_transparents`. Catch-all for
-    /// outside-the-sorted-list transparent ops.
-    pub fn render_misc_transparents(&mut self) {}
-
-    /// `rasterizer_occlusion_submit` / `lens_flares_submit_occlusions`.
-    /// Engine submits both conditional (early) and main (late) lens
-    /// flare occlusion queries. **Stub.**
-    pub fn submit_occlusion_tests(&mut self, _occlusion: bool, _conditional: bool) {}
-
-    /// `rasterizer_occlusions_retrieve`. Pulls prior-frame occlusion
-    /// query results from the GPU for lens flare gating.
-    pub fn retrieve_occlusion_tests(&mut self) {}
-
-    /// `c_player_view::setup_cinematic_clip_planes`. Cinematic
-    /// camera mode applies HSC-driven clip planes.
-    pub fn setup_cinematic_clip_planes(&mut self) {}
-
-    /// `c_player_view::render_patchy_fog`. Patchy-fog volume render
-    /// — already shipped via `patchy_fog_pass.rs`; stub kept for
-    /// engine-name parity in the P4 frame loop.
-    pub fn render_patchy_fog(&mut self) {}
-
-    /// `c_player_view::render_weather_occlusion @ 0x18068b2f0`.
-    /// Generates a depth-only render into the occlusion buffer for
-    /// weather geometry intersection (used by patchy fog / rain).
-    /// Sets `g_weather_occlusion_available`. **Stub — P10 fills in.**
-    pub fn render_weather_occlusion(&mut self) {}
-
-    /// `chud_draw_turbulence @ 0x18071ef90`. Writes the CHUD heat-
-    /// haze distortion overlay into the distortion accumulator.
-    /// **Stub — P10 fills in.**
-    pub fn chud_draw_turbulence(&mut self) {}
-
-    /// `chud_generate_damage_flash_texture @ 0x18071f1e0`. Returns
-    /// true if player damage flash is active; result gates the
-    /// `chud_draw_screen_LDR` call. **Stub — P10 fills in (returns
-    /// false).**
-    pub fn chud_generate_damage_flash_texture(&mut self) -> bool { false }
-
-    /// `screen_effect_sample @ 0x1803a4e90`. Walks scenario screen-
-    /// effect settings hierarchy and samples per-frame state
-    /// (exposure_boost, hue/sat/contrast, color matrix, fade).
-    /// **Stub — P10 fills in.**
-    pub fn screen_effect_sample(&mut self) {}
-
-    /// `c_player_view::render_effects(pass) @ 0x180688BA0` callee.
-    /// Dispatches game-effect draws for a specific pass enum
-    /// (`_effect_pass_distortion`, `_effect_pass_opaque`,
-    /// `_effect_pass_transparent`). **Stub — P10 fills in.**
-    pub fn render_effects(&mut self, _pass: EffectPass) {}
-
-    /// `render_setup_window`. Restores viewport + scissor before UI
-    /// composite. **Stub.**
-    pub fn render_setup_window(&mut self) {}
-
-    /// `c_player_view::setup_camera_fx_parameters(exposure_boost)`.
-    /// Applies screen-effect exposure boost to the camera FX state.
-    /// **Stub — P10 fills in.**
-    pub fn setup_camera_fx_parameters(&mut self, _exposure_boost: f32) {}
-}
-
-/// Mirror of `e_effect_pass` — selector for which game-effect entries
-/// get dispatched in a given pass. Engine values:
-/// 0 = distortion, 1 = opaque, 2 = transparent, 3 = post-process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum EffectPass {
-    Distortion = 0,
-    Opaque = 1,
-    Transparent = 2,
-    PostProcess = 3,
 }
 
 /// Stand-in for `s_render_game_state::s_player_window`. Filled when
 /// `render_game_state.rs` lands.
 #[derive(Debug, Clone, Default)]
 pub struct PlayerWindowGameState {
-    pub _placeholder: (),
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ObserverDepthOfField {
-    pub flags: u32,
     pub _placeholder: (),
 }
 

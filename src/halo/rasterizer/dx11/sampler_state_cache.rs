@@ -69,57 +69,7 @@ impl SamplerKey {
         address_w: BitmapAddressMode::Wrap,
     };
 
-    /// "Strongest" merge — picks the dominant filter mode (most-aniso
-    /// wins) and keeps the first observed address mode per axis. Used
-    /// when a material has multiple bitmap bindings; the engine emits
-    /// one sampler per binding, but for the P8.1 minimal step we bind
-    /// one sampler per material (highest aniso wins so terrain layers
-    /// get their authored aniso).
-    pub fn merge_strongest(mut self, other: Self) -> Self {
-        if filter_strength(other.filter) > filter_strength(self.filter) {
-            self.filter = other.filter;
-        }
-        self
-    }
-
-    /// Walk a `MaterialData`'s resolved bitmap parameters and merge
-    /// their sampler configs into a single "strongest" key. Used by
-    /// renderer code paths that bind one sampler per material — every
-    /// material's terrain-grade bindings drive the resolved aniso even
-    /// if non-terrain bindings would have authored a lower mode.
-    pub fn for_material(
-        mat: &crate::halo::render_methods::materials::MaterialData,
-    ) -> Self {
-        use blam_tags::render_method::{ParameterSource, ResolvedValue};
-        let mut key = Self::FILTERING_FALLBACK;
-        for p in &mat.resolved.parameters {
-            if let ParameterSource::Inline(ResolvedValue::Bitmap(b)) = &p.source {
-                let candidate = Self {
-                    filter: b.filter_mode,
-                    address_u: b.address_mode_x,
-                    address_v: b.address_mode_y,
-                    address_w: b.address_mode_x,  // engine broadcasts X to W
-                };
-                key = key.merge_strongest(candidate);
-            }
-        }
-        key
-    }
-
-    /// Per-bitmap sampler key — used when emitting one sampler per
-    /// `TextureBindingSlot`. Each binding gets its authored filter +
-    /// address mode straight from the rmt2's bitmap parameter, no merge.
-    /// `name` is the Halo parameter name; returns `None` if there's no
-    /// `BitmapBinding` for it (e.g. baseline/extern slots — caller
-    /// falls back to `FILTERING_FALLBACK`).
-    pub fn for_binding(
-        mat: &crate::halo::render_methods::materials::MaterialData,
-        name: &str,
-    ) -> Option<Self> {
-        Self::for_binding_in_resolved(&mat.resolved, name)
-    }
-
-    /// Same as [`for_binding`] but takes the resolved render method
+    /// Same as `for_binding` but takes the resolved render method
     /// directly. The WGSL assembler doesn't carry a full `MaterialData`
     /// (only `ResolvedRenderMethod`), so this is the lower-level
     /// variant the per-binding sampler map calls.
@@ -150,23 +100,6 @@ impl SamplerKey {
             }
         }
         None
-    }
-}
-
-/// Returns a rank where higher = "more expensive / better quality" so
-/// `merge_strongest` can pick the dominant filter across a material's
-/// bindings.
-fn filter_strength(mode: BitmapFilterMode) -> u32 {
-    use BitmapFilterMode as F;
-    match mode {
-        F::Point | F::ComparisonPoint => 0,
-        F::Bilinear | F::ComparisonBilinear => 1,
-        F::Trilinear => 2,
-        F::LightprobeTextureArray => 2,
-        F::Anisotropic1 => 3,
-        F::Anisotropic2Expensive => 4,
-        F::Anisotropic3Expensive => 5,
-        F::Anisotropic4Expensive => 6,
     }
 }
 
@@ -249,41 +182,5 @@ fn address_to_wgpu(mode: BitmapAddressMode) -> wgpu::AddressMode {
         // visible only at extreme grazing UVs where the cubemap/border
         // sample would have shown the border color.
         BitmapAddressMode::BlackBorder => wgpu::AddressMode::ClampToEdge,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn merge_strongest_picks_higher_aniso() {
-        let base = SamplerKey {
-            filter: BitmapFilterMode::Bilinear,
-            address_u: BitmapAddressMode::Wrap,
-            address_v: BitmapAddressMode::Wrap,
-            address_w: BitmapAddressMode::Wrap,
-        };
-        let stronger = SamplerKey {
-            filter: BitmapFilterMode::Anisotropic4Expensive,
-            ..base
-        };
-        assert_eq!(
-            base.merge_strongest(stronger).filter,
-            BitmapFilterMode::Anisotropic4Expensive,
-        );
-        // Symmetric — stronger-then-weaker keeps the stronger one too.
-        assert_eq!(
-            stronger.merge_strongest(base).filter,
-            BitmapFilterMode::Anisotropic4Expensive,
-        );
-    }
-
-    #[test]
-    fn filter_strength_orders_aniso_above_trilinear() {
-        assert!(filter_strength(BitmapFilterMode::Anisotropic1) > filter_strength(BitmapFilterMode::Trilinear));
-        assert!(filter_strength(BitmapFilterMode::Anisotropic4Expensive) > filter_strength(BitmapFilterMode::Anisotropic1));
-        assert!(filter_strength(BitmapFilterMode::Trilinear) > filter_strength(BitmapFilterMode::Bilinear));
-        assert!(filter_strength(BitmapFilterMode::Bilinear) > filter_strength(BitmapFilterMode::Point));
     }
 }

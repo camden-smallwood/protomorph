@@ -46,14 +46,6 @@ pub struct ObserverDepthOfField {
     pub blur_amount: f32,
 }
 
-impl ObserverDepthOfField {
-    pub const ACTIVE_BIT: u32 = 1 << 0;
-
-    pub fn is_active(&self) -> bool {
-        self.flags & Self::ACTIVE_BIT != 0
-    }
-}
-
 /// `s_observer_result` (Ares `camera/observer.h:148-163`, 112 bytes).
 ///
 /// The per-frame camera output that `c_player_view::setup_camera @
@@ -83,14 +75,6 @@ pub struct ObserverResult {
     /// at `e_adjust_for_fov_scale` (observer.h:63-67) chooses whether
     /// downstream camera-build operations apply this.
     pub field_of_view_scale: f32,             // 0x6C
-}
-
-/// `e_adjust_for_fov_scale` (Ares `camera/observer.h:63-67`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum AdjustForFovScale {
-    DontAdjust = 0,
-    Adjust = 1,
 }
 
 /// `observer_result_compute_parameters @ 0x18035B960` — verbatim port.

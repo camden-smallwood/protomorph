@@ -9,8 +9,8 @@
 //!   the structure BSP's collision tree (per loaded BSP)
 //! - [`instanced_geometry_test_vector_internal`] for each instanced-geometry
 //!   instance in each loaded BSP
-//! - [`object_test_vector_internal`] for each placed object (scenery,
-//!   weapons, units, etc.) **— STUB in this port; see below.**
+//! - per-object collision (engine `object_test_vector_internal`) for each
+//!   placed object (scenery, weapons, units, etc.) **— NOT ported; see below.**
 //!
 //! Returns the closest hit across all sources in `collision_result`.
 //!
@@ -23,10 +23,10 @@
 //!   `c_geometry_sampler` does).
 //! - Assert/event handlers (`handle_slim_assert`, `c_event`).
 //!
-//! ## Stubbed in this port (NEEDS follow-up Phase 5b for full object support)
+//! ## Not ported (NEEDS follow-up Phase 5b for full object support)
 //!
-//! [`object_test_vector_internal`] currently returns `false` with a clear
-//! `// TODO Phase 5b` comment. Engine body decompile at
+//! Per-object collision (engine `object_test_vector_internal`) is **not
+//! ported** — placed objects are skipped. Engine body decompile at
 //! `refs/engine_geometry_sampler/object_test_vector_internal.txt`. The
 //! decorator-bake chain still works for placements on BSP clusters and
 //! instanced geometry (the majority case) — scenery-attached decorators
@@ -525,28 +525,6 @@ pub fn instanced_geometry_test_vector_internal(
 }
 
 // =============================================================================
-// object_test_vector_internal — STUB (Phase 5b)
-// =============================================================================
-
-/// `object_test_vector_internal` @ dllcache `0x180400440` — **STUB**.
-///
-/// **TODO Phase 5b.** Engine body at
-/// `refs/engine_geometry_sampler/object_test_vector_internal.txt` (114 LoC).
-/// Tests a placed object's collision against the ray. For the decorator-bake
-/// chain, scenery-attached decorators would route here on their primary
-/// raycast; instead they'll fall through to the scenery_probe path the bake
-/// already handles. Returns `false` (no hit) until ported.
-pub fn object_test_vector_internal(
-    _object_index: i32,
-    _flags: CollisionTestFlagsPair,
-    _point: RealPoint3d,
-    _vector: RealVector3d,
-    _collision: &mut CollisionResult,
-) -> bool {
-    false
-}
-
-// =============================================================================
 // collision_test_vector @ 0x1803fa720 (1st overload) + 0x1803fa760 (2nd, 965 LoC)
 // =============================================================================
 
@@ -585,7 +563,7 @@ pub fn collision_test_vector(
 /// `LoadedScenario.active_bsps`). For each:
 ///  - BSP collision test via [`collision_bsp::test_vector`]
 ///  - For each instance in that BSP, [`instanced_geometry_test_vector_internal`]
-///  - For each relevant object, [`object_test_vector_internal`] **(TODO 5b)**
+///  - per-object collision (`object_test_vector_internal`) is **not ported (TODO 5b)**
 /// Returns `true` if any hit found; `collision` carries the closest one.
 #[allow(clippy::too_many_arguments)]
 pub fn collision_test_vector_2(

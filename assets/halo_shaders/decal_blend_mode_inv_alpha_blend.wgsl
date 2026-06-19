@@ -2,11 +2,11 @@
 // (line 384-421). Behavior matches alpha_blend in fade_out:
 //   - NOT additive/multiply/double_multiply → no .xyz scale by fade.
 //   - NOT pre_multiplied_alpha → skip the premultiply block.
-//   - BLEND_MODE_USES_SRC_ALPHA macro (HLSL line 142-147) does NOT
-//     list inv_alpha_blend, but the !IS_FLAT_VERTEX / !specular_leave
-//     branches still fade alpha for most decal authoring — match the
-//     alpha_blend behavior (`color.w *= fade`) since the GPU blend
-//     stage consumes the inverted alpha.
+//   - BLEND_MODE_USES_SRC_ALPHA = true: the macro (HLSL line 141-148)
+//     EXCLUDES only opaque/additive/multiply/double_multiply/maximum/
+//     multiply_add, so inv_alpha_blend → true (D3 fix: this const was
+//     wrongly `false`). With it true the alpha clause always fires →
+//     `color.w *= fade` (the prior behavior), so this is a label-only fix.
 //
 // Pipeline blend state: src=OneMinusSrcAlpha, dst=SrcAlpha (the
 // "inverse alpha" variant per `reference_halo_blend_modes.md`). Engine
@@ -15,13 +15,14 @@
 //
 // `BLEND_MODE_SELF_ILLUM` for inv_alpha_blend = false (HLSL line 67
 // only flags additive / add_src_times_srcalpha).
-// `BLEND_MODE_USES_SRC_ALPHA` reflects the macro = false (engine
-// authoring still routes alpha through `* fade` via the !IS_FLAT
-// branch, but our WGSL fragment exposes the macro value verbatim).
 
 fn fade_out(color: vec4<f32>) -> vec4<f32> {
-    return vec4<f32>(color.xyz, color.w * decal_constants.fade);
+    var a = color.w;
+    if (!IS_FLAT_VERTEX || BLEND_MODE_USES_SRC_ALPHA) {
+        a = a * decal_constants.fade;
+    }
+    return vec4<f32>(color.xyz, a);
 }
 
 const BLEND_MODE_SELF_ILLUM: bool = false;
-const BLEND_MODE_USES_SRC_ALPHA: bool = false;
+const BLEND_MODE_USES_SRC_ALPHA: bool = true;

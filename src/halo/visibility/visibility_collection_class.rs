@@ -296,37 +296,6 @@ impl CVisibilityCollection {
         }
     }
 
-    // =========================================================================
-    // Accessors
-    // =========================================================================
-
-    pub fn get_region(&self) -> &crate::halo::visibility::SVisibilityRegion {
-        &self.m_input.region
-    }
-
-    pub fn get_collection_type(&self) -> ECollectionType {
-        self.m_input.collection_type
-    }
-
-    pub fn get_collection_shape(&self) -> ECollectionShape {
-        self.m_input.collection_shape
-    }
-
-    pub fn get_cluster_reference(&self) -> ClusterReference {
-        ClusterReference::from(self.m_input.cluster_reference)
-    }
-
-    pub fn get_center(&self) -> RealPoint3d {
-        self.m_input.sphere_center
-    }
-
-    pub fn get_radius(&self) -> f32 {
-        self.m_input.sphere_radius
-    }
-
-    pub fn get_flags(&self) -> i32 {
-        self.m_input.flags
-    }
 }
 
 impl Default for CVisibilityCollection {

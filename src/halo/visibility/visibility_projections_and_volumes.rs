@@ -11,13 +11,8 @@
 
 use blam_tags::math::{RealMatrix4x3, RealPlane3d, RealPoint3d, RealVector3d};
 
-use crate::halo::visibility::visibility_test::{
-    visibility_volume_test_box, visibility_volume_test_sphere, VOLUME_INSIDE, VOLUME_OUTSIDE,
-};
 use crate::halo::visibility::{
-    visibility_region_get_cluster, RealRectangle2d, RealRectangle3d,
-    SVisibilityRegion, VisibilityProjection, VisibilityVolume,
-    VisibilityVolumeIntersection,
+    RealRectangle2d, RealRectangle3d, VisibilityProjection, VisibilityVolume,
 };
 
 // =============================================================================
@@ -29,16 +24,9 @@ use crate::halo::visibility::{
 // dependencies for now; promote to a shared math module if reused).
 // =============================================================================
 
-#[inline]
-fn normalize3d(v: &mut RealVector3d) {
-    let len_sq = v.i * v.i + v.j * v.j + v.k * v.k;
-    if len_sq > 0.0 {
-        let inv = 1.0 / len_sq.sqrt();
-        v.i *= inv;
-        v.j *= inv;
-        v.k *= inv;
-    }
-}
+use crate::halo::math::matrix_math::{
+    matrix4x3_transform_plane, matrix4x3_transform_point, normalize3d,
+};
 
 /// Public alias for [`matrix4x3_transform_point`] used by the
 /// transformed-portal cache (Phase E2). Engine equivalent of
@@ -49,36 +37,10 @@ pub fn matrix4x3_transform_point_pub(m: &RealMatrix4x3, p: RealPoint3d) -> RealP
 }
 
 #[inline]
-fn matrix4x3_transform_point(m: &RealMatrix4x3, p: RealPoint3d) -> RealPoint3d {
-    // Halo basis layout: basis vectors are rows-of-3-floats in
-    // `forward/left/up`; transform is
-    //   w = scale*(p.x*forward + p.y*left + p.z*up) + position
-    // (engine asserts scale == 1.0 in `visibility_volume_build`, but
-    // honour it here in case of future callers.)
-    let s = m.scale;
-    RealPoint3d {
-        x: s * (p.x * m.forward.i + p.y * m.left.i + p.z * m.up.i) + m.position.x,
-        y: s * (p.x * m.forward.j + p.y * m.left.j + p.z * m.up.j) + m.position.y,
-        z: s * (p.x * m.forward.k + p.y * m.left.k + p.z * m.up.k) + m.position.z,
-    }
-}
-
-#[inline]
 fn matrix4x3_transform_points_in_place(m: &RealMatrix4x3, points: &mut [RealPoint3d]) {
     for p in points.iter_mut() {
         *p = matrix4x3_transform_point(m, *p);
     }
-}
-
-#[inline]
-fn matrix4x3_transform_plane(m: &RealMatrix4x3, plane: RealPlane3d) -> RealPlane3d {
-    // For scale=1 + orthonormal basis: n_world = R * n_basis,
-    //   d_world = d_basis + dot(n_world, position).
-    let nx = plane.i * m.forward.i + plane.j * m.left.i + plane.k * m.up.i;
-    let ny = plane.i * m.forward.j + plane.j * m.left.j + plane.k * m.up.j;
-    let nz = plane.i * m.forward.k + plane.j * m.left.k + plane.k * m.up.k;
-    let d = plane.d + (nx * m.position.x + ny * m.position.y + nz * m.position.z);
-    RealPlane3d { i: nx, j: ny, k: nz, d }
 }
 
 #[inline]
@@ -236,152 +198,3 @@ pub fn visibility_volume_build(
     true
 }
 
-// =============================================================================
-// `visibility_region_test_sphere @ 0x18050D570` (B7)
-// =============================================================================
-
-/// Test sphere against all per-projection volumes of a region cluster.
-///
-/// Returns the `VOLUME_*` discriminant ORed across volumes (so any
-/// intersect returns intersect; any inside-or-intersect returns
-/// non-zero). `fully_contained` is set to `true` only when at least
-/// one volume fully contains the sphere — engine semantic preserved.
-///
-/// This is the direct entry point used by
-/// `c_structure_renderer::render_decorators @ 0x1806901A0` to cull
-/// decorator-cluster runs against the camera region (fixes decorator
-/// pop in Phase I.1).
-pub fn visibility_region_test_sphere(
-    region: &SVisibilityRegion,
-    region_cluster_index: i32,
-    bounding_center: RealPoint3d,
-    bounding_radius: f32,
-    fully_contained: &mut bool,
-) -> u8 {
-    *fully_contained = false;
-    let Some(cluster) = visibility_region_get_cluster(region, region_cluster_index) else {
-        return 0;
-    };
-    debug_assert!(
-        region.projection_count >= 0 && region.projection_count <= 6,
-        "region.projection_count out of range"
-    );
-
-    let mut result_any: u8 = 0;
-    let mut found_inside = false;
-    'outer: for proj in 0..region.projection_count as usize {
-        let count = cluster.volume_counts[proj] as i32;
-        let first = cluster.first_volume_indices[proj] as i32;
-        for i in 0..count {
-            let volume_idx = first + i;
-            if volume_idx < 0 || volume_idx >= region.volume_count as i32 {
-                continue;
-            }
-            let volume = &region.volumes[volume_idx as usize];
-            let result = visibility_volume_test_sphere(volume, bounding_center, bounding_radius);
-            if result != VOLUME_OUTSIDE {
-                result_any = 1;
-            }
-            if result == VOLUME_INSIDE {
-                found_inside = true;
-                break 'outer;
-            }
-        }
-    }
-    *fully_contained = found_inside;
-    result_any
-}
-
-// =============================================================================
-// `visibility_region_test_box @ 0x18050D7A0` (B8)
-// =============================================================================
-
-/// Test AABB against all per-projection volumes of a region cluster.
-/// Returns `true` if any volume returns intersect/inside.
-///
-/// `test_frustum_against_cube` is forwarded to `volume_test_box` —
-/// most callers pass `false`; light/shadow paths pass `true` for the
-/// tighter cull (Phase E refinement).
-pub fn visibility_region_test_box(
-    region: &SVisibilityRegion,
-    region_cluster_index: i32,
-    bounding_box: &RealRectangle3d,
-    test_frustum_against_cube: bool,
-) -> bool {
-    let Some(cluster) = visibility_region_get_cluster(region, region_cluster_index) else {
-        return false;
-    };
-    debug_assert!(
-        region.projection_count >= 0 && region.projection_count <= 6,
-        "region.projection_count out of range"
-    );
-
-    let mut any_intersect = false;
-    for proj in 0..region.projection_count as usize {
-        let count = cluster.volume_counts[proj] as i32;
-        let first = cluster.first_volume_indices[proj] as i32;
-        for i in 0..count {
-            let volume_idx = first + i;
-            if volume_idx < 0 || volume_idx >= region.volume_count as i32 {
-                continue;
-            }
-            let volume = &region.volumes[volume_idx as usize];
-            let result =
-                visibility_volume_test_box(volume, bounding_box, test_frustum_against_cube);
-            if result != VOLUME_OUTSIDE {
-                any_intersect = true;
-                break; // engine breaks inner loop on first hit per projection
-            }
-        }
-    }
-    any_intersect
-}
-
-// =============================================================================
-// `visibility_volumes_intersect` (B9) — light × camera region intersection
-// `visibility_project_*` (B10) — projection helpers for occlusion / lens flares
-//
-// Stubs only: bodies depend on `c_visibility_collection::intersect_*`
-// (Phase F) and the occlusion view (Phase G.5). Returning conservative
-// "intersect/cannot-cull" results so any caller wiring up early sees
-// nothing being culled rather than nothing being drawn.
-// =============================================================================
-
-/// `visibility_volumes_intersect` — Phase F stub. Always reports an
-/// intersection; output structure is filled with zeros.
-pub fn visibility_volumes_intersect(
-    _light_projection: &VisibilityProjection,
-    _light_volume: &VisibilityVolume,
-    _camera_projection: &VisibilityProjection,
-    _camera_volume: &VisibilityVolume,
-    output_intersection: &mut VisibilityVolumeIntersection,
-    _create_convex_hull: bool,
-) -> bool {
-    *output_intersection = VisibilityVolumeIntersection::default();
-    // TODO(phase-f): port real intersection math from
-    // `Ares/source/visibility/visibility_projections_and_volumes.cpp`
-    // (used by c_visibility_collection::intersect_light_region_with_camera_region).
-    true
-}
-
-/// `visibility_project_sphere` — Phase G stub (occlusion view).
-pub fn visibility_project_sphere(
-    _projection: &VisibilityProjection,
-    _center: RealPoint3d,
-    _radius: f32,
-    projected_bounds: &mut RealRectangle3d,
-) -> bool {
-    *projected_bounds = real_rectangle3d_empty();
-    // TODO(phase-g): port — needed by `c_occlusion_view::compute_visibility`.
-    false
-}
-
-/// `visibility_project_box` — Phase G stub.
-pub fn visibility_project_box(
-    _projection: &VisibilityProjection,
-    _bound: &RealRectangle3d,
-    projected_bounds: &mut RealRectangle3d,
-) -> bool {
-    *projected_bounds = real_rectangle3d_empty();
-    false
-}

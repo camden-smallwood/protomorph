@@ -14,14 +14,6 @@ use crate::halo::scenario::{
     scenario_zone_set_pvs_write_open_row, LoadedScenario, SGameClusterBitVectors,
 };
 
-/// `structure_bsp_cluster_pvs_flags`.
-///
-/// Bit indices match Ares `structure_bsp_definitions.h:39-42`.
-pub mod cluster_pvs_flags {
-    pub const PVS_AFFECTED_BY_ONE_WAY_PORTAL: u16 = 1 << 0;
-    pub const PVS_AFFECTED_BY_DOOR_PORTAL: u16 = 1 << 1;
-}
-
 /// `structure_bsp_compute_cluster_active_pvs @ 0x180334F80`. Compute
 /// the active cluster-PVS bitvector for `cluster_reference` in the
 /// current zone set.

@@ -229,11 +229,11 @@ impl CameraFxBloomDefaults {
 /// variant; see [`Kernel5Uniforms`] below.
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct PostprocessUniforms {
-    pixel_size: [f32; 4],
-    scale: [f32; 4],
-    intensity_vector: [f32; 4],
-    dark_color_multiplier: [f32; 4],
+pub(crate) struct PostprocessUniforms {
+    pub(crate) pixel_size: [f32; 4],
+    pub(crate) scale: [f32; 4],
+    pub(crate) intensity_vector: [f32; 4],
+    pub(crate) dark_color_multiplier: [f32; 4],
 }
 
 /// `kernel_5` shader's full uniform block — base postprocess fields
@@ -325,10 +325,6 @@ struct Pipelines {
     spike_blur_v: wgpu::RenderPipeline,
     /// Additive-blend variant of `spike_blur_v`.
     spike_blur_v_add: wgpu::RenderPipeline,
-    /// `bloom_star_combine.wgsl` — final bloom + bling combine with
-    /// independent per-component intensities. Mirrors the bloom+star
-    /// contribution computed inside Halo's `copy_accumulation_target`.
-    bloom_star_combine: wgpu::RenderPipeline,
     /// `downsample_4x4_block.wgsl` — plain 4-tap box filter used to
     /// build the multi-scale bloom pyramid (1/2 → 1/4 → 1/8).
     /// Halo's shader index 49.
@@ -416,7 +412,6 @@ pub struct ScreenPostprocess {
 
     uniform_buffer: wgpu::Buffer,
     kernel5_uniform_buffer: wgpu::Buffer,
-    spike_uniform_buffer: wgpu::Buffer,
     /// 64-byte uniform buffer holding the 16 radial-blur sample weights
     /// (4 vec4s). Updated each radial_blur dispatch.
     radial_blur_weights_buffer: wgpu::Buffer,
@@ -958,92 +953,87 @@ impl ScreenPostprocess {
         let pipelines = Pipelines {
             apply_bloom_curve: make_pipeline(
                 "apply_bloom_curve",
-                include_str!("../../../assets/shaders/apply_bloom_curve.wgsl"),
+                include_str!("../../../assets/halo_shaders/apply_bloom_curve.wgsl"),
                 f, &layout_1tex,
             ),
             horizontal_gaussian_blur: make_pipeline(
                 "horizontal_gaussian_blur",
-                include_str!("../../../assets/shaders/horizontal_gaussian_blur.wgsl"),
+                include_str!("../../../assets/halo_shaders/horizontal_gaussian_blur.wgsl"),
                 f, &layout_1tex,
             ),
             vertical_gaussian_blur: make_pipeline(
                 "vertical_gaussian_blur",
-                include_str!("../../../assets/shaders/vertical_gaussian_blur.wgsl"),
+                include_str!("../../../assets/halo_shaders/vertical_gaussian_blur.wgsl"),
                 f, &layout_1tex,
             ),
             downsample_4x4_block_bloom_ldr: make_pipeline(
                 "downsample_4x4_block_bloom_ldr",
-                include_str!("../../../assets/shaders/downsample_4x4_block_bloom_ldr.wgsl"),
+                include_str!("../../../assets/halo_shaders/downsample_4x4_block_bloom_ldr.wgsl"),
                 f, &layout_2tex,
             ),
             downsample_4x4_block_bloom: make_pipeline(
                 "downsample_4x4_block_bloom",
-                include_str!("../../../assets/shaders/downsample_4x4_block_bloom.wgsl"),
+                include_str!("../../../assets/halo_shaders/downsample_4x4_block_bloom.wgsl"),
                 f, &layout_1tex,
             ),
             blur_11_horizontal: make_pipeline(
                 "blur_11_horizontal",
-                include_str!("../../../assets/shaders/blur_11_horizontal.wgsl"),
+                include_str!("../../../assets/halo_shaders/blur_11_horizontal.wgsl"),
                 f, &layout_1tex,
             ),
             blur_11_vertical: make_pipeline(
                 "blur_11_vertical",
-                include_str!("../../../assets/shaders/blur_11_vertical.wgsl"),
+                include_str!("../../../assets/halo_shaders/blur_11_vertical.wgsl"),
                 f, &layout_1tex,
             ),
             add: make_pipeline(
                 "add",
-                include_str!("../../../assets/shaders/add.wgsl"),
+                include_str!("../../../assets/halo_shaders/add.wgsl"),
                 f, &layout_2tex,
             ),
             bloom_add_alpha1: make_pipeline(
                 "bloom_add_alpha1",
-                include_str!("../../../assets/shaders/bloom_add_alpha1.wgsl"),
+                include_str!("../../../assets/halo_shaders/bloom_add_alpha1.wgsl"),
                 f, &layout_2tex,
             ),
             kernel_5: make_pipeline(
                 "kernel_5",
-                include_str!("../../../assets/shaders/kernel_5.wgsl"),
+                include_str!("../../../assets/halo_shaders/kernel_5.wgsl"),
                 f, &layout_kernel5,
             ),
             postprocess_copy: make_pipeline(
                 "postprocess_copy",
-                include_str!("../../../assets/shaders/postprocess_copy.wgsl"),
+                include_str!("../../../assets/halo_shaders/postprocess_copy.wgsl"),
                 f, &layout_1tex,
             ),
             spike_blur_h: make_pipeline(
                 "spike_blur_h",
-                include_str!("../../../assets/shaders/spike_blur_horizontal.wgsl"),
+                include_str!("../../../assets/halo_shaders/spike_blur_horizontal.wgsl"),
                 f, &layout_1tex,
             ),
             spike_blur_h_add: make_pipeline_blend(
                 "spike_blur_h_add",
-                include_str!("../../../assets/shaders/spike_blur_horizontal.wgsl"),
+                include_str!("../../../assets/halo_shaders/spike_blur_horizontal.wgsl"),
                 f, &layout_1tex, Some(additive_blend),
             ),
             spike_blur_v: make_pipeline(
                 "spike_blur_v",
-                include_str!("../../../assets/shaders/spike_blur_vertical.wgsl"),
+                include_str!("../../../assets/halo_shaders/spike_blur_vertical.wgsl"),
                 f, &layout_1tex,
             ),
             spike_blur_v_add: make_pipeline_blend(
                 "spike_blur_v_add",
-                include_str!("../../../assets/shaders/spike_blur_vertical.wgsl"),
+                include_str!("../../../assets/halo_shaders/spike_blur_vertical.wgsl"),
                 f, &layout_1tex, Some(additive_blend),
-            ),
-            bloom_star_combine: make_pipeline(
-                "bloom_star_combine",
-                include_str!("../../../assets/shaders/bloom_star_combine.wgsl"),
-                f, &layout_2tex,
             ),
             downsample_4x4_block: make_pipeline(
                 "downsample_4x4_block",
-                include_str!("../../../assets/shaders/downsample_4x4_block.wgsl"),
+                include_str!("../../../assets/halo_shaders/downsample_4x4_block.wgsl"),
                 f, &layout_1tex,
             ),
             lightshafts_extract: make_pipeline(
                 "lightshafts_extract",
-                include_str!("../../../assets/shaders/lightshafts.wgsl"),
+                include_str!("../../../assets/halo_shaders/lightshafts.wgsl"),
                 // Engine `c_screen_postprocess::copy(97, source, _surface_albedo)`
                 // writes the extracted bright-cone result at FULL-RES into
                 // `_surface_albedo` (= our `albedo_view`, Rg11b10Ufloat).
@@ -1055,12 +1045,12 @@ impl ScreenPostprocess {
             ),
             radial_blur: make_pipeline(
                 "radial_blur",
-                include_str!("../../../assets/shaders/radial_blur.wgsl"),
+                include_str!("../../../assets/halo_shaders/radial_blur.wgsl"),
                 f, &layout_radial_blur,
             ),
             lightshafts_additive_blit: make_pipeline_blend(
                 "lightshafts_additive_blit",
-                include_str!("../../../assets/shaders/postprocess_copy.wgsl"),
+                include_str!("../../../assets/halo_shaders/postprocess_copy.wgsl"),
                 // Additive blit targets the HDR scene color
                 // (`dest_view`) which protomorph allocates as
                 // Rg11b10Ufloat — match the pipeline format to the
@@ -1070,22 +1060,22 @@ impl ScreenPostprocess {
             ),
             ssao: make_pipeline(
                 "ssao",
-                include_str!("../../../assets/shaders/ssao.wgsl"),
+                include_str!("../../../assets/halo_shaders/ssao.wgsl"),
                 wgpu::TextureFormat::Rgba8Unorm, &layout_ssao,
             ),
             ssao_blur: make_pipeline(
                 "ssao_blur",
-                include_str!("../../../assets/shaders/ssao_blur.wgsl"),
+                include_str!("../../../assets/halo_shaders/ssao_blur.wgsl"),
                 wgpu::TextureFormat::Rgba8Unorm, &layout_ssao_blur,
             ),
             ssao_blur_multiply: make_pipeline_blend(
                 "ssao_blur_multiply",
-                include_str!("../../../assets/shaders/ssao_blur.wgsl"),
+                include_str!("../../../assets/halo_shaders/ssao_blur.wgsl"),
                 wgpu::TextureFormat::Rgba16Float, &layout_ssao_blur, Some(multiply_blend),
             ),
             exposure_downsample: make_pipeline(
                 "exposure_downsample",
-                include_str!("../../../assets/shaders/exposure_downsample.wgsl"),
+                include_str!("../../../assets/halo_shaders/exposure_downsample.wgsl"),
                 wgpu::TextureFormat::R16Float, &layout_2tex,
             ),
         };
@@ -1124,16 +1114,6 @@ impl ScreenPostprocess {
             label: Some("kernel5_uniforms"),
             contents: bytemuck::bytes_of(&Kernel5Uniforms {
                 pixel_size: [0.0; 4], scale: [1.0; 4], kernel: [[0.0; 4]; 5],
-            }),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let spike_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("spike_blur_uniforms"),
-            contents: bytemuck::bytes_of(&SpikeBlurUniforms {
-                source_pixel_size: [0.0; 4],
-                offset_delta: [0.0; 4],
-                initial_color: [1.0, 1.0, 1.0, 0.0],
-                delta_color: [0.0; 4],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -1333,7 +1313,6 @@ impl ScreenPostprocess {
             sampler_point,
             uniform_buffer,
             kernel5_uniform_buffer,
-            spike_uniform_buffer,
             radial_blur_weights_buffer,
             bgl_radial_blur,
             ssao_noise_texture,
@@ -1397,6 +1376,35 @@ impl ScreenPostprocess {
     /// this and adds it to the HDR composite before tone curve.
     pub fn bloom_result_view(&self) -> &wgpu::TextureView {
         &self.aux_bloom.view
+    }
+
+    /// View into the bling/star spike buffer (engine `g_star_buffer`).
+    /// `FinalCompositePass` samples this separately from bloom and weights
+    /// it by [`bling_scale`], matching the single-pass engine composite
+    /// (`copy_target.hlsl` sampler 3). Stays 0 when bling is inactive.
+    pub fn bling_result_view(&self) -> &wgpu::TextureView {
+        &self.aux_star.view
+    }
+
+    /// Whether bling/star spikes are active this frame. Gates both
+    /// `bling_generate` and the composite's `intensity.z` weight. Mirrors
+    /// the engine `m_bling` enable plus the `bling_count`/`bling_intensity`
+    /// guards; `PROTOMORPH_DISABLE_BLING=1` forces off (diagnostic).
+    pub fn bling_active(&self) -> bool {
+        if std::env::var_os("PROTOMORPH_DISABLE_BLING").is_some() {
+            static LOG: std::sync::Once = std::sync::Once::new();
+            LOG.call_once(|| eprintln!("[bling] disabled via PROTOMORPH_DISABLE_BLING"));
+            return false;
+        }
+        self.settings_internal.bling != 0
+            && self.camera_fx.bling_count > 0
+            && self.camera_fx.bling_intensity > 0.0
+    }
+
+    /// Engine `intensity.z` (bling_intensity) for the final composite —
+    /// `m_bling_intensity` when active, else 0 (term vanishes).
+    pub fn bling_scale(&self) -> f32 {
+        if self.bling_active() { self.camera_fx.bling_intensity } else { 0.0 }
     }
 
     /// View into the half-res DoF blur output (E1). The composite blit
@@ -1551,62 +1559,6 @@ fn make_exposure_ring_surface(device: &wgpu::Device, slot: usize) -> BloomSurfac
 // `impl ScreenPostprocess` per project Rust style (drop the `c_`
 // namespace, keep engine method names).
 impl ScreenPostprocess {
-    /// `c_screen_postprocess::accept_edited_settings @ 0x18034d890`.
-    pub fn accept_edited_settings(&mut self) {
-        self.settings_internal = self.editable_settings;
-    }
-
-    /// `c_screen_postprocess::postprocess_final_composite @ 0x1806b49f0`.
-    ///
-    /// **Screenshot-render-engine path** — the only caller in the
-    /// dllcache xref is `c_screenshot_render_engine::composite_single_tile`.
-    /// Per-frame rendering does NOT go through this method; it goes
-    /// through `postprocess_player_view`'s embedded `copy(51, accum_HDR
-    /// → display)` (or `copy(93, ...)` when FXAA is on).
-    ///
-    /// Engine body (271 lines): looks up bloom-curve / tone-curve /
-    /// color grading textures from `rasterizer_globals.default_textures`,
-    /// binds them at sampler slots 0/1, the `bloom_surface` argument
-    /// at slot 2, plus `depth_stencil` and `aux_small2` at slots 3/4
-    /// when DoF is enabled. Writes cbuffer slots:
-    ///
-    ///   - `0x420000` pixel_size (1/aux_refraction.{w,h}, 1/depth.{w,h} for DoF)
-    ///   - `0x1D0000` intensities = `(1, 1, inherent_scale, 0)`
-    ///   - `0x1D0001` tone_curve_constants (when `use_tone_curve`):
-    ///       `w0 = wp`, `w1 = (1.4938016/wp) * 1.0041494`,
-    ///       `w2 = 0`, `w3 = -(1.4938016/wp)^3 * 0.15`
-    ///     Without tone curve: `(65535, 1.4938016/wp, 0, 0)`.
-    ///   - `0x1D0003` bloom_xform — window_rect normalization.
-    ///   - `0x1E0000`/`0x1E0001` depth + DoF blur sigma (DoF only).
-    ///
-    /// Then `set_scissor_rect(target_rect)` + `draw_fullscreen_quad` +
-    /// reset all sampler/scissor state.
-    ///
-    /// **Protomorph status: STUB** — we don't render screenshots, so
-    /// no caller path lights up. The corresponding per-frame logic
-    /// lives in `FinalCompositePass`. Adding this method keeps the
-    /// engine API surface complete; if/when screenshot rendering
-    /// lands, the body fills in.
-    #[allow(clippy::too_many_arguments)]
-    pub fn postprocess_final_composite(
-        &self,
-        _explicit_shader_index: i32,
-        _display_surface: Option<&wgpu::TextureView>,
-        _bloom_surface: Option<&wgpu::TextureView>,
-        _inherent_scale: f32,
-        _use_tone_curve: bool,
-        _true_srgb_output: bool,
-        _use_depth_of_field: bool,
-        _z_near: f32,
-        _z_far: f32,
-        _target_rect: Option<[i32; 4]>,
-        _window_rect: Option<[f32; 4]>,
-    ) -> bool {
-        // Engine returns 1 on success, 0 if set_explicit_shaders failed.
-        // Stub — see doc comment.
-        false
-    }
-
     /// `c_screen_postprocess::render_ssao @ 0x1806b50e0`. Screen-space
     /// ambient occlusion. Engine flow:
     ///
@@ -2259,38 +2211,6 @@ impl ScreenPostprocess {
         encoder.pop_debug_group();
     }
 
-    /// `c_screen_postprocess::color_grading_init @ 0x1806ca070`. Engine
-    /// allocates `g_pColorGradingTextures[0/1]` + their staging pair.
-    /// We allocate them inline in `new()` (since wgpu's
-    /// `queue.write_texture` handles staging implicitly); this method
-    /// re-uploads identity LUTs to both slots and resets the swap
-    /// state. Called from a future `c_rasterizer::initialize_after_device_creation_or_reset`
-    /// port and from any explicit "reset color grading" path.
-    pub fn color_grading_init(&mut self, queue: &wgpu::Queue) {
-        let identity = crate::halo::render::color_grading::bake_lut_to_vec(None);
-        crate::halo::render::color_grading::upload_lut(
-            queue,
-            &self.color_grading_textures[0],
-            &identity,
-        );
-        crate::halo::render::color_grading::upload_lut(
-            queue,
-            &self.color_grading_textures[1],
-            &identity,
-        );
-        self.color_grading_blend_factor = 0.0;
-        self.color_grading_active = 0;
-    }
-
-    /// `c_screen_postprocess::color_grading_release @ 0x1806ca170`.
-    /// Engine releases the D3D resource pointers. wgpu's RAII handles
-    /// the actual textures via Drop; this method just resets blend
-    /// state so a re-init starts clean.
-    pub fn color_grading_release(&mut self) {
-        self.color_grading_blend_factor = 0.0;
-        self.color_grading_active = 0;
-    }
-
     /// `c_screen_postprocess::update_color_grading @ 0x1806ca1d0`. Bake
     /// the authored `s_color_grading_parameter` into the inactive LUT
     /// slot, then swap. Engine: when settings change, swap
@@ -2394,7 +2314,7 @@ impl ScreenPostprocess {
         shared: &SharedResources,
         encoder: &mut wgpu::CommandEncoder,
         composite_hdr: &wgpu::TextureView,
-        depth_view: &wgpu::TextureView,
+        _depth_view: &wgpu::TextureView,
         camera_fx: Option<&blam_tags::camera_fx_settings::CameraFxSettings>,
         view: glam::Mat4,
         projection: glam::Mat4,
@@ -2661,46 +2581,22 @@ impl ScreenPostprocess {
             [1.0, 1.0, 1.0, 1.0],
         );
 
-        // Step 14-15 — copy_accumulation_target equivalent (bloom + bling combine).
-        // Diagnostic: PROTOMORPH_DISABLE_BLING=1 skips bling_generate and
-        // zeros bling_scale. Use to bisect: if yellow wash gone with bling
-        // disabled, the spike kernel is amplifying scene content too much.
-        let bling_disabled = std::env::var_os("PROTOMORPH_DISABLE_BLING").is_some();
-        if bling_disabled {
-            static LOG: std::sync::Once = std::sync::Once::new();
-            LOG.call_once(|| eprintln!("[bling] disabled via PROTOMORPH_DISABLE_BLING"));
-        }
-        let bling_active = !bling_disabled
-            && self.settings_internal.bling != 0
-            && self.camera_fx.bling_count > 0
-            && self.camera_fx.bling_intensity > 0.0;
-        if bling_active {
+        // Step 14 — bling/star spike generation. Engine-faithful: the
+        // bloom+bling COMBINE is NOT a separate pass (dllcache
+        // `postprocess_bloom_buffer @0x1806B4710` keeps `_surface_aux_bloom`
+        // and the star buffer as two distinct surfaces). `bling_generate`
+        // writes the star spikes into `aux_star`; the weighted combine
+        // `intensity.z*bling` happens INSIDE the single `copy_accumulation_
+        // target` composite (`copy_target.hlsl:50-53`), which protomorph
+        // runs as `FinalCompositePass` — it samples `aux_bloom` (sampler 2)
+        // and `aux_star` (sampler 3) separately. So here we only produce the
+        // star buffer; the composite reads it via `bling_result_view()` and
+        // weights it by `bling_scale()`.
+        // Diagnostic: PROTOMORPH_DISABLE_BLING=1 skips bling_generate (and
+        // `bling_scale()` returns 0). Bisect tool for star-spike over-bloom.
+        if self.bling_active() {
             self.bling_generate(shared, encoder);
         }
-        let bling_scale = if bling_active { self.camera_fx.bling_intensity } else { 0.0 };
-        let combine_scale = [1.0, 1.0, 1.0, bling_scale];
-        let combine_uniforms = PostprocessUniforms {
-            pixel_size: [
-                1.0 / self.aux_bloom.width as f32,
-                1.0 / self.aux_bloom.height as f32,
-                self.aux_bloom.width as f32,
-                self.aux_bloom.height as f32,
-            ],
-            scale: combine_scale,
-            intensity_vector: [0.299, 0.587, 0.114, 0.0],
-            dark_color_multiplier: [1.0, 0.0, 0.0, 0.0],
-        };
-        self.dispatch_2tex_isolated(
-            shared, encoder, "bloom_star_combine_iso",
-            &self.pipelines.bloom_star_combine,
-            &self.aux_bloom.view,
-            &self.aux_star.view,
-            &self.aux_exposure_7.view,
-            wgpu::Color::TRANSPARENT,
-            &combine_uniforms,
-        );
-        self.copy_step(shared, encoder, "bloom_finalcopy",
-            &self.aux_exposure_7.view, &self.aux_bloom);
 
         // Step 16 — render_lightshafts. RELOCATED to the caller (in
         // `render_player_view`) so that the engine ordering
@@ -3322,9 +3218,19 @@ impl ScreenPostprocess {
             initial_color: [intensity / sum_r, intensity / sum_g, intensity / sum_b, 0.0],
             delta_color: [r_step, g_step, b_step, 0.0],
         };
-        shared
-            .queue
-            .write_buffer(&self.spike_uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        // Per-call uniform buffer — NOT the shared self.spike_uniform_buffer.
+        // bling_generate runs spike_blur 2×count times in one encoder with no
+        // submit between, and wgpu flushes every queue.write_buffer upload
+        // BEFORE any encoder command — so writing the shared buffer per pass
+        // would make all passes read the LAST pass's angle/skip/intensity
+        // (every spike pointing the same way, wrong kernel/amplitude). Same
+        // race-avoidance as dispatch_1tex_isolated.
+        use wgpu::util::DeviceExt;
+        let local_uniform = shared.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::bytes_of(&uniforms),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
 
         let pipeline = match (use_linear_y, additive) {
             (true, false) => &self.pipelines.spike_blur_h,
@@ -3347,7 +3253,7 @@ impl ScreenPostprocess {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.spike_uniform_buffer.as_entire_binding(),
+                    resource: local_uniform.as_entire_binding(),
                 },
             ],
         });
@@ -3434,123 +3340,6 @@ impl ScreenPostprocess {
         );
     }
 
-    /// `c_screen_postprocess::gaussian_blur_fixed @ 0x1806b68b0`.
-    /// Body verbatim from dllcache:
-    ///   copy(11, target, temp, bilinear, clamp, 1, 1, 1, 1);
-    ///   resolve_surface(temp, 0, 0, 0);                  // PC: no-op
-    ///   set_shader_constant(0x330000, 5, kernel_vertical);
-    ///   copy(34, temp, target, bilinear, clamp, scale_r, scale_g, scale_b, scale_a);
-    pub fn gaussian_blur_fixed(
-        &self,
-        shared: &SharedResources,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &BloomSurface,
-        temp: &BloomSurface,
-        scale: [f32; 4],
-    ) {
-        encoder.push_debug_group("gaussian_blur_fixed");
-
-        // copy(11, target, temp, ...) — shader 11 = blur_11_horizontal.
-        // Hardcoded Pascal-row-10 weights. Pixel_size derives from the
-        // source surface (target).
-        self.upload_uniforms(
-            shared,
-            [target.width as f32, target.height as f32],
-            [0.0; 4],
-        );
-        self.run_pipeline_1tex(
-            shared, encoder,
-            "blur_11_horizontal",
-            &self.pipelines.blur_11_horizontal,
-            &target.view,
-            &temp.view,
-            wgpu::Color::TRANSPARENT,
-        );
-
-        // copy(34, temp, target, ..., scale) — shader 34 = kernel_5,
-        // but we use blur_11_vertical (same hardcoded Pascal kernel).
-        self.upload_uniforms(
-            shared,
-            [temp.width as f32, temp.height as f32],
-            scale,
-        );
-        self.run_pipeline_1tex(
-            shared, encoder,
-            "blur_11_vertical",
-            &self.pipelines.blur_11_vertical,
-            &temp.view,
-            &target.view,
-            wgpu::Color::TRANSPARENT,
-        );
-
-        encoder.pop_debug_group();
-    }
-
-    /// `c_screen_postprocess::apply_binary_op_ex @ 0x1806b66b0`. Two-input
-    /// fullscreen postprocess shader dispatch.
-    ///
-    /// Engine body: set RT0 = dest, set explicit shader, bind source_0
-    /// + source_1 with per-sampler filter/address mode, write
-    /// `pixel_size = 1/source_0.{w,h}` to cbuffer slot `0x420000` and
-    /// `scale` to `0x420001`, draw a fullscreen quad, then clear
-    /// sampler textures 0 + 1.
-    ///
-    /// Wgpu adaptation: we resolve the explicit_shader_index to a
-    /// concrete `&RenderPipeline` outside this method (caller knows
-    /// which shader they want); pixel_size + scale go into our shared
-    /// `PostprocessUniforms` cbuffer; sampler bindings are baked into
-    /// pre-allocated `sampler_bilinear` / `sampler_point` (address_mode
-    /// is currently clamp-only — matches all Halo bloom callers).
-    /// Render pass uses LoadOp::Load (engine doesn't clear the dest).
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_binary_op_ex(
-        &self,
-        shared: &SharedResources,
-        encoder: &mut wgpu::CommandEncoder,
-        pipeline: &wgpu::RenderPipeline,
-        source_0: &wgpu::TextureView,
-        source_0_size: [u32; 2],
-        source_1: &wgpu::TextureView,
-        dest: &wgpu::TextureView,
-        filter_mode: wgpu::FilterMode,
-        _address_mode: wgpu::AddressMode,
-        scale: [f32; 4],
-    ) {
-        self.upload_uniforms(
-            shared,
-            [source_0_size[0] as f32, source_0_size[1] as f32],
-            scale,
-        );
-        let sampler = match filter_mode {
-            wgpu::FilterMode::Linear => &self.sampler_bilinear,
-            wgpu::FilterMode::Nearest => &self.sampler_point,
-        };
-        let bg = shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("apply_binary_op_ex"),
-            layout: &self.bgl_2tex,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source_0) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(source_1) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
-                wgpu::BindGroupEntry { binding: 4, resource: self.uniform_buffer.as_entire_binding() },
-            ],
-        });
-        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("apply_binary_op_ex"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: dest, resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
-        });
-        rp.set_pipeline(pipeline);
-        rp.set_bind_group(0, &bg, &[]);
-        rp.draw(0..3, 0..1);
-    }
-
     /// Step 3 of `c_screen_postprocess::downsample_generate` —
     /// runs explicit shader 35 (`exposure_downsample`) to compress
     /// the 1/16-res HDR (intensity in `.a`) into a single half-float
@@ -3622,12 +3411,6 @@ impl ScreenPostprocess {
         rp.set_pipeline(&self.pipelines.exposure_downsample);
         rp.set_bind_group(0, &bg, &[]);
         rp.draw(0..3, 0..1);
-    }
-
-    /// Read-only accessor for ring-slot textures. Phase C readback
-    /// uses this to issue `copy_texture_to_buffer`.
-    pub fn aux_exposure_texture(&self, slot: usize) -> &wgpu::Texture {
-        &self.aux_exposure[slot].tex
     }
 
     /// `aux_tiny` (1/8-res Rgba16Float bloom-pyramid output, with
@@ -3803,86 +3586,6 @@ impl ScreenPostprocess {
         Some(half::f16::from_bits(bits).to_f32())
     }
 
-    /// `c_screen_postprocess::restore_surface_to_EDRAM @ 0x1806b6120`.
-    /// Xbox 360-specific — restores a tiled surface from main memory
-    /// back into the GPU's on-die EDRAM. PC has no EDRAM; the dllcache
-    /// build is x64 (PC-targeted) but retains the function for
-    /// API-shape compatibility — it amounts to a tile-resolve no-op
-    /// outside the 360 build path.
-    ///
-    /// We keep the method as a structural marker so the orchestrator
-    /// port can call it engine-faithfully; the body is a no-op.
-    /// Callers in the dllcache: `c_screenshot_render_engine::copy_composited_tile_to_display`,
-    /// `initialize_render_display` — both screenshot paths we don't
-    /// exercise.
-    pub fn restore_surface_to_EDRAM(&self, _surface_label: &str, _explicit_shader_index: i32) {
-        // No-op on PC.
-    }
-
-    /// `c_screen_postprocess::gaussian_blur @ 0x1806b69b0`. Two-pass
-    /// blur using fixed 11-tap kernels (shader 11 horizontal, 12
-    /// vertical). The `horizontal_blur_size` / `vertical_blur_size`
-    /// args exist in the engine signature but are unused in this body
-    /// — the kernel weights are baked into the shaders. Caller passes
-    /// blur_size for ordering / debugging only.
-    ///
-    /// `target_surface` ↔ `temp_surface` ping-pong: H pass copies
-    /// target → temp, V pass copies temp → target. Final result lives
-    /// in `target_surface`.
-    pub fn gaussian_blur(
-        &self,
-        shared: &SharedResources,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
-        temp: &wgpu::TextureView,
-        target_size: [u32; 2],
-        _horizontal_blur_size: f32,
-        _vertical_blur_size: f32,
-    ) {
-        encoder.push_debug_group("gaussian_blur");
-        // Shader 11 — blur_11_horizontal.
-        self.copy(
-            shared, encoder, &self.pipelines.blur_11_horizontal,
-            target, target_size, temp,
-            wgpu::FilterMode::Linear, wgpu::AddressMode::ClampToEdge,
-            [1.0, 1.0, 1.0, 1.0],
-        );
-        // Shader 12 — blur_11_vertical.
-        self.copy(
-            shared, encoder, &self.pipelines.blur_11_vertical,
-            temp, target_size, target,
-            wgpu::FilterMode::Linear, wgpu::AddressMode::ClampToEdge,
-            [1.0, 1.0, 1.0, 1.0],
-        );
-        encoder.pop_debug_group();
-    }
-
-    /// `c_screen_postprocess::blur_display @ 0x1806b6aa0`. GUI/menu
-    /// utility — blurs the current display contents into the bloom
-    /// scratch surface for use as a backdrop. Engine flow:
-    ///   1. stretch_rect display → albedo
-    ///   2. resolve_surface(albedo)
-    ///   3. copy(shader 39, albedo → aux_bloom)
-    ///   4. resolve_surface(aux_bloom)
-    ///   5. gaussian_blur(aux_bloom, aux_exposure_5)
-    ///   6. resolve_surface(aux_bloom)
-    ///   7. return e_surface_aux_bloom (= 25)
-    ///
-    /// Used by `render_bitmap` for blurred GUI panel backgrounds.
-    /// Protomorph has no GUI surfaces yet — this is a stub that
-    /// returns `None` and logs once. The hook lands when GUI rendering
-    /// (CHUD / menu / pause overlay) gets ported.
-    pub fn blur_display(
-        &self,
-        _horizontal_blur_size: f32,
-        _vertical_blur_size: f32,
-    ) -> Option<&wgpu::TextureView> {
-        // Engine returns `e_surface_aux_bloom` (= 25). When GUI
-        // rendering is ported, return `Some(&self.aux_bloom.view)`
-        // after running the steps above.
-        None
-    }
-
     /// `c_screen_postprocess::copy @ 0x1806b64c0`. Single-input fullscreen
     /// postprocess shader dispatch — same plumbing as `apply_binary_op_ex`
     /// but only one source texture. Used when the postprocess pixel
@@ -3942,116 +3645,6 @@ impl ScreenPostprocess {
         rp.draw(0..3, 0..1);
     }
 
-    /// `c_screen_postprocess::blit @ 0x1806b6280`. Variant of `copy`
-    /// that draws a sub-rect: takes `source_texture_rect` (UV region
-    /// to sample from) and `dest_texture_rect` (pixel region of dest
-    /// to write into) — equivalent to `draw_screen_quad_with_texture_transform`.
-    ///
-    /// `dest_texture_rect` becomes a viewport on the wgpu render pass.
-    /// `source_texture_rect` would normally feed a UV transform
-    /// uniform, but our existing postprocess pipelines sample with the
-    /// full UV range — supporting rect-blit needs a shader change to
-    /// read a UV-transform cbuffer slot. For now this method asserts
-    /// that the source rect spans `[0, 1]²`; non-fullscreen source
-    /// rects are deferred until a `blit_uv_transform.wgsl` lands.
-    #[allow(clippy::too_many_arguments)]
-    pub fn blit(
-        &self,
-        shared: &SharedResources,
-        encoder: &mut wgpu::CommandEncoder,
-        pipeline: &wgpu::RenderPipeline,
-        source: &wgpu::TextureView,
-        source_size: [u32; 2],
-        dest: &wgpu::TextureView,
-        filter_mode: wgpu::FilterMode,
-        address_mode: wgpu::AddressMode,
-        scale: [f32; 4],
-        source_rect_uv: [f32; 4],   // (u0, v0, u1, v1)
-        dest_rect_px: [u32; 4],     // (x0, y0, x1, y1)
-        dest_size: [u32; 2],
-    ) {
-        // v1 limitation: non-fullscreen source rect needs a UV-transform
-        // cbuffer + matching shader. Fall through to `copy` when source
-        // covers the full texture; otherwise log + skip the dispatch.
-        let full_source = source_rect_uv == [0.0, 0.0, 1.0, 1.0];
-        if !full_source {
-            eprintln!(
-                "blit: source_rect_uv != [0,0,1,1] (got {:?}) — UV transform path not yet ported, skipping",
-                source_rect_uv,
-            );
-            return;
-        }
-        self.upload_uniforms(
-            shared,
-            [source_size[0] as f32, source_size[1] as f32],
-            scale,
-        );
-        let sampler = match filter_mode {
-            wgpu::FilterMode::Linear => &self.sampler_bilinear,
-            wgpu::FilterMode::Nearest => &self.sampler_point,
-        };
-        let _ = address_mode;
-        use crate::halo::render::bind_group_cache::{key_from_ptrs, ptr_addr};
-        let bg = self.cached_bg(
-            key_from_ptrs(&[ptr_addr(source), ptr_addr(sampler), ptr_addr(&self.bgl_1tex)]),
-            || shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blit"),
-                layout: &self.bgl_1tex,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.uniform_buffer.as_entire_binding() },
-                ],
-            }),
-        );
-        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("blit"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: dest, resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
-        });
-        // dest_rect_px → viewport. Engine `draw_screen_quad_with_texture_transform`
-        // restricts the rasterizer to the dest pixel region.
-        let _ = dest_size;
-        let vx = dest_rect_px[0] as f32;
-        let vy = dest_rect_px[1] as f32;
-        let vw = (dest_rect_px[2] - dest_rect_px[0]) as f32;
-        let vh = (dest_rect_px[3] - dest_rect_px[1]) as f32;
-        rp.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
-        rp.set_pipeline(pipeline);
-        rp.set_bind_group(0, bg.as_ref(), &[]);
-        rp.draw(0..3, 0..1);
-    }
-
-    /// `c_screen_postprocess::apply_binary_op @ 0x1804f38f0`. Thin
-    /// wrapper for `apply_binary_op_ex` with `(point, clamp)` sampler
-    /// state — engine's default for screenshot/bloom paths that don't
-    /// need bilinear filtering.
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_binary_op(
-        &self,
-        shared: &SharedResources,
-        encoder: &mut wgpu::CommandEncoder,
-        pipeline: &wgpu::RenderPipeline,
-        source_0: &wgpu::TextureView,
-        source_0_size: [u32; 2],
-        source_1: &wgpu::TextureView,
-        dest: &wgpu::TextureView,
-        scale: [f32; 4],
-    ) {
-        self.apply_binary_op_ex(
-            shared, encoder, pipeline,
-            source_0, source_0_size, source_1, dest,
-            wgpu::FilterMode::Nearest,
-            wgpu::AddressMode::ClampToEdge,
-            scale,
-        );
-    }
-
     fn upload_uniforms(
         &self,
         shared: &SharedResources,
@@ -4065,49 +3658,6 @@ impl ScreenPostprocess {
             dark_color_multiplier: [1.0, 0.0, 0.0, 0.0],
         };
         shared.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&u));
-    }
-
-    fn run_pipeline_2tex(
-        &self,
-        shared: &SharedResources,
-        encoder: &mut wgpu::CommandEncoder,
-        label: &str,
-        pipeline: &wgpu::RenderPipeline,
-        source_a: &wgpu::TextureView,
-        source_b: &wgpu::TextureView,
-        dest: &wgpu::TextureView,
-        clear: wgpu::Color,
-    ) {
-        use crate::halo::render::bind_group_cache::{key_from_ptrs, ptr_addr};
-        let bg = self.cached_bg(
-            key_from_ptrs(&[ptr_addr(source_a), ptr_addr(source_b), ptr_addr(&self.bgl_2tex)]),
-            || shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &self.bgl_2tex,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source_a) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler_bilinear) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(source_b) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler_bilinear) },
-                    wgpu::BindGroupEntry { binding: 4, resource: self.uniform_buffer.as_entire_binding() },
-                ],
-            }),
-        );
-        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some(label),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: dest, resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        rp.set_pipeline(pipeline);
-        rp.set_bind_group(0, bg.as_ref(), &[]);
-        rp.draw(0..3, 0..1);
     }
 
     fn run_pipeline_1tex(

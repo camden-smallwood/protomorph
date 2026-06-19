@@ -21,7 +21,7 @@ use crate::halo::visibility::visibility_working_portals::{
     SClusterWorkingPortals, SWorkingPortalStack,
 };
 use crate::halo::visibility::{
-    RealRectangle2d, SVisibilityRegion, VisibilityCluster, VisibilityProjection,
+    RealRectangle2d, SVisibilityRegion, VisibilityCluster,
 };
 
 // =============================================================================
@@ -59,11 +59,6 @@ impl ClustersToRegionClusters {
         self.table[bsp as usize][c as usize] = region_cluster_index;
     }
 
-    pub fn clear(&mut self) {
-        for row in self.table.iter_mut() {
-            *row = [-1; MAX_CLUSTERS_PER_BSP];
-        }
-    }
 }
 
 impl Default for ClustersToRegionClusters {

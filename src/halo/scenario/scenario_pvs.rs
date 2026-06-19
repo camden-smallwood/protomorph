@@ -41,32 +41,6 @@ impl Default for SGameClusterBitVectors {
     }
 }
 
-impl SGameClusterBitVectors {
-    /// `game_clusters_fill @ ?` — set all bits to `value`.
-    pub fn fill(&mut self, value: bool) {
-        let pattern = if value { u32::MAX } else { 0 };
-        for bsp in &mut self.bit_vectors {
-            for w in bsp.iter_mut() {
-                *w = pattern;
-            }
-        }
-    }
-
-    /// `game_clusters_test @ ?` — read one cluster bit. `bsp_index`
-    /// must be in `0..16`; `cluster_index` is masked into the per-BSP
-    /// 256-bit space.
-    pub fn test(&self, cluster: ClusterReference) -> bool {
-        if cluster.bsp_index < 0 || (cluster.bsp_index as usize) >= MAX_BSPS {
-            return false;
-        }
-        if cluster.cluster_index < 0 || (cluster.cluster_index as usize) >= MAX_CLUSTERS_PER_BSP {
-            return false;
-        }
-        let word = self.bit_vectors[cluster.bsp_index as usize][cluster.cluster_index as usize >> 5];
-        (word >> (cluster.cluster_index & 31)) & 1 != 0
-    }
-}
-
 // =============================================================================
 // `scenario_zone_set_pvs_get_row @ 0x180333630`
 // `scenario_zone_set_pvs_write_row @ 0x180333930`
@@ -133,26 +107,6 @@ pub fn scenario_zone_set_pvs_write_open_row(
     write_cluster_pvs_into(cluster_pvs, bsp_mask, pvs);
 }
 
-/// Like [`scenario_zone_set_pvs_write_open_row`] but for the
-/// doors-closed variant. Used by
-/// [`super::scenario_pvs::scenario_zone_set_pvs_write_open_row`]'s
-/// counterpart `structure_bsp_compute_cluster_active_pvs` when a
-/// cluster is `_pvs_affected_by_door_portal`.
-pub fn scenario_zone_set_pvs_write_closed_row(
-    scenario: &Scenario,
-    zone_set_index: usize,
-    cluster_reference: ClusterReference,
-    pvs: &mut SGameClusterBitVectors,
-) {
-    *pvs = SGameClusterBitVectors::default();
-    let Some((cluster_pvs, bsp_mask)) =
-        resolve_cluster_pvs_row(scenario, zone_set_index, cluster_reference, true)
-    else {
-        return;
-    };
-    write_cluster_pvs_into(cluster_pvs, bsp_mask, pvs);
-}
-
 fn write_cluster_pvs_into(
     cluster_pvs: &ZoneSetClusterPvs,
     bsp_mask: u32,
@@ -175,45 +129,3 @@ fn write_cluster_pvs_into(
     }
 }
 
-// =============================================================================
-// `scenario_zone_set_pvs_row_test/set/fill` utility helpers
-// (Ares 0x180333A30 / B50 / CD0)
-// =============================================================================
-
-/// `scenario_zone_set_pvs_row_test @ 0x180333A30`. Test whether
-/// `cluster_reference` is set in `pvs`.
-pub fn scenario_zone_set_pvs_row_test(
-    pvs: &SGameClusterBitVectors,
-    cluster_reference: ClusterReference,
-) -> bool {
-    pvs.test(cluster_reference)
-}
-
-/// `scenario_zone_set_pvs_row_set @ 0x180333B50`. Set/clear one
-/// cluster's bit.
-pub fn scenario_zone_set_pvs_row_set(
-    pvs: &mut SGameClusterBitVectors,
-    cluster_reference: ClusterReference,
-    value: bool,
-) {
-    if cluster_reference.bsp_index < 0
-        || (cluster_reference.bsp_index as usize) >= MAX_BSPS
-        || cluster_reference.cluster_index < 0
-        || (cluster_reference.cluster_index as usize) >= MAX_CLUSTERS_PER_BSP
-    {
-        return;
-    }
-    let word = &mut pvs.bit_vectors[cluster_reference.bsp_index as usize]
-        [cluster_reference.cluster_index as usize >> 5];
-    let mask = 1u32 << (cluster_reference.cluster_index & 31);
-    if value {
-        *word |= mask;
-    } else {
-        *word &= !mask;
-    }
-}
-
-/// `scenario_zone_set_pvs_row_fill @ 0x180333CD0`. Set all bits.
-pub fn scenario_zone_set_pvs_row_fill(pvs: &mut SGameClusterBitVectors, value: bool) {
-    pvs.fill(value);
-}

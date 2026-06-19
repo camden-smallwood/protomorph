@@ -141,12 +141,26 @@ pub fn transform_portal(
         .find(|b| b.scenario_bsp_index as i16 == bsp_index)?;
     let cluster_portal: &BspClusterPortal =
         bsp.sbsp.cluster_portals.get(portal_index as usize)?;
-    let plane = bsp
+    // `plane_index` carries a plane_designator-style direction sign bit (bit 31):
+    // low 31 bits = index into the planes block, high bit = use the NEGATED plane.
+    // Indexing it raw makes any sign-bit-set portal resolve to `None` →
+    // zero plane → classified degenerate → never traversed → clusters behind it
+    // dropped from the PVS. Mask the index and negate the plane when the bit is
+    // set. (-1, the "no plane" default, masks to 0x7FFFFFFF → out of range →
+    // zero plane, preserving the genuine no-plane case.)
+    let raw_plane_index = cluster_portal.plane_index;
+    let mut plane = bsp
         .sbsp
         .collision_bsp
         .as_ref()
-        .and_then(|c| c.planes.get(cluster_portal.plane_index as usize).copied())
+        .and_then(|c| c.planes.get((raw_plane_index & 0x7FFF_FFFF) as usize).copied())
         .unwrap_or_default();
+    if raw_plane_index < 0 {
+        plane.i = -plane.i;
+        plane.j = -plane.j;
+        plane.k = -plane.k;
+        plane.d = -plane.d;
+    }
 
     let slot = cache.actual_transformed_portals.len();
 

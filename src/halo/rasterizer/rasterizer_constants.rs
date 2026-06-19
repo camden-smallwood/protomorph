@@ -8,32 +8,7 @@
 //! call sites read `rasterizer::AlphaBlendMode::Opaque` instead of
 //! `c_rasterizer::_alpha_blend_opaque`.
 
-pub const K_NUMBER_OF_SAMPLERS: usize = 16;
-pub const K_NUMBER_OF_TEXTURES: usize = 32;
-pub const K_NUMBER_OF_VERTEX_SAMPLERS: usize = 4;
-pub const K_NUMBER_OF_VERTEX_TEXTURES: usize = 4;
-pub const K_NUMBER_OF_COMPUTE_SAMPLERS: usize = 4;
-pub const K_NUMBER_OF_COMPUTE_TEXTURES: usize = 4;
 pub const K_NUMBER_OF_COLOR_SURFACES: usize = 4;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum Platform {
-    Xenon = 0,
-    Dx9 = 1,
-    Durango = 2,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum PresentationInterval {
-    Default = 0,
-    One,
-    Two,
-    Three,
-    Four,
-    Immediate,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(i32)]
@@ -63,14 +38,6 @@ pub enum SeparateAlphaBlendMode {
     Additive,
     Multiply,
     ToConstant,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum FirstPersonMode {
-    Never = 0,
-    Sometimes,
-    Always,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -113,12 +80,6 @@ pub enum StencilMode {
 
 /// Bitflags for `set_color_write_enable`. Default = all channels.
 pub mod color_write_enable {
-    pub const NONE: u32 = 0;
-    pub const RED: u32 = 1;
-    pub const GREEN: u32 = 2;
-    pub const BLUE: u32 = 4;
-    pub const ALPHA: u32 = 8;
-    pub const COLOR: u32 = 7; // RGB
     pub const ALL: u32 = 15;
 }
 
@@ -140,55 +101,6 @@ pub enum FillMode {
     Solid = 3,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[repr(i32)]
-pub enum SamplerAddressMode {
-    #[default]
-    Wrap = 0,
-    Clamp,
-    Mirror,
-    Border,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[repr(i32)]
-pub enum SamplerFilterMode {
-    #[default]
-    Trilinear = 0,
-    Point,
-    Bilinear,
-    Anisotropic1,
-    Anisotropic2,
-    Anisotropic3,
-    Anisotropic4,
-    /// `_sampler_filter_lightprobe_texture_array` —
-    /// `D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT` per dllcache's
-    /// `d3d11_sampler_state_cache::get`.
-    LightprobeTextureArray,
-}
-
-pub const SAMPLER_CLEAR_ALL_TEXTURES: u32 = 0xFFFF;
-pub const SAMPLER_MIP_BIAS_NONE: u32 = 8;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum GprAllocation {
-    DefaultD3d = 0,
-    Default,
-    MaxToPixelShader,
-    MaxToVertexShader,
-    AllToVertexShader,
-    DecoratorAllocation,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum TessellationMode {
-    Discrete = 0,
-    Continues,
-    PerEdge,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum SplitscreenRes {
@@ -196,15 +108,6 @@ pub enum SplitscreenRes {
     HalfWidth,
     HalfSize,
     EightByThreeHalfHeight,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum RenderMode {
-    Default = 0,
-    Mode7e3,
-    Gamma2,
-    XRgb,
 }
 
 /// Mirror of `c_rasterizer::e_surface` (engine `g_surface_group_descriptions`
@@ -276,19 +179,3 @@ pub enum Surface {
 }
 
 pub const K_NUMBER_OF_SURFACES: usize = 56;
-pub const K_SURFACE_AUX_EXPOSURE_COUNT: usize = 8;
-
-impl Surface {
-    /// Alias — mirrors engine's `_surface_occlusion = 2` (same value as
-    /// `_surface_shadow_1`). Engine overloads the slot for both
-    /// shadow generation and occlusion queries.
-    pub const OCCLUSION: Surface = Surface::Shadow1;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum BufferGammaMode {
-    TrueSrgb = 0,
-    PiecewiseLinearSrgb,
-    Mode7e3,
-}

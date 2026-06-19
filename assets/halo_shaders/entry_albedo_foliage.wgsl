@@ -117,7 +117,8 @@ fn fs_main(in: VertexOutput) -> FsOut {
     // here). wgpu doesn't expose ATOC cleanly, so we clip on the
     // alpha_test_map.a value at threshold 0.5 to match the DX11
     // codepath in `alpha_test_fx.hlsl:36-40`.
-    let alpha = textureSample(alpha_test_map, alpha_test_map_sampler, in.tex_coords).a;
+    // HLSL alpha_test_fx.hlsl:20 — alpha sampled through transform_texcoord.
+    let alpha = textureSample(alpha_test_map, alpha_test_map_sampler, transform_texcoord(in.tex_coords, material.alpha_test_map_xform)).a;
     if (alpha < FOLIAGE_ALPHA_THRESHOLD) {
         discard;
     }

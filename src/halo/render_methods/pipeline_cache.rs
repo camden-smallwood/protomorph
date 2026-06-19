@@ -15,8 +15,8 @@ use std::rc::Rc;
 use blam_tags::render_method::{ResolvedCbuffer, ResolvedRenderMethod};
 
 use crate::halo::render_methods::{
-    assemble, cbuffer::CbufferLayout, material_bindings::MaterialBindings, CategoryChoices,
-    HaloEntryPoint, VariantKey,
+    assemble_with, cbuffer::CbufferLayout, material_bindings::MaterialBindings,
+    material_samplers::MaterialSamplerMap, CategoryChoices, HaloEntryPoint, VariantKey,
 };
 use crate::halo::geometry::ModelVertex;
 use crate::halo::render::shared::SharedResources;
@@ -82,25 +82,35 @@ impl HaloPipelineCache {
         entry_point: HaloEntryPoint,
         tags_root: &std::path::Path,
     ) -> Rc<VariantArtifacts> {
-        let key = VariantKey::from_resolved(resolved, entry_point, choices);
+        // Compute the per-material bindings + sampler map ONCE: they
+        // drive both the cube-mask / sampler-signature components of the
+        // cache key AND (on a miss) the assembled WGSL. Reusing the same
+        // instances avoids a second bitm-tag read inside `assemble`.
+        let bindings = MaterialBindings::from_resolved(resolved, tags_root);
+        let sampler_map = MaterialSamplerMap::from_resolved(resolved, &bindings);
+        let key = VariantKey::from_resolved(
+            resolved, entry_point, choices, cbuffer, &bindings, &sampler_map,
+        );
         if let Some(a) = self.artifacts.get(&key) {
             return a.clone();
         }
         eprintln!(
-            "[halo_pipeline] new variant {:?} group={} choices={:?} (cache size → {})",
+            "[halo_pipeline] new variant {:?} group={} choices={:?} \
+             cube_mask={:#x} sampler_sig={:#x} (cache size → {})",
             entry_point,
             std::str::from_utf8(&resolved.group_tag.to_be_bytes()).unwrap_or("????"),
             choices.pairs(),
+            key.cube_mask,
+            key.sampler_signature,
             self.artifacts.len() + 1,
         );
-        let artifacts = build_variant(shared, resolved, cbuffer, choices, entry_point, tags_root);
+        let artifacts = build_variant(
+            shared, resolved, cbuffer, choices, entry_point,
+            bindings, sampler_map,
+        );
         let rc = Rc::new(artifacts);
         self.artifacts.insert(key, rc.clone());
         rc
-    }
-
-    pub fn len(&self) -> usize {
-        self.artifacts.len()
     }
 }
 
@@ -110,9 +120,12 @@ fn build_variant(
     cbuffer: &ResolvedCbuffer,
     choices: &CategoryChoices,
     entry_point: HaloEntryPoint,
-    tags_root: &std::path::Path,
+    bindings: MaterialBindings,
+    sampler_map: MaterialSamplerMap,
 ) -> VariantArtifacts {
-    let assembled = assemble(resolved, cbuffer, choices, entry_point, tags_root);
+    let assembled = assemble_with(
+        resolved, cbuffer, choices, entry_point, bindings, sampler_map,
+    );
     let shader = shared.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("halo_albedo_variant"),
         source: wgpu::ShaderSource::Wgsl(assembled.wgsl.into()),

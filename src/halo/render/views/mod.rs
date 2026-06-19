@@ -10,5 +10,5 @@
 pub mod lights_view;
 pub mod render_player_view;
 
-pub use lights_view::{LightsView, SimpleLight};
+pub use lights_view::LightsView;
 pub use render_player_view::PlayerView;

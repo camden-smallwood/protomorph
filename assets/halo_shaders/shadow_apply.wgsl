@@ -63,6 +63,11 @@ struct ShadowApplyUniforms {
     /// `(quality_mode, _, _, _)` — kernel selector. 0=default 3×3, 1=fancy
     /// 5×5, 2=faster 2×2. Cast to u32 by truncation in fs_main.
     pcf_quality: vec4<f32>,
+    /// `(eye_world.xyz, 1.0)` — camera world position. Used as the
+    /// `view_point` for `compute_scattering`, so the shadow stamp tints
+    /// toward the SAME atmospheric inscatter the forward pass applied at
+    /// this pixel's depth (engine `shadow_apply_hlsl.hlsl:211` inscatter).
+    camera_world: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> u: ShadowApplyUniforms;
@@ -72,6 +77,109 @@ struct ShadowApplyUniforms {
 @group(0) @binding(4) var shadow_sampler: sampler_comparison;
 @group(0) @binding(5) var receiver_normal: texture_2d<f32>;
 @group(0) @binding(6) var normal_sampler: sampler;
+
+// ─── Atmosphere fog inscatter (engine `shadow_apply_hlsl.hlsl:210-217`) ───
+// The engine emits `inscatter * g_exposure.rrr` as the shadow stamp color,
+// NOT black: with the alpha-blend `Src*(1-darken) + Dst*darken`, this
+// preserves the fog inscatter on shadowed pixels (the shadow darkens only
+// the `lit*extinction` term). Engine packs inscatter as a depth-linear
+// near/far fit of `c_atmosphere_fog_interface::compute_scattering` (dllcache
+// `submit_visibility_and_render @ 0x1806BB7A0` → `compute_scattering @
+// 0x1803AF020`); since we already reconstruct world position below, we call
+// `compute_scattering(camera, world)` directly — exact match to the forward
+// pass instead of a linear approximation, so shadowed fog == unshadowed fog.
+//
+// `EngineAtmosphereRaw` + `EngineExposure` layouts mirror
+// `engine_bindings.wgsl` (same `GpuAtmosphereData` / `GpuEngineExposure`
+// source buffers bound by the renderer).
+const k_log2_e: f32 = 1.4426950;
+
+struct EngineAtmosphereRaw {
+    slot0_sun_dir_dist_bias: vec4<f32>,
+    slot1_sun_int_norm_thickness: vec4<f32>,
+    slot2_beta_m_log2e_g1: vec4<f32>,
+    slot3_beta_p_log2e_refh: vec4<f32>,
+    slot4_beta_m_angular_mieh: vec4<f32>,
+    slot5_beta_p_angular_rayh: vec4<f32>,
+    slot6_g2: vec4<f32>,
+    slot7_sun_disc: vec4<f32>,
+    slot8_sun_glow: vec4<f32>,
+    slot9_sun_tint_horizon: vec4<f32>,
+    slot10_horizon_pad: vec4<f32>,
+}
+@group(0) @binding(7) var<uniform> engine_atmosphere_raw: EngineAtmosphereRaw;
+
+struct EngineExposure {
+    g_exposure: vec4<f32>,
+    g_alt_exposure: vec4<f32>,
+}
+@group(0) @binding(8) var<uniform> engine_exposure: EngineExposure;
+
+// Verbatim port of `atmosphere_fx.hlsl::compute_scattering` (same as
+// `atmosphere_fx.wgsl`, used by every opaque forward entry point). Returns
+// the in-scatter radiance at `world_scene_point` viewed from `view_point`.
+fn shadow_inscatter(view_point: vec3<f32>, world_scene_point: vec3<f32>) -> vec3<f32> {
+    let r = engine_atmosphere_raw;
+    let sun_direction = r.slot0_sun_dir_dist_bias.xyz;
+    let distance_bias = r.slot0_sun_dir_dist_bias.w;
+    let sun_intensity_normalized = r.slot1_sun_int_norm_thickness.xyz;
+    let max_fog_thickness = r.slot1_sun_int_norm_thickness.w;
+    let beta_m_log2e = r.slot2_beta_m_log2e_g1.xyz;
+    let mie_g_plus_one = r.slot2_beta_m_log2e_g1.w;
+    let beta_p_log2e = r.slot3_beta_p_log2e_refh.xyz;
+    let reference_height = r.slot3_beta_p_log2e_refh.w;
+    let beta_m_angular = r.slot4_beta_m_angular_mieh.xyz;
+    let mie_height_scale = r.slot4_beta_m_angular_mieh.w;
+    let beta_p_angular = r.slot5_beta_p_angular_rayh.xyz;
+    let rayleigh_height_scale = r.slot5_beta_p_angular_rayh.w;
+    let mie_g_times_two = r.slot6_g2.x;
+
+    // Atmosphere disabled (slot1.w negative) → no fog.
+    if (max_fog_thickness < 0.0) {
+        return vec3<f32>(0.0);
+    }
+
+    var view_vector = view_point - world_scene_point;
+    var dist = length(view_vector);
+    if (dist < 1e-6) {
+        return vec3<f32>(0.0);
+    }
+    view_vector = view_vector / dist;
+    let c_theta = -dot(view_vector, sun_direction);
+
+    dist = max(dist + distance_bias, 0.0);
+    dist = min(dist, max_fog_thickness);
+
+    var view_height = max(view_point.z - reference_height, 0.0);
+    var scene_height = max(world_scene_point.z - reference_height, 0.0);
+    let diff = view_height - scene_height;
+
+    view_height = view_height * k_log2_e;
+    scene_height = scene_height * k_log2_e;
+
+    let mie_h = max(mie_height_scale, 1e-4);
+    let ray_h = max(rayleigh_height_scale, 1e-4);
+
+    var extinction: vec3<f32>;
+    if (diff * diff > 0.001) {
+        let dp = -(exp2(-view_height / mie_h) - exp2(-scene_height / mie_h)) * dist * mie_h / diff;
+        let dm = -(exp2(-view_height / ray_h) - exp2(-scene_height / ray_h)) * dist * ray_h / diff;
+        extinction = exp2(-(beta_m_log2e * dm + beta_p_log2e * dp));
+    } else {
+        let dp = exp2(-view_height / mie_h) * dist;
+        let dm = exp2(-view_height / ray_h) * dist;
+        extinction = exp2(-(beta_m_log2e * dm + beta_p_log2e * dp));
+    }
+
+    let beta_m_theta = beta_m_angular * (1.0 + c_theta * c_theta);
+    let heyey_term = mie_g_plus_one - mie_g_times_two * c_theta;
+    let heyey_term_one_pt_five = pow(max(heyey_term, 1e-4), -1.5);
+    let beta_p_theta = beta_p_angular * heyey_term_one_pt_five;
+
+    return sun_intensity_normalized
+        * (beta_m_theta + beta_p_theta)
+        * (vec3<f32>(1.0) - extinction);
+}
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -319,11 +427,35 @@ fn fs_main(in: VsOut) -> AccumPixel {
     darken = darken * darken;
     let stamp_alpha = 1.0 - darken;
 
-    // Output: alpha-blend (SrcAlpha, OneMinusSrcAlpha) with rgb=0 darkens
-    // toward black by `stamp_alpha`. Engine emits `inscatter * exposure`
-    // here instead of black; we use straight black until atmosphere-aware
-    // shadow-color modulation lands. Same value to both RT0 and RT1
-    // since DARK_COLOR_MULTIPLIER = 1.0 on PC.
-    let v = vec4<f32>(0.0, 0.0, 0.0, stamp_alpha);
+    // Output: alpha-blend (SrcAlpha, OneMinusSrcAlpha). Engine
+    // `shadow_apply_hlsl.hlsl:217` emits `inscatter * g_exposure.rrr` as the
+    // stamp color (NOT black). With this blend the result is
+    //   inscatter*exposure*(1-darken) + Dst*darken
+    //   = exposure * (lit*darken*extinction + inscatter)
+    // i.e. the shadow darkens only the lit*extinction term and the
+    // atmospheric inscatter is preserved — so shadows in fog keep the fog
+    // color instead of crushing to pure black. `inscatter` is recomputed
+    // per-pixel here (camera → reconstructed world) so it matches exactly
+    // what the forward opaque pass added at this pixel. Same value to both
+    // RT0 and RT1 since DARK_COLOR_MULTIPLIER = 1.0 on PC.
+    let inscatter = shadow_inscatter(u.camera_world.xyz, world);
+    // Sanitize the stamp color. The frustum culls above use comparisons on
+    // `light_ndc`, which are all FALSE when `world` is non-finite (NaN/Inf
+    // compares false) — so sky / far-plane pixels, whose depth reconstructs
+    // to a degenerate (w≈0) `world` and thus an Inf position, slip through to
+    // here. `shadow_inscatter` then returns NaN (Inf/Inf in the view-vector
+    // normalize) or −Inf (negative optical depth → extinction overflow), and
+    // the alpha blend does `Src.rgb * SrcAlpha` → `NaN * alpha = NaN`, which
+    // poisons the whole stamp quad to opaque black (the regression boxes over
+    // sky). `clamp` is built on fmin/fmax, which are NaN-suppressing on Metal
+    // (return the finite operand), so this maps NaN→0 and −Inf→0 — exactly the
+    // harmless `rgb=0` the stamp used before inscatter tinting — while leaving
+    // real receiver pixels' finite inscatter untouched. 65504 = max half-float.
+    let stamp_rgb = clamp(
+        inscatter * engine_exposure.g_exposure.x,
+        vec3<f32>(0.0),
+        vec3<f32>(65504.0),
+    );
+    let v = vec4<f32>(stamp_rgb, stamp_alpha);
     return AccumPixel(v, v);
 }

@@ -92,7 +92,6 @@ fn force_xform_slot(cb: &mut blam_tags::render_method::ResolvedCbuffer, name: &s
 /// the WGSL is a fixed 4-layer body, so missing slots get filled with
 /// neutral defaults (identity xform / 1.0 diffuse / 0.0 specular).
 pub fn pad_terrain_cbuffer(cb: &mut blam_tags::render_method::ResolvedCbuffer) {
-    const IDENTITY_XFORM: [f32; 4] = [1.0, 1.0, 0.0, 0.0];
     const DEFAULT_DIFFUSE: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
     const DEFAULT_SPEC_POWER: [f32; 4] = [16.0, 0.0, 0.0, 0.0];
     const DEFAULT_SPEC_TINT: [f32; 4] = [0.5, 0.5, 0.5, 0.0];
@@ -174,6 +173,10 @@ pub fn pad_foliage_cbuffer(
     // world units. Tag-authored value (when present) wins via the
     // ensure_slot "first writer wins" semantics.
     ensure_slot(cb, "animation_amplitude_horizontal", false, [0.05, 0.0, 0.0, 0.0]);
+    // Foliage entries alpha-test inline through `transform_texcoord(uv,
+    // alpha_test_map_xform)` (alpha_test_fx.hlsl:20); guarantee the xform
+    // slot so the WGSL compiles — identity when the rmt2 didn't route it.
+    force_xform_slot(cb, "alpha_test_map");
 }
 
 /// Pad an rmd (`shader_decal`) cbuffer with the xform slots the decal
@@ -253,6 +256,17 @@ pub fn pad_rmsh_material_cbuffer(
         // (mid-gray reference for the artist-tuned tint divide); 0.5
         // gives a no-op identity for albedo_color = (0.5, 0.5, 0.5, 1).
         ensure_slot(cb, "neutral_gray", false, [0.5, 0.5, 0.5, 1.0]);
+    }
+    // chameleon (`albedo_fx.hlsl::calc_albedo_chameleon*`). The masked
+    // variants sample `chameleon_mask_map` (and chameleon_albedo_masked
+    // also `base_masked_map`) through `transform_texcoord`, so guarantee
+    // those xform slots exist — identity when the rmt2 didn't route them
+    // (= the prior raw-texcoord behavior), real xform when it did.
+    if matches!(albedo, "chameleon_masked" | "chameleon_albedo_masked") {
+        force_xform_slot(cb, "chameleon_mask_map");
+    }
+    if albedo == "chameleon_albedo_masked" {
+        force_xform_slot(cb, "base_masked_map");
     }
 
     // bump_mapping (`bump_mapping_fx.hlsl`)
@@ -625,11 +639,37 @@ pub fn emit_wgsl(layout: &CbufferLayout, struct_name: &str, group: u32, binding:
     if layout.members.is_empty() {
         out.push_str("    _unused: vec4<f32>,\n");
     } else {
-        // vec4<f32> is 16-byte aligned and sized — sequential members
-        // naturally land at offsets 0, 16, 32, … which is exactly the
-        // rmt2 destination-register order. No explicit @offset required.
-        for m in &layout.members {
+        // Each member is a `vec4<f32>` (16 B, 16-aligned). WGSL has no
+        // `@offset`, so to land each member at its TRUE `byte_offset`
+        // (the rmt2 routing table can be SPARSE or out-of-order, and the
+        // uploaded `mat.cbuffer.bytes` is copied verbatim at those
+        // offsets) we order members by ascending offset and insert
+        // explicit `_padN: vec4<f32>` filler to bridge any 16-byte gap.
+        //
+        // For the common DENSE, ascending case (offsets 0,16,32,…) the
+        // cursor already matches each member's offset → zero padding
+        // emitted → byte-identical to the old sequential output.
+        let mut ordered: Vec<&CbufferMember> = layout.members.iter().collect();
+        ordered.sort_by_key(|m| m.byte_offset);
+        let mut cursor: u32 = 0;
+        let mut pad_n: u32 = 0;
+        for m in ordered {
+            // Skip slots whose offset exceeds the uploaded buffer (the
+            // layout builder drops these; defensive guard mirrors that).
+            if m.byte_offset >= layout.total_size {
+                continue;
+            }
+            // Bridge the gap from the cursor up to this member's offset
+            // with 16-byte vec4 padding members. Offsets are 16-aligned
+            // by construction; round up defensively so a non-16 offset
+            // can't desync the cursor.
+            while cursor + 16 <= m.byte_offset {
+                out.push_str(&format!("    _pad{}: vec4<f32>,\n", pad_n));
+                pad_n += 1;
+                cursor += 16;
+            }
             out.push_str(&format!("    {}: vec4<f32>,\n", m.name));
+            cursor += 16;
         }
     }
     out.push_str("}\n");
@@ -638,4 +678,118 @@ pub fn emit_wgsl(layout: &CbufferLayout, struct_name: &str, group: u32, binding:
         group, binding, struct_name,
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(name: &str, byte_offset: u32) -> CbufferMember {
+        CbufferMember { name: name.to_string(), byte_offset }
+    }
+
+    /// Resolve the byte offset of each NAMED (non-pad) member from the
+    /// emitted WGSL struct body: every member is a `vec4<f32>` (16 B),
+    /// so a member's offset is `16 * (number of fields before it)`.
+    fn offsets_in_emitted(wgsl: &str) -> std::collections::HashMap<String, u32> {
+        let mut out = std::collections::HashMap::new();
+        let mut field_index: u32 = 0;
+        let mut in_struct = false;
+        for line in wgsl.lines() {
+            let t = line.trim();
+            if t.starts_with("struct ") {
+                in_struct = true;
+                continue;
+            }
+            if in_struct && t.starts_with('}') {
+                break;
+            }
+            if in_struct {
+                if let Some((name, _)) = t.split_once(':') {
+                    let name = name.trim();
+                    if !name.starts_with("_pad") {
+                        out.insert(name.to_string(), field_index * 16);
+                    }
+                    field_index += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// B6: a SPARSE + OUT-OF-ORDER routing table must place each named
+    /// member at its true `byte_offset` via explicit padding, not at
+    /// `N*16` by declaration order.
+    #[test]
+    fn sparse_out_of_order_offsets_are_honored() {
+        // Routing table (out of order, with a 16-byte gap at offset 16):
+        //   color       @ 32
+        //   base_xform  @ 0
+        //   tint        @ 48
+        // Offset 16 is unused → must become a `_pad` filler.
+        let layout = CbufferLayout {
+            members: vec![
+                member("color", 32),
+                member("base_xform", 0),
+                member("tint", 48),
+            ],
+            total_size: 64,
+        };
+        let wgsl = emit_wgsl(&layout, "MaterialParameters", 2, 5);
+        let offsets = offsets_in_emitted(&wgsl);
+        assert_eq!(offsets.get("base_xform"), Some(&0), "wgsl:\n{wgsl}");
+        assert_eq!(offsets.get("color"), Some(&32), "wgsl:\n{wgsl}");
+        assert_eq!(offsets.get("tint"), Some(&48), "wgsl:\n{wgsl}");
+        // The gap at 16 must be filled by exactly one pad member.
+        assert_eq!(wgsl.matches("_pad").count(), 1, "wgsl:\n{wgsl}");
+    }
+
+    /// B6 no-op guarantee: a DENSE, ascending layout (0,16,32,…) emits
+    /// no padding members — byte-identical placement to the old
+    /// sequential output.
+    #[test]
+    fn dense_layout_emits_no_padding() {
+        let layout = CbufferLayout {
+            members: vec![
+                member("a", 0),
+                member("b", 16),
+                member("c", 32),
+            ],
+            total_size: 48,
+        };
+        let wgsl = emit_wgsl(&layout, "MaterialParameters", 2, 5);
+        assert!(!wgsl.contains("_pad"), "dense layout should not pad:\n{wgsl}");
+        let offsets = offsets_in_emitted(&wgsl);
+        assert_eq!(offsets.get("a"), Some(&0));
+        assert_eq!(offsets.get("b"), Some(&16));
+        assert_eq!(offsets.get("c"), Some(&32));
+    }
+
+    /// The emitted struct (sparse case) must be valid WGSL per naga.
+    #[test]
+    fn sparse_emitted_struct_naga_validates() {
+        let layout = CbufferLayout {
+            members: vec![
+                member("color", 32),
+                member("base_xform", 0),
+                member("tint", 48),
+            ],
+            total_size: 64,
+        };
+        let wgsl = emit_wgsl(&layout, "MaterialParameters", 2, 5);
+        // Reference each field so naga keeps the struct and validates
+        // its layout. Wrap in a trivial entry point.
+        let src = format!(
+            "{wgsl}\n@fragment fn fs() -> @location(0) vec4<f32> {{\n\
+             return material.base_xform + material.color + material.tint;\n}}\n",
+        );
+        let module = naga::front::wgsl::parse_str(&src)
+            .unwrap_or_else(|e| panic!("emitted cbuffer WGSL parse failed: {e:?}\n{src}"));
+        let mut v = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        v.validate(&module)
+            .unwrap_or_else(|e| panic!("emitted cbuffer WGSL validation failed: {e:?}\n{src}"));
+    }
 }

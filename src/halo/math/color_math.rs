@@ -4,15 +4,11 @@
 //! geometry sampler chain. Currently scoped to the subset Phase 7b needs:
 //!
 //! - `real_rgb_lightprobe_from_half`           @ dllcache `0x1803ea110`
-//! - `pixel32_RGBE_platform_unswizzle`         @ dllcache `0x1803ed030`
-//! - `pixel32_RGBE_to_real_rgb_color`          @ dllcache `0x1803ec930`
 //!
 //! Function name + signature from Reach (preserved C++ symbols, e.g.
 //! `?real_rgb_lightprobe_from_half@@YAXPEBUhalf_rgb_lightprobe@@PEAUreal_rgb_lightprobe@@@Z`);
 //! body from tool.exe (`dllcache_play.dll.i64` @ port 13372). The diff
-//! against Reach showed no functional divergence for these three.
-
-use blam_tags::math::RealRgbColor;
+//! against Reach showed no functional divergence.
 
 // =============================================================================
 // half_rgb_lightprobe — `color_math.h:335` (sizeof=56)
@@ -81,109 +77,6 @@ const _: () = assert!(std::mem::size_of::<HalfRgbLightprobeWithDominantLight>() 
 pub use crate::halo::geometry::geometry_sampling::RealRgbLightprobe;
 
 // =============================================================================
-// pixel32_RGBE_platform_unswizzle — `dllcache 0x1803ed030`
-// =============================================================================
-
-/// `pixel32_RGBE_platform_unswizzle(color)` @ dllcache `0x1803ed030`.
-///
-/// Reverses the platform byte-order for an RGBE-encoded ARGB pixel and, on
-/// non-Xbox-360 platforms, subtracts 127 from each byte (signed-RGBE bias
-/// removal). On Xbox 360 path the bytes pass through unchanged before the
-/// byte reversal.
-///
-/// Engine returns `__int64` but only uses the low 32 bits; we use `u32`.
-pub fn pixel32_rgbe_platform_unswizzle(color: u32) -> u32 {
-    // Engine reads the four bytes via HIBYTE / BYTE2 / BYTE1 / LOBYTE, then
-    // either subtracts 127 (PC) or leaves them alone (Xbox 360), then
-    // rebuilds as ((HIBYTE << 24) | (LOBYTE << 16) | (BYTE1 << 8) | BYTE2).
-    // That is: it swaps R↔B (bytes 0 and 2) while keeping G and A in place.
-    let mut byte0 = (color & 0xFF) as u8; // LOBYTE
-    let mut byte1 = ((color >> 8) & 0xFF) as u8;
-    let mut byte2 = ((color >> 16) & 0xFF) as u8;
-    let mut byte3 = ((color >> 24) & 0xFF) as u8; // HIBYTE
-
-    if get_runtime_platform_type() != 0 {
-        // Non-Xbox-360: subtract 127 from each byte (wrap-around mirrors the
-        // engine's `LOBYTE(x) = HIBYTE(color) - 127` truncation).
-        byte0 = byte0.wrapping_sub(127);
-        byte1 = byte1.wrapping_sub(127);
-        byte2 = byte2.wrapping_sub(127);
-        byte3 = byte3.wrapping_sub(127);
-    }
-
-    // Reassemble: ((byte3 << 24) | (byte0 << 16) | (byte1 << 8) | byte2)
-    (byte2 as u32)
-        | ((byte1 as u32) << 8)
-        | ((byte0 as u32) << 16)
-        | ((byte3 as u32) << 24)
-}
-
-// =============================================================================
-// pixel32_RGBE_to_real_rgb_color — `dllcache 0x1803ec930`
-// =============================================================================
-
-/// `pixel32_RGBE_to_real_rgb_color(pixel, &color, values_can_be_negative)`
-/// @ dllcache `0x1803ec930`.
-///
-/// Decodes a 32-bit RGBE-encoded pixel into a 3-channel float color.
-///
-/// Encoding (matches the engine derivation exactly):
-/// - byte 0 (lo) = R mantissa
-/// - byte 1      = G mantissa
-/// - byte 2      = B mantissa
-/// - byte 3 (hi) = E exponent
-/// - `values_can_be_negative=true`  → mantissas in `[-1,1]` via `i8/127`,
-///   exponent treated as signed (`int8 e * (1/4)` → `2^(e/4)` scale).
-/// - `values_can_be_negative=false` → mantissas in `[0,1]` via `u8/255`,
-///   exponent biased by 127 (`u8 e * (1/4) - 31.75` → `2^((e-127)/4)`).
-///
-/// Output stored into `color->n[0..2]` (R, G, B). Engine returns the
-/// pointer; we return `()` and write through `&mut`.
-pub fn pixel32_rgbe_to_real_rgb_color(
-    pixel: u32,
-    color: &mut RealRgbColor,
-    values_can_be_negative: bool,
-) {
-    let r;
-    let g;
-    let b;
-    let exponent_y: f32;
-
-    if values_can_be_negative {
-        // Signed: SHIBYTE/SBYTE* — each byte is sign-extended (i8). Engine
-        // scales the exponent byte by 0.0078740157 (=1/127), then multiplies
-        // by 127.0/2² = 31.75 → net = i8 / 4.
-        let s3 = (pixel >> 24) as i8 as f32;
-        let s2 = (pixel >> 16) as i8 as f32;
-        let s1 = (pixel >> 8) as i8 as f32;
-        let s0 = pixel as i8 as f32;
-        r = s0 * 0.007_874_015_7;
-        g = s1 * 0.007_874_015_7;
-        b = s2 * 0.007_874_015_7;
-        let v4 = s3 * 0.007_874_015_7;
-        exponent_y = 31.75 * v4;
-    } else {
-        // Unsigned: bytes are u8 in [0,1]. Exponent biased by 127.
-        // Engine: Y = (255/4) * (e/255) - (127/4) = e/4 - 31.75.
-        let u3 = ((pixel >> 24) & 0xFF) as f32;
-        let u2 = ((pixel >> 16) & 0xFF) as f32;
-        let u1 = ((pixel >> 8) & 0xFF) as f32;
-        let u0 = (pixel & 0xFF) as f32;
-        r = u0 * 0.003_921_568_9;
-        g = u1 * 0.003_921_568_9;
-        b = u2 * 0.003_921_568_9;
-        let v12 = u3 * 0.003_921_568_9;
-        // 1.0 / pow(2.0, 2.0) = 0.25; 0.25 * 255.0 = 63.75; 0.25 * 127.0 = 31.75.
-        exponent_y = 63.75 * v12 - 31.75;
-    }
-
-    let scale = 2.0_f32.powf(exponent_y);
-    color.red = r * scale;
-    color.green = g * scale;
-    color.blue = b * scale;
-}
-
-// =============================================================================
 // real_rgb_lightprobe_from_half — `dllcache 0x1803ea110`
 // =============================================================================
 
@@ -219,18 +112,6 @@ pub fn real_rgb_lightprobe_from_half(probe: &HalfRgbLightprobe, result: &mut Rea
     result.blue_terms.copy_from_slice(&result_floats[18..]);
 }
 
-// =============================================================================
-// get_runtime_platform_type — engine global
-// =============================================================================
-//
-// Engine exports an `e_runtime_platform_type` enum (0 = xbox360, !=0 = PC).
-// Protomorph always runs on PC. Stubbed here as a local constant so the
-// RGBE unswizzle picks the PC code path; if a Durango/Scorpio runtime
-// path is ever ported we re-route this through a real getter.
-const fn get_runtime_platform_type() -> u32 {
-    1 // _runtime_platform_not_xbox
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,41 +137,5 @@ mod tests {
             assert!((decoded.green_terms[i] - expected_g).abs() < 1e-6);
             assert!((decoded.blue_terms[i] - expected_b).abs() < 1e-6);
         }
-    }
-
-    /// White unsigned RGBE at exponent 128 (= 1.0 scale) should produce
-    /// approximately (1, 1, 1).
-    #[test]
-    fn pixel32_rgbe_unsigned_white_at_unit_scale() {
-        let mut c = RealRgbColor::default();
-        // R=255, G=255, B=255, E=128 → mantissas 1.0, exponent (128-127)/4 = 0.25 → scale = 2^0.25 ≈ 1.189
-        pixel32_rgbe_to_real_rgb_color(0x80FFFFFF, &mut c, false);
-        let s = 2.0_f32.powf(0.25);
-        assert!((c.red - s).abs() < 1e-4);
-        assert!((c.green - s).abs() < 1e-4);
-        assert!((c.blue - s).abs() < 1e-4);
-    }
-
-    /// Signed mode: exponent byte 0 gives scale 1.0; mantissa 127 → 1.0.
-    #[test]
-    fn pixel32_rgbe_signed_zero_exponent() {
-        let mut c = RealRgbColor::default();
-        // R=127 (=+1.0), G=-127 (=-1.0), B=64 (~+0.5), E=0 (=scale 1.0)
-        let pixel: u32 = (0u8 as u32) << 24 | (64u8 as u32) << 16 | (((-127i8 as u8) as u32) << 8) | (127u8 as u32);
-        pixel32_rgbe_to_real_rgb_color(pixel, &mut c, true);
-        assert!((c.red - 1.0).abs() < 1e-3, "red={}", c.red);
-        assert!((c.green - (-1.0)).abs() < 1e-3, "green={}", c.green);
-        assert!((c.blue - (64.0 / 127.0)).abs() < 1e-3, "blue={}", c.blue);
-    }
-
-    /// Platform unswizzle on PC swaps R↔B and subtracts 127 from each byte.
-    #[test]
-    fn pixel32_rgbe_unswizzle_pc_swaps_red_blue_with_bias() {
-        let input: u32 = 0xAABBCCDD; // A=AA, B=BB, G=CC, R=DD
-        let out = pixel32_rgbe_platform_unswizzle(input);
-        // After -127 each byte: A=2B, B=3C, G=4D, R=5E. After R↔B swap:
-        // (A=2B << 24) | (R=5E << 16) | (G=4D << 8) | B=3C
-        let expected: u32 = (0x2Bu32 << 24) | (0x5Eu32 << 16) | (0x4Du32 << 8) | 0x3C;
-        assert_eq!(out, expected, "got {:08x} expected {:08x}", out, expected);
     }
 }

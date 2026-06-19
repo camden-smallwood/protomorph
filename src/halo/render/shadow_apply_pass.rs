@@ -7,11 +7,11 @@
 //! 1. Per-caster (object or expensive dynamic light): bind
 //!    `_surface_shadow_1` as depth-stencil, render shadow-casting
 //!    geometry through a per-caster ortho/perspective camera into the
-//!    depth target. Uses `assets/shaders/shadow_generate.wgsl`.
+//!    depth target. Uses `assets/halo_shaders/shadow_generate.wgsl`.
 //! 2. Apply pass: a fullscreen quad samples scene depth, reconstructs
 //!    world position, transforms to light-space, PCF-samples the shadow
 //!    target, and alpha-blends a darkening stamp into the LDR target.
-//!    Uses `assets/shaders/shadow_apply.wgsl`.
+//!    Uses `assets/halo_shaders/shadow_apply.wgsl`.
 //! 3. Repeat for each caster against the same shared 512² target.
 //!
 //! S1 lands the infrastructure (target, shaders, pass skeleton).
@@ -25,25 +25,8 @@
 //!   - `c_rasterizer::setup_targets_shadow_generate @ 0x180671080`
 
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 
 use crate::halo::render::shared::SharedResources;
-
-/// One shadow-cast event the apply pass should stamp. Populated each
-/// frame by the per-object/per-light scheduler (TODO — see plan S1/S4).
-/// The matrix fields mirror engine `Shadow_Projection` (cbuffer slot
-/// `0x2B0000`, 4 vec4) + `CAMERA_TO_SHADOW_*` (`0x2E0000..2`).
-#[derive(Clone, Copy)]
-pub struct ShadowCaster {
-    /// World-to-light-clip matrix used both at generate-time (to write
-    /// the depth target) and at apply-time (to project scene fragments
-    /// into shadow UV space).
-    pub world_to_shadow: glam::Mat4,
-    /// 0..1 fade — multiplied into the stamp alpha at apply-time. Engine
-    /// uses this for distance fade, transition into ambient-only zones,
-    /// etc. Default 1.0 = full shadow.
-    pub opacity: f32,
-}
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable, Debug, Default)]
@@ -62,6 +45,10 @@ struct ShadowApplyUniforms {
     /// 1=fancy 5×5 predicated, 2=faster 2×2 bilinear. Read from
     /// `PROTOMORPH_SHADOW_PCF` env var via `pcf_quality_from_env()`.
     pcf_quality: [f32; 4],
+    /// `(eye_world.xyz, 1.0)` — camera world position; the `view_point`
+    /// for the in-shader `compute_scattering` that tints the shadow stamp
+    /// toward atmospheric inscatter (engine `shadow_apply_hlsl.hlsl:211`).
+    camera_world: [f32; 4],
 }
 
 /// Read `PROTOMORPH_SHADOW_PCF` env var → kernel index.
@@ -165,6 +152,20 @@ pub struct ShadowApplyPass {
     generate_pipeline: wgpu::RenderPipeline,
     generate_uniform: wgpu::Buffer,
     generate_uniform_bg: wgpu::BindGroup,
+
+    /// Alpha-tested caster variant of `generate_pipeline` (vs_main +
+    /// `fs_alpha_test`). Same group-0 layout (so the bound per-caster
+    /// uniform persists across the pipeline switch) plus a group-1
+    /// alpha-test bind group. Drawn for opaque parts whose material has
+    /// `alpha_test != off` so they cast holey shadows.
+    generate_alpha_test_pipeline: wgpu::RenderPipeline,
+    /// @group(1) layout for the alpha-test map + sampler + xform uniform.
+    /// Public via `build_alpha_test_bind_group` so the material loader
+    /// builds one per alpha-tested material.
+    alpha_test_bgl: wgpu::BindGroupLayout,
+    /// Sampler for the alpha-test map (linear + repeat — alpha-test masks
+    /// tile; the xform scale handles the tiling rate).
+    alpha_test_sampler: wgpu::Sampler,
 }
 
 impl ShadowApplyPass {
@@ -232,6 +233,30 @@ impl ShadowApplyPass {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // 7 = engine atmosphere cbuffer (shared.atmosphere_buffer),
+                // 8 = engine exposure cbuffer (shared.engine_exposure_buffer).
+                // Drive the in-scatter tint of the shadow stamp so shadows in
+                // fog keep the fog color instead of going black.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -244,7 +269,7 @@ impl ShadowApplyPass {
         let shader = shared.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadow_apply_wgsl"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../../assets/shaders/shadow_apply.wgsl").into(),
+                include_str!("../../../assets/halo_shaders/shadow_apply.wgsl").into(),
             ),
         });
 
@@ -379,7 +404,7 @@ impl ShadowApplyPass {
         let generate_shader = shared.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadow_generate_wgsl"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../../assets/shaders/shadow_generate.wgsl").into(),
+                include_str!("../../../assets/halo_shaders/shadow_generate.wgsl").into(),
             ),
         });
         let generate_pipeline = shared.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -430,6 +455,98 @@ impl ShadowApplyPass {
             cache: None,
         });
 
+        // ----- Alpha-tested shadow-generate variant -----
+        // @group(1): alpha_test_map (0) + sampler (1) + xform uniform (2).
+        let alpha_test_bgl = shared.device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                label: Some("shadow_generate_alpha_test_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            },
+        );
+        let alpha_test_sampler = shared.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow_generate_alpha_test_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        // Pipeline layout: group 0 = generate_bgl (IDENTICAL to the opaque
+        // pipeline so the per-caster uniform bound by `begin_generate_pass`
+        // stays valid when the caster loop switches to this pipeline),
+        // group 1 = alpha_test_bgl.
+        let generate_alpha_test_layout = shared.device.create_pipeline_layout(
+            &wgpu::PipelineLayoutDescriptor {
+                label: Some("shadow_generate_alpha_test_pipeline_layout"),
+                bind_group_layouts: &[&generate_bgl, &alpha_test_bgl],
+                immediate_size: 0,
+            },
+        );
+        let generate_alpha_test_pipeline = shared.device.create_render_pipeline(
+            &wgpu::RenderPipelineDescriptor {
+                label: Some("shadow_generate_alpha_test_pipeline"),
+                layout: Some(&generate_alpha_test_layout),
+                vertex: wgpu::VertexState {
+                    module: &generate_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[crate::halo::geometry::ModelVertex::layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &generate_shader,
+                    entry_point: Some("fs_alpha_test"),
+                    targets: &[],
+                    compilation_options: Default::default(),
+                }),
+                // Same rasterizer/depth config as the opaque generate pipeline.
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState { constant: 4, slope_scale: 1.5, clamp: 0.0 },
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            },
+        );
+
         Self {
             apply_pipeline,
             apply_bgl,
@@ -443,7 +560,62 @@ impl ShadowApplyPass {
             generate_pipeline,
             generate_uniform,
             generate_uniform_bg,
+            generate_alpha_test_pipeline,
+            alpha_test_bgl,
+            alpha_test_sampler,
         }
+    }
+
+    /// Build a per-material @group(1) bind group for the alpha-tested
+    /// shadow-generate pipeline: the material's `alpha_test_map` view +
+    /// the shared repeat sampler + a uniform holding `alpha_test_map_xform`.
+    /// Called once per alpha-tested material at load. The created uniform
+    /// buffer is kept alive by the returned bind group.
+    pub fn build_alpha_test_bind_group(
+        &self,
+        device: &wgpu::Device,
+        alpha_test_view: &wgpu::TextureView,
+        xform: [f32; 4],
+    ) -> wgpu::BindGroup {
+        use wgpu::util::DeviceExt;
+        let xform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("shadow_alpha_test_xform"),
+            contents: bytemuck::cast_slice(&xform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_alpha_test_bg"),
+            layout: &self.alpha_test_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(alpha_test_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.alpha_test_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: xform_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// The alpha-tested shadow-generate pipeline (vs_main + fs_alpha_test).
+    /// The caster loop switches to this for parts whose material carries a
+    /// `shadow_alpha_test_bg`, after binding it at group 1.
+    pub fn generate_alpha_test_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.generate_alpha_test_pipeline
+    }
+
+    /// The opaque shadow-generate pipeline. `begin_generate_pass` binds it
+    /// initially; the caster loop re-binds it after drawing an alpha-tested
+    /// part (whose group-0 layout is identical, so the per-caster uniform
+    /// stays valid across the switch).
+    pub fn generate_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.generate_pipeline
     }
 
     /// Drop every cached apply bind group. Caller invokes on resize
@@ -526,6 +698,7 @@ impl ShadowApplyPass {
         receiver_normal_view: &wgpu::TextureView,
         camera_view: glam::Mat4,
         camera_projection: glam::Mat4,
+        camera_position: glam::Vec3,
         world_to_shadow: glam::Mat4,
         light_dir_world: glam::Vec3,
         opacity: f32,
@@ -550,6 +723,7 @@ impl ShadowApplyPass {
                 shadow_no_cosine_from_env(),
                 shadow_frustum_only_from_env(),
             ],
+            camera_world: [camera_position.x, camera_position.y, camera_position.z, 1.0],
         };
         // Distinct slot per caster — no clobber across the single submit.
         let slot = caster_index as u64 * SHADOW_CASTER_STRIDE;
@@ -604,6 +778,29 @@ impl ShadowApplyPass {
                     wgpu::BindGroupEntry {
                         binding: 6,
                         resource: wgpu::BindingResource::Sampler(&self.normal_sampler),
+                    },
+                    // Atmosphere + exposure cbuffers: stable buffer objects
+                    // (re-written each frame), so not folded into the cache
+                    // key. Feed the shadow-stamp inscatter tint.
+                    //
+                    // The atmosphere buffer is a per-frame TABLE (256-byte
+                    // stride). Offset 0 = the frame-default camera-blended
+                    // atmosphere — engine-faithful: the shadow-apply inscatter
+                    // is computed from `m_default_parameters` (a single fit for
+                    // the whole fullscreen pass), not per-receiver fog.
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &shared.atmosphere_buffer,
+                            offset: 0,
+                            size: std::num::NonZeroU64::new(
+                                crate::halo::render::shared::ATMOSPHERE_STRIDE as u64,
+                            ),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: shared.engine_exposure_buffer.as_entire_binding(),
                     },
                 ],
             }),
@@ -673,49 +870,6 @@ pub fn shadow_resolution_for_caster(
     res.round() as u32
 }
 
-/// Build a basic ortho world-to-shadow matrix for an OBB-bounded
-/// caster. `light_dir` points TOWARD the light; the matrix projects
-/// world points into [-1, 1] light-clip space along that axis.
-///
-/// Engine equivalent: `c_lightmap_shadows_view::setup_camera @
-/// 0x1806BB...` builds an ortho camera through the caster's
-/// `projection_bounds` (a 3-basis OBB) toward the dominant light.
-/// This sphere-bound version is preserved as a fallback for callers
-/// without an AABB; new code should prefer [`build_caster_obb_ortho`]
-/// which projects the 8 AABB corners into light-space for tight
-/// non-spherical bounds.
-pub fn build_caster_ortho(
-    caster_center: glam::Vec3,
-    caster_extents: glam::Vec3,
-    light_dir: glam::Vec3,
-) -> glam::Mat4 {
-    // Build a light-space basis. Choose `up` perpendicular to light_dir.
-    let forward = -light_dir.normalize_or_zero();
-    let up_world = if forward.z.abs() < 0.99 {
-        glam::Vec3::Z
-    } else {
-        glam::Vec3::Y
-    };
-    let right = forward.cross(up_world).normalize_or_zero();
-    let up = right.cross(forward).normalize_or_zero();
-
-    // Half-size of the ortho box. The loop passes `splat(shadow_radius)`
-    // (= 3× the bounding-sphere radius, per `object_shadow_get_potential_
-    // bounds @ 0x1806BAAD0`). Take the max extent → a cube of that
-    // half-size (~6r across). Using `.length()` instead circumscribed the
-    // sphere with a cube of half-size `radius·√3 ≈ 5.2r` — ~1.7× too loose
-    // on every axis, so the caster's silhouette covered ~3× fewer shadow-
-    // map texels → blurry. `max_element` packs the caster into far more
-    // depth texels (sharper) while still covering the 3× ground bound.
-    let radius = caster_extents.max_element();
-    let eye = caster_center - forward * radius;
-    let view = glam::Mat4::look_at_rh(eye, caster_center, up);
-    let proj = glam::Mat4::orthographic_rh(
-        -radius, radius, -radius, radius, 0.01, radius * 2.5,
-    );
-    proj * view
-}
-
 /// Build a tight light-aligned ortho world-to-shadow matrix for a
 /// caster whose model-space AABB is `(aabb_min, aabb_max)` transformed
 /// to world space by `model_matrix`. Engine-faithful equivalent of
@@ -724,8 +878,8 @@ pub fn build_caster_ortho(
 /// the per-axis min/max, and build the camera frustum from those tight
 /// extents instead of an inflated bounding-sphere cube.
 ///
-/// Visible win over [`build_caster_ortho`]: for elongated objects
-/// (crates, weapon racks, etc.) the perpendicular axes shrink, raising
+/// For elongated objects (crates, weapon racks, etc.) the
+/// perpendicular axes shrink, raising
 /// effective shadow resolution along the long axis without changing
 /// the output target size.
 pub fn build_caster_obb_ortho(

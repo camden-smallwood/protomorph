@@ -230,15 +230,6 @@ impl SStaticIndexQueue {
         Self { read: 0, write: 0, indices: [0; STATIC_INDEX_QUEUE_CAPACITY] }
     }
 
-    /// `c_static_index_queue<short,256>::valid @ 0x18050C890`. Engine
-    /// validates the queue's internal counters are coherent.
-    pub fn valid(&self) -> bool {
-        self.read >= 0
-            && (self.read as usize) <= STATIC_INDEX_QUEUE_CAPACITY
-            && self.write >= 0
-            && (self.write as usize) <= STATIC_INDEX_QUEUE_CAPACITY
-    }
-
     /// `empty @ 0x18050C320`. Returns `true` iff `read == write`.
     pub fn empty(&self) -> bool {
         self.read == self.write

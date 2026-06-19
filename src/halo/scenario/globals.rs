@@ -20,18 +20,6 @@ pub fn set_global_scenario(scenario: Arc<Scenario>) {
     *GLOBAL_SCENARIO.write().unwrap() = Some(scenario);
 }
 
-/// Clear the global pointer (e.g. between scenario reloads).
-pub fn clear_global_scenario() {
-    *GLOBAL_SCENARIO.write().unwrap() = None;
-}
-
-/// Borrow the loaded scenario via `Arc::clone`. Returns `None` before
-/// any scenario has been loaded. The returned handle is cheap to drop
-/// — refcount bump only.
-pub fn get_global_scenario() -> Option<Arc<Scenario>> {
-    GLOBAL_SCENARIO.read().unwrap().clone()
-}
-
 /// Convenience accessor for `global_scenario->local_north` (radians).
 /// Drives `object_compute_function_value` case `compass` (engine sid
 /// 500). Returns 0.0 when no scenario is loaded.

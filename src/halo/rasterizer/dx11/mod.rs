@@ -26,4 +26,4 @@ pub use depth_stencil_state_cache::DepthStencilStateCache;
 pub use input_layout_cache::InputLayoutCache;
 pub use rasterizer_state_cache::RasterizerStateCache;
 pub use sampler_state_cache::{SamplerKey, SamplerStateCache};
-pub use shader_constants::{CbufferPool, CbufferSlot, K_NUMBER_OF_CBUFFERS};
+pub use shader_constants::CbufferPool;

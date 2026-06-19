@@ -27,6 +27,12 @@ use blam_tags::structure_bsp::{Bsp3d, BspCollisionMaterial, BspInstance, BspInst
 
 use blam_tags::math::RealMatrix4x3;
 
+use crate::halo::math::matrix_math::{
+    matrix4x3_inverse_compose, matrix4x3_inverse_transform_normal,
+    matrix4x3_inverse_transform_plane, matrix4x3_inverse_transform_point_value,
+    normalize3d_value,
+};
+
 use super::instance_raycast::instance_matrix;
 use super::mesh_builder::{build_mesh_fragment_recursive, DecalBuildContext};
 use super::types::{
@@ -221,11 +227,11 @@ pub fn build_mesh_fragment(
         // Mirror engine lines 0x18039CCC0:195-211 — invert M_inst on
         // the projection basis, the fold (origin, normal), and the
         // plane. Normalize the resulting fold normal.
-        effective_proj = inverse_compose_matrix(&inst_matrix, &params.local_to_world);
-        seed_origin = inverse_transform_point(&inst_matrix, seed_origin);
-        let local_normal = inverse_transform_normal(&inst_matrix, seed_normal);
-        seed_normal = normalize(local_normal);
-        seed_plane = inverse_transform_plane(&inst_matrix, seed_plane);
+        effective_proj = matrix4x3_inverse_compose(&inst_matrix, &params.local_to_world);
+        seed_origin = matrix4x3_inverse_transform_point_value(&inst_matrix, seed_origin);
+        let local_normal = matrix4x3_inverse_transform_normal(&inst_matrix, seed_normal);
+        seed_normal = normalize3d_value(local_normal);
+        seed_plane = matrix4x3_inverse_transform_plane(&inst_matrix, seed_plane);
 
         fragment.instance_local_to_world = Some(inst_matrix);
         effective_instance_definition_index = inst.definition_index as i32;
@@ -285,7 +291,7 @@ pub fn build_mesh_fragment(
         j: fwd.k * seed_normal.i - fwd.i * seed_normal.k,
         k: fwd.i * seed_normal.j - fwd.j * seed_normal.i,
     };
-    let axis_primary_normalized = normalize(axis_primary);
+    let axis_primary_normalized = normalize3d_value(axis_primary);
     let len_sq_post_normalize = axis_primary_normalized.i * axis_primary_normalized.i
         + axis_primary_normalized.j * axis_primary_normalized.j
         + axis_primary_normalized.k * axis_primary_normalized.k;
@@ -300,7 +306,7 @@ pub fn build_mesh_fragment(
             j: up.k * seed_normal.i - up.i * seed_normal.k,
             k: up.i * seed_normal.j - up.j * seed_normal.i,
         };
-        normalize(axis_fallback)
+        normalize3d_value(axis_fallback)
     };
     fragment_builder.neighbor_surfaces[0].fold.axis = axis;
 
@@ -409,91 +415,9 @@ pub fn build_mesh_fragment(
     walker_ok
 }
 
-#[inline]
-fn normalize(v: RealVector3d) -> RealVector3d {
-    let len_sq = v.i * v.i + v.j * v.j + v.k * v.k;
-    if len_sq > 0.0 {
-        let inv = len_sq.sqrt().recip();
-        RealVector3d {
-            i: v.i * inv,
-            j: v.j * inv,
-            k: v.k * inv,
-        }
-    } else {
-        v
-    }
-}
-
-// =============================================================================
-// Inverse-transform helpers — mirror engine `matrix4x3_inverse_transform_*`.
-// =============================================================================
-//
-// Used by the instance-seed branch of `build_mesh_fragment` to pull a
+// Inverse-transform helpers now live in `crate::halo::math::matrix_math`
+// (canonical, sign-preserving scale clamp). The decal instance-seed
+// branch above imports them directly. Mirror engine
+// `matrix4x3_inverse_transform_*` (`@ 0x1802c4ca0` family); pull a
 // world-space `DecalCollisionResult` into instance-local space (engine
-// lines `c_decal::build_mesh_fragment @ 0x18039CCC0:195-211`).
-//
-// Halo's `RealMatrix4x3` is an orthonormal basis (forward/left/up) +
-// uniform `scale` + translation. For instance matrices, scale is the
-// instance scale.
-
-/// `matrix4x3_inverse_transform_point @ 0x1802c4c80` —
-/// `p_local = (M_inst^{-1})(p_world)`.
-#[inline]
-fn inverse_transform_point(m: &RealMatrix4x3, p: RealPoint3d) -> RealPoint3d {
-    let dx = p.x - m.position.x;
-    let dy = p.y - m.position.y;
-    let dz = p.z - m.position.z;
-    let s = m.scale.abs().max(0.000099999997);
-    let inv_s = 1.0 / s;
-    RealPoint3d {
-        x: inv_s * (m.forward.i * dx + m.forward.j * dy + m.forward.k * dz),
-        y: inv_s * (m.left.i * dx + m.left.j * dy + m.left.k * dz),
-        z: inv_s * (m.up.i * dx + m.up.j * dy + m.up.k * dz),
-    }
-}
-
-/// `matrix4x3_inverse_transform_normal @ 0x1802c4dd0` —
-/// Pure rotation: `n_local = R^T n_world` (translation + scale ignored
-/// — engine treats surface normals as directions, not displacements).
-#[inline]
-fn inverse_transform_normal(m: &RealMatrix4x3, v: RealVector3d) -> RealVector3d {
-    RealVector3d {
-        i: m.forward.i * v.i + m.forward.j * v.j + m.forward.k * v.k,
-        j: m.left.i * v.i + m.left.j * v.j + m.left.k * v.k,
-        k: m.up.i * v.i + m.up.j * v.j + m.up.k * v.k,
-    }
-}
-
-/// `matrix4x3_inverse_transform_plane @ 0x1802c4f40` — inverse of
-/// `matrix4x3_transform_plane`. World plane `(n, d)` → local plane.
-#[inline]
-fn inverse_transform_plane(m: &RealMatrix4x3, p: RealPlane3d) -> RealPlane3d {
-    let n_local = inverse_transform_normal(
-        m,
-        RealVector3d { i: p.i, j: p.j, k: p.k },
-    );
-    let s = m.scale.abs().max(0.000099999997);
-    let d_local = (p.d - (p.i * m.position.x + p.j * m.position.y + p.k * m.position.z)) / s;
-    RealPlane3d {
-        i: n_local.i,
-        j: n_local.j,
-        k: n_local.k,
-        d: d_local,
-    }
-}
-
-/// Inverse-compose two `RealMatrix4x3` — produces `M_local = M_inst^{-1}
-/// ∘ M_world`. Used to pull the decal's projection (which lives in
-/// world space) into the instance's local space so the BFS walker
-/// computes texture coords correctly.
-#[inline]
-fn inverse_compose_matrix(m_inst: &RealMatrix4x3, m_world: &RealMatrix4x3) -> RealMatrix4x3 {
-    let s_inst = m_inst.scale.abs().max(0.000099999997);
-    RealMatrix4x3 {
-        scale: m_world.scale / s_inst,
-        forward: inverse_transform_normal(m_inst, m_world.forward),
-        left: inverse_transform_normal(m_inst, m_world.left),
-        up: inverse_transform_normal(m_inst, m_world.up),
-        position: inverse_transform_point(m_inst, m_world.position),
-    }
-}
+// `c_decal::build_mesh_fragment @ 0x18039CCC0:195-211`).

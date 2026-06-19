@@ -83,43 +83,6 @@ pub enum EntryPoint {
     DynamicLightingCinematic = 17,
 }
 
-impl EntryPoint {
-    /// Map canonical EntryPoint → the material-side `HaloEntryPoint`
-    /// subset our shader assembler currently ports.
-    pub fn to_material_entry_point(self) -> HaloEntryPoint {
-        match self {
-            // Albedo G-buffer fill — used by both `_entry_point_albedo`
-            // (BSP / object opaque pass) and `_entry_point_default`
-            // dispatch through `c_object_renderer::render_albedo_decals`
-            // (object-attached decal mesh parts). Both want the rmsh
-            // material's albedo PS body that populates RT0 + RT1 with
-            // no lighting. Engine call sites:
-            //   `c_player_view::render_albedo @ 0x18068ad36` →
-            //     c_object_renderer::render_albedo(1) [entry=_albedo]
-            //   `c_player_view::render_albedo @ 0x18068ad36` →
-            //     c_object_renderer::render_albedo_decals() →
-            //     render_object_contexts(_entry_point_default, 32)
-            //   Both ultimately want the rmsh default_ps body which
-            //   our `HaloEntryPoint::Albedo` maps to entry_albedo.wgsl.
-            Self::Default | Self::Albedo => HaloEntryPoint::Albedo,
-            // Static-lit-per-pixel families share one umbrella shader
-            // (entry_static_per_pixel.wgsl).
-            Self::StaticLightingPerPixel => HaloEntryPoint::StaticPerPixel,
-            // SH / PRT / per-vertex paths all use the SH umbrella
-            // (entry_static_sh.wgsl).
-            Self::StaticLightingSh
-            | Self::StaticLightingPerVertex
-            | Self::StaticLightingPrtAmbient
-            | Self::StaticLightingPrtLinear
-            | Self::StaticLightingPrtQuadratic => HaloEntryPoint::StaticSh,
-            // Everything else (DynamicLighting / ShadowGenerate /
-            // ShadowApply / ActiveCamo / etc.) — falls back to
-            // StaticPerPixel until those passes get their own entries.
-            _ => HaloEntryPoint::StaticPerPixel,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // e_render_object_mesh_part_flags (render_objects.h:14-28)
 // ---------------------------------------------------------------------------
@@ -130,28 +93,14 @@ impl EntryPoint {
 /// transparent pass tests `transparent`, etc.).
 pub mod render_object_mesh_part_flags {
     pub const LIT: u32 = 1 << 0;
-    pub const SHADOW_CASTING: u32 = 1 << 1;
-    pub const TRANSPARENT: u32 = 1 << 2;
-    pub const INSTANCE: u32 = 1 << 3;
-    pub const GENERATES_HEAT: u32 = 1 << 4;
     pub const DECAL: u32 = 1 << 5;
-    pub const IS_SKY: u32 = 1 << 6;
-    pub const TRON: u32 = 1 << 7;
-    pub const FIRST_PERSON_SQUISHED: u32 = 1 << 8;
-    pub const FIRST_PERSON_UNSQUISHED: u32 = 1 << 9;
-    pub const CANCEL_SHADOWS_FOR_FIRST_PERSON_ALBEDO: u32 = 1 << 10;
 }
 
 // ---------------------------------------------------------------------------
 // e_submit_visibility_flags (render_objects.h:30-37)
 // ---------------------------------------------------------------------------
 
-pub mod submit_visibility_flags {
-    pub const TRANSPARENTS: u32 = 1 << 0;
-    pub const TREAT_ACTIVE_CAMO_AS_OPAQUE: u32 = 1 << 1;
-    pub const IGNORE_LIGHTING: u32 = 1 << 2;
-    pub const FIRST_PERSON: u32 = 1 << 3;
-}
+pub mod submit_visibility_flags {}
 
 // ---------------------------------------------------------------------------
 // s_object_render_context (render_objects.h:69-77, 24B)
@@ -267,19 +216,6 @@ impl ObjectRenderer {
             self.state.object_render_context_count;
         self.state.context_mesh_part_starting_index[idx] =
             self.state.total_context_mesh_part_count;
-    }
-
-    /// `c_object_renderer::pop_marker @ 0x1806e1850`.
-    pub fn pop_marker(&mut self) {
-        assert!(self.state.marker_index >= 0, "pop_marker without push");
-        let idx = self.state.marker_index as usize;
-        let context_start = self.state.object_render_context_starting_index[idx] as usize;
-        let mesh_part_start = self.state.context_mesh_part_starting_index[idx] as usize;
-        self.state.object_render_contexts.truncate(context_start);
-        self.state.object_render_context_count = context_start as i32;
-        self.state.context_mesh_parts.truncate(mesh_part_start);
-        self.state.total_context_mesh_part_count = mesh_part_start as i32;
-        self.state.marker_index -= 1;
     }
 
     /// `c_object_renderer::begin_object_render_context
@@ -473,44 +409,6 @@ impl ObjectRenderer {
         );
     }
 
-    /// `c_object_renderer::render_lights @ 0x1806e4b20`. Per-light
-    /// proxy draws over each visible object.
-    pub fn render_lights(
-        &self,
-        entry_point: EntryPoint,
-        draw: impl FnMut(usize, &ContextMeshPart, EntryPoint, u32, &ObjectRenderContext),
-    ) {
-        // Mask = LIT — only lit parts get the dynamic-light pass.
-        self.render_object_contexts(
-            entry_point,
-            render_object_mesh_part_flags::LIT,
-            draw,
-        );
-    }
-
-    /// `c_object_renderer::render_shadows_generate @ 0x1806e4b80`.
-    pub fn render_shadows_generate(
-        &self,
-        draw: impl FnMut(usize, &ContextMeshPart, EntryPoint, u32, &ObjectRenderContext),
-    ) {
-        self.render_object_contexts(
-            EntryPoint::ShadowGenerate,
-            render_object_mesh_part_flags::SHADOW_CASTING,
-            draw,
-        );
-    }
-
-    /// `c_object_renderer::render_shadows_apply @ 0x1806e4be0`.
-    pub fn render_shadows_apply(
-        &self,
-        draw: impl FnMut(usize, &ContextMeshPart, EntryPoint, u32, &ObjectRenderContext),
-    ) {
-        self.render_object_contexts(
-            EntryPoint::ShadowApply,
-            render_object_mesh_part_flags::LIT,
-            draw,
-        );
-    }
 }
 
 /// Submit visibility — populate object_render_contexts from the
@@ -1142,9 +1040,7 @@ pub fn submit_and_render_sky<'rp>(
             // Engine push_marker scopes a sky-only batch into the
             // transparency pool; sort + render walk only that batch;
             // pop_marker truncates the pool back to the regular scope.
-            use crate::halo::render::render_transparents::{
-                TransparentDispatch, TransparentSortLayer,
-            };
+            use crate::halo::render::render_transparents::TransparentDispatch;
             let diag_sky = std::env::var_os("PROTOMORPH_DIAG_SKY_SORT").is_some() && {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static F: AtomicU32 = AtomicU32::new(0);

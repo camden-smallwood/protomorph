@@ -61,17 +61,6 @@ impl TransparentSortLayer {
     }
 }
 
-/// `e_transparent_sort_method` (render_transparents.h:22-28). v1 uses
-/// only `PointQsort` — BSP and plane-qsort variants TBD with the full
-/// recursive sort.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum TransparentSortMethod {
-    Bsp = 0,
-    PointQsort = 1,
-    PointPlaneQsort = 2,
-}
-
 /// What a sorted transparent element actually does when its turn comes
 /// in `render()`. Replaces Halo's
 /// `void (*render_callback)(void const *user_data, long user_context)`
@@ -405,6 +394,32 @@ impl TransparencyRenderer {
                     let face_dot =
                         (faced[0] * f[0] + faced[1] * f[1] + faced[2] * f[2]).abs();
                     e.importance = (e.radius * e.radius * face_dot) / dist;
+                } else if e.radius > 0.000_1 {
+                    // DEGENERATE authored plane = the part has no
+                    // `transparent_sorting_index` (-1). The engine
+                    // `c_structure_renderer::submit_visibility @0x18068E860`
+                    // does NOT point-sort these — it seeds the sort plane with
+                    // the DEFAULT `*global_forward3d`, which is the FIXED WORLD
+                    // axis `(1,0,0)` (verified: bytes 0000803f 0 0 = 1,0,0),
+                    // d=0, then `add_element` faces it toward the camera. So the
+                    // element participates in the stage-2 BSP plane sort as a
+                    // splitter, classified by FIXED world geometry → stable under
+                    // rotation. Without this (point-sort by z_sort) co-located
+                    // layers (riverworld's 3 instanced `vahalla_waterfall`
+                    // planes) flip order as the camera pitches → a layer pops.
+                    e.use_plane = true;
+                    // Face the WORLD +X plane toward the camera: camera on + side
+                    // of (n, 0) ⟺ n·camera_pos ≥ 0.
+                    let faced = if camera_pos[0] >= 0.0 {
+                        [1.0, 0.0, 0.0, 0.0]
+                    } else {
+                        [-1.0, 0.0, 0.0, 0.0]
+                    };
+                    e.plane = faced;
+                    let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.000_1);
+                    let face_dot =
+                        (faced[0] * f[0] + faced[1] * f[1] + faced[2] * f[2]).abs();
+                    e.importance = (e.radius * e.radius * face_dot) / dist;
                 }
             }
         }
@@ -451,20 +466,23 @@ impl TransparencyRenderer {
         }
         // Stage 2: per sort-layer run, the recursive BSP plane sort
         // (`group_plane_and_point_of_sublist` + `sort_plane_and_point`).
+        // ON BY DEFAULT (engine `render_debug_transparent_sort_method == 0`
+        // always runs this after the qsort). It is THE stabilizer: the qsort
+        // proc (`transparent_layer_and_z_sort_proc`) falls back to plain
+        // `z_sort` for plane-vs-plane, which flips under rotation; only this
+        // recursive BSP partition (by FIXED world planes) gives a
+        // view-independent back-to-front order.
         //
-        // GATED OFF by default (PROTOMORPH_PLANE_SORT to enable). The
-        // algorithm is engine-faithful, but it only sorts correctly when the
-        // sublist's plane elements are GOOD spatial separators for the whole
-        // sublist. On construct the big waterfall sheets read with NO authored
-        // plane (`plane = [0,0,0,0]` in the loose tag) so they participate as
-        // planeless POINTS, and the only available splitter is a small
-        // horizontal glass pane (z≈5.3) — using it to partition the distant
-        // waterfall scatters far segments to the "camera side" and draws them
-        // OVER near glass (a milky veil). Plain `z_sort` (stage 1) orders these
-        // correctly (far-first). Re-enable once the waterfall's authored sort
-        // plane is recovered (suspected loose-tag parse gap: radius is present
-        // but the plane reads zero) so it splits as a plane, not a point.
-        if std::env::var_os("PROTOMORPH_PLANE_SORT").is_some() {
+        // It was previously gated off because plane-less BSP transparents (the
+        // waterfall sheets) read `plane = [0,0,0,0]` and participated as stray
+        // POINTS, leaving a tiny glass pane as the only splitter → construct
+        // mis-sort. That was a WRONG diagnosis (not a loose-tag parse gap): the
+        // engine `submit_visibility` deliberately gives no-sorting-index parts
+        // the `global_forward3d` = world `(1,0,0)` default plane (applied above),
+        // so they ARE splitters. With that fix this sort is correct, and gating
+        // it off is what made the riverworld waterfall layer flip with pitch.
+        // PROTOMORPH_NO_PLANE_SORT falls back to stage-1 z_sort for A/B.
+        if std::env::var_os("PROTOMORPH_NO_PLANE_SORT").is_none() {
             let mut run_start = start;
             while run_start < end {
                 let layer =
@@ -598,23 +616,6 @@ impl TransparencyRenderer {
         }
     }
 
-    /// `c_transparency_renderer::set_using_active_camo @ 0x1806CDDF0`.
-    /// Halo: `m_using_active_camo = 1`.
-    pub fn set_using_active_camo(&mut self) {
-        self.using_active_camo = true;
-    }
-
-    /// `c_transparency_renderer::set_active_camo_bounds @ 0x1806CDEA0`.
-    /// Captures the resolve bounds and clears the active-camo flag
-    /// (Halo: marks `m_needs_active_camo_ldr_resolve` so the LDR
-    /// composite picks the snapshot up later).
-    pub fn set_active_camo_bounds(&mut self) {
-        if self.using_active_camo {
-            self.needs_active_camo_ldr_resolve = true;
-            self.using_active_camo = false;
-        }
-    }
-
     /// Sorted indices into `transparents` for the CURRENT marker scope.
     /// Iterated by `render()`. Earlier batches (already rendered) are
     /// skipped — engine `c_transparency_renderer::render` walks
@@ -631,12 +632,6 @@ impl TransparencyRenderer {
         self.sorted_order[range]
             .iter()
             .map(move |&i| &self.transparents[i as usize])
-    }
-
-    /// Number of registered transparents (Halo:
-    /// `m_total_transparent_count`).
-    pub fn total_count(&self) -> usize {
-        self.total_transparent_count as usize
     }
 
     /// Debug: dump the current marker batch's post-sort draw order with
@@ -688,6 +683,15 @@ impl TransparencyRenderer {
         rpass: &mut wgpu::RenderPass<'rp>,
         ctx: &'rp crate::halo::render::shared::FrameContext<'rp>,
     ) {
+        if std::env::var("PROTOMORPH_DIAG_DRAW_ORDER").is_ok() {
+            eprintln!(
+                "[draworder] render() CALLED: render_enabled={} marker={} start={} total={}",
+                self.render_enabled,
+                self.current_marker_index,
+                self.current_batch_start(),
+                self.total_transparent_count,
+            );
+        }
         if !self.render_enabled {
             return;
         }
@@ -695,6 +699,39 @@ impl TransparencyRenderer {
         let end = self.total_transparent_count as usize;
         if end <= start {
             return;
+        }
+        // Diagnostic: dump the FINAL draw order (back→front) of BSP-instance +
+        // particle transparents — capture at the "good" and "bad" view angle to
+        // see exactly which layers reorder. PROTOMORPH_DIAG_DRAW_ORDER=1.
+        if std::env::var("PROTOMORPH_DIAG_DRAW_ORDER").is_ok() {
+            // ALWAYS print the header (confirms render() ran + the scope size),
+            // then EVERY element (so we see if the waterfall is even in scope).
+            eprintln!(
+                "[draworder] render() scope [{start}..{end}] = {} elems (marker={})",
+                end.saturating_sub(start),
+                self.current_marker_index,
+            );
+            for (draw_i, &oi) in self.sorted_order[start..end].iter().enumerate() {
+                let e = &self.transparents[oi as usize];
+                let kind = match e.dispatch {
+                    TransparentDispatch::BspInstancePart { structure_instance_index, mesh_index, part_index, .. } =>
+                        format!("INSTANCE i{structure_instance_index} m{mesh_index} p{part_index}"),
+                    TransparentDispatch::BspClusterPart { cluster_index, mesh_index, part_index, .. } =>
+                        format!("cluster c{cluster_index} m{mesh_index} p{part_index}"),
+                    TransparentDispatch::EmitterInstance { draw_index } =>
+                        format!("PARTICLE draw{draw_index}"),
+                    TransparentDispatch::Object { object_slot, mesh_index, part_index, .. } =>
+                        format!("object o{object_slot} m{mesh_index} p{part_index}"),
+                    TransparentDispatch::SkyMeshPart { mesh_index, part_index } =>
+                        format!("sky m{mesh_index} p{part_index}"),
+                    TransparentDispatch::PatchyFog => "patchyfog".to_string(),
+                };
+                eprintln!(
+                    "[draworder]  #{draw_i:3} L{} z={:.2} pl={} imp={:.3} c=[{:.0},{:.0},{:.0}] {kind}",
+                    e.sort_layer as u8, e.z_sort, e.use_plane as u8, e.importance,
+                    e.centroid[0], e.centroid[1], e.centroid[2],
+                );
+            }
         }
         let (Some(identity_model_bg), Some(identity_nm_bg)) =
             (ctx.structure_renderer.identity_model_bg.as_ref(), ctx.structure_renderer.identity_nm_bg.as_ref())
@@ -716,7 +753,27 @@ impl TransparencyRenderer {
             ],
         );
 
+        // Diagnostic isolation toggles (which transparent layer owns a bug):
+        //   PROTOMORPH_NO_PARTICLES=1       — draw everything EXCEPT particles
+        //   PROTOMORPH_ONLY_PARTICLES=1     — draw ONLY particles
+        //   PROTOMORPH_NO_BSP_TRANSPARENTS=1 — drop BSP transparents (water/glass)
+        let no_particles = std::env::var("PROTOMORPH_NO_PARTICLES").is_ok();
+        let only_particles = std::env::var("PROTOMORPH_ONLY_PARTICLES").is_ok();
+        let no_bsp_transp = std::env::var("PROTOMORPH_NO_BSP_TRANSPARENTS").is_ok();
         for element in self.sorted_elements() {
+            let is_particle =
+                matches!(element.dispatch, TransparentDispatch::EmitterInstance { .. });
+            let is_bsp = matches!(
+                element.dispatch,
+                TransparentDispatch::BspClusterPart { .. }
+                    | TransparentDispatch::BspInstancePart { .. }
+            );
+            if (no_particles && is_particle)
+                || (only_particles && !is_particle)
+                || (no_bsp_transp && is_bsp)
+            {
+                continue;
+            }
             match element.dispatch {
                 TransparentDispatch::BspClusterPart {
                     bsp_index,
@@ -840,13 +897,23 @@ impl TransparencyRenderer {
                         .instance_selections
                         .get(structure_instance_index as usize)
                         .map(|s| s.entry);
+                    // Only pick a 2-vertex-buffer pipeline (per-vertex SH /
+                    // PRT ambient) when its slot-1 source actually exists,
+                    // else the draw binds a 2-buffer pipeline with nothing in
+                    // slot 1 → wgpu panic. Mirror the opaque instance path.
+                    let pv_present = bsp
+                        .instance_per_vertex_sh_buffers
+                        .get(structure_instance_index as usize)
+                        .and_then(|o| o.as_ref())
+                        .is_some();
+                    let prt_present = mesh.prt_ambient_buffer.is_some();
                     let (artifacts_opt, bind_groups_opt) = match sel {
                         Some(Ep::StaticPerPixel) => (material.artifacts.as_ref(), material.bind_group.as_ref()),
-                        Some(Ep::StaticShPerVertex) => (
+                        Some(Ep::StaticShPerVertex) if pv_present => (
                             material.artifacts_sh_per_vertex.as_ref(),
                             material.bind_group_sh_per_vertex.as_ref(),
                         ),
-                        Some(Ep::StaticPrtAmbient) => (
+                        Some(Ep::StaticPrtAmbient) if prt_present => (
                             material.artifacts_prt_ambient.as_ref(),
                             material.bind_group_prt_ambient.as_ref(),
                         ),
@@ -888,13 +955,22 @@ impl TransparencyRenderer {
                         .unwrap_or(&mesh.vertex_buffer);
                     rpass.set_vertex_buffer(0, placement_vb.slice(..));
                     // Per-vertex SH stream (slot 1) — StaticShPerVertex only.
-                    if matches!(sel, Some(Ep::StaticShPerVertex)) {
+                    if matches!(sel, Some(Ep::StaticShPerVertex)) && pv_present {
                         if let Some(pv_buf) = bsp
                             .instance_per_vertex_sh_buffers
                             .get(structure_instance_index as usize)
                             .and_then(|o| o.as_ref())
                         {
                             rpass.set_vertex_buffer(1, pv_buf.slice(..));
+                        }
+                    }
+                    // PRT ambient transfer stream (slot 1) — StaticPrtAmbient
+                    // only. Was missing entirely; the selection guard above
+                    // only routes here when `prt_present`, so the buffer is
+                    // always Some at this point.
+                    if matches!(sel, Some(Ep::StaticPrtAmbient)) && prt_present {
+                        if let Some(prt_buf) = mesh.prt_ambient_buffer.as_ref() {
+                            rpass.set_vertex_buffer(1, prt_buf.slice(..));
                         }
                     }
                     rpass.set_index_buffer(

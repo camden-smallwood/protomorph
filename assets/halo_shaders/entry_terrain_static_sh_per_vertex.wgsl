@@ -601,9 +601,13 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // Engine `out_color.rgb += self_illum` (terrain_new_fx.hlsl:1018).
     // Self_illum is added INSIDE the lit accumulator so atmospheric
     // extinction and exposure also apply to glow.
-    let lit = diffuse + sl.diffuse * albedo
+    // Engine terrain_new_fx.hlsl:880/887 — diffuse_coefficient multiplies the
+    // SUM (SH + simple-light) diffuse; spec.analytical multiplies the SUM
+    // (analytical + simple-light) specular. So the simple-light terms must
+    // carry the same coefficients as their SH/analytical counterparts.
+    let lit = diffuse + sl.diffuse * albedo * max(diffuse_coef, 0.0)
         + analytic_specular
-        + sl.specular * specular_tint * albedo_w
+        + sl.specular * specular_tint * albedo_w * spec.analytical
         + self_illum;
     // Atmospheric scattering + exposure (terrain_new_fx.hlsl:1021):
     //   out_color.rgb = (out_color.rgb * extinction + inscatter) * g_exposure.rrr;

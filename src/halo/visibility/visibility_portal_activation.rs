@@ -80,29 +80,6 @@ impl ActivePortalBitvectors {
         Self::default()
     }
 
-    pub fn new_all_inactive() -> Self {
-        Self { bits: [[0; PORTAL_FLAG_WORDS_PER_BSP]; MAX_BSPS] }
-    }
-
-    /// `portal_activation_set_portal_active @ ?`. Set/clear one
-    /// portal bit.
-    pub fn set_active(&mut self, portal: PortalReference, active: bool) {
-        let bsp = portal.bsp_index();
-        let p = portal.portal_index();
-        if bsp < 0 || (bsp as usize) >= MAX_BSPS
-            || p < 0 || (p as usize) >= MAX_PORTALS_PER_BSP
-        {
-            return;
-        }
-        let word = &mut self.bits[bsp as usize][p as usize >> 5];
-        let mask = 1u32 << (p & 31);
-        if active {
-            *word |= mask;
-        } else {
-            *word &= !mask;
-        }
-    }
-
     /// `portal_activation_portal_is_active @ ?`. Read one portal bit.
     pub fn is_active(&self, portal: PortalReference) -> bool {
         let bsp = portal.bsp_index();
@@ -114,26 +91,5 @@ impl ActivePortalBitvectors {
         }
         let word = self.bits[bsp as usize][p as usize >> 5];
         (word >> (p & 31)) & 1 != 0
-    }
-
-    /// `portal_activation_initialize_for_new_structure_bsp @ ?`. Mark
-    /// all portals in the given BSPs as active. `mask` has bit `i`
-    /// set for each BSP index to initialize.
-    pub fn init_for_new_bsps(&mut self, mask: u32) {
-        for b in 0..MAX_BSPS {
-            if (mask & (1u32 << b)) != 0 {
-                self.bits[b] = [u32::MAX; PORTAL_FLAG_WORDS_PER_BSP];
-            }
-        }
-    }
-
-    /// `portal_activation_dispose_from_old_structure_bsp @ ?`. Mark
-    /// all portals in the given BSPs as inactive (zero).
-    pub fn dispose_from_bsps(&mut self, mask: u32) {
-        for b in 0..MAX_BSPS {
-            if (mask & (1u32 << b)) != 0 {
-                self.bits[b] = [0; PORTAL_FLAG_WORDS_PER_BSP];
-            }
-        }
     }
 }

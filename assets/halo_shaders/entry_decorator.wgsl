@@ -522,12 +522,15 @@ fn default_vs(in: VsIn) -> VsOut {
         let scaled = wind_vec * mscale;
         wind_offset_xy = scaled;
 
-        // height_scale = sqrt(z² / (z² + |wind|²)) — `decorators.hlsl:233`.
-        // Engine multiplies the squared-wind by instance_quaternion's
-        // length² (= scale²); we don't have non-unit quats here yet so
-        // just use vertex_z² directly — close enough for visible bend.
+        // height_scale = sqrt(h² / (h² + |wind|²)) — `decorators_hlsl.hlsl:231-233`:
+        //   instance_scale = dot(instance_quaternion, instance_quaternion)  // = scale²
+        //   height_squared = instance_scale * vertex_position.z + 0.01       // LINEAR z
+        // The z term is LINEAR (was wrongly squared here). instance_scale
+        // (the per-instance quaternion scale) isn't plumbed through the
+        // model-matrix path yet, so it's treated as 1 — exact for the
+        // common unit-scale decorator instances.
         let wind_sq = dot(scaled, scaled);
-        let height_sq = local_pos.z * local_pos.z + 0.01;
+        let height_sq = local_pos.z + 0.01;
         height_scale = sqrt(height_sq / (height_sq + wind_sq));
     } else if (variant == VARIANT_WAVY_DYNAMIC) {
         // `decorators.hlsl:236-240` — sin-driven sway:
@@ -540,13 +543,16 @@ fn default_vs(in: VsIn) -> VsOut {
         let phase = local_pos.z * wave_flow.w
                   + wind_globals.wind_data2.w * wave_flow.z
                   + dot(inst_xy, wave_flow.xy);
-        let wave = motion_scale * abs(local_pos.z) * sin(phase);
+        let wave = motion_scale * saturate(abs(local_pos.z)) * sin(phase);
         local_pos.x = local_pos.x + wave;
     }
     local_pos.z = local_pos.z * height_scale;
 
     let world_pos4 = model * vec4<f32>(local_pos, 1.0);
-    let world_pos = vec3<f32>(world_pos4.xy + wind_offset_xy, world_pos4.z);
+    // HLSL decorators_hlsl.hlsl:248 — `world_position.xy += wind_vector.xy * height_scale`
+    // (the post-transform wind offset is scaled by the bend factor; height_scale
+    // is 1.0 for non-wind variants so wind_offset_xy is 0 there anyway).
+    let world_pos = vec3<f32>(world_pos4.xy + wind_offset_xy * height_scale, world_pos4.z);
 
     // World normal — model matrix's rotation submatrix × object normal.
     // ShadedDynamicLights uses the rotated_position vector instead, so

@@ -1,7 +1,7 @@
 //! CPU-side lightprobe-atlas decoder for the decorator bake. Mirrors
 //! the GPU path in `assets/halo_shaders/lightmap_sampling_fx.wgsl`:
 //! 8 BC3 array slices encoding 4 SH coefs as (L, U/V/W) half-pairs;
-//! `decode_bpp16_luvw` reconstructs each coef.
+//! each coef is reconstructed from its (L, U/V/W) half-pair.
 //!
 //! BC3 (DXT5) decoding is hand-rolled — keeps the dependency graph
 //! flat. Full-atlas decode at scenario load (~2 MB per riverworld-size
@@ -9,7 +9,7 @@
 //! fires. CPU output is bilinear-sampleable at any UV.
 
 use blam_tags::bitmap::{BitmapFormat, BitmapImage};
-use glam::{Vec2, Vec3};
+use glam::Vec2;
 
 /// One BC3 atlas decoded to per-layer RGBA-f32 pixel grids. `layers`
 /// is `layer_count` long, each entry `(width × height × 4)` floats in
@@ -58,45 +58,6 @@ impl DecodedAtlas {
         Some(Self { width, height, layers: decoded_layers })
     }
 
-    /// Bilinear-sample one layer at a UV in [0, 1]. Returns RGBA in
-    /// 0..1. Out-of-bounds UVs are clamped. Mirrors the GPU sampler's
-    /// `MIN_MAG_LINEAR_MIP_POINT` behavior at LOD 0.
-    ///
-    /// Used by the decorator atlas-color bake. The lightprobe SH +
-    /// intensity readers use [`Self::sample_nearest`] to match engine's
-    /// CPU-side `bitmap_2d_get_real_pixel_internal` semantics — engine
-    /// does NOT bilinear-blend on CPU lightprobe reads; it grabs the
-    /// single nearest texel. Bilinear at chart-gap UVs averages 4
-    /// neighbors (most alpha=0) and produces dim values vs engine's
-    /// "pick one corner, take its color".
-    pub fn sample(&self, layer: usize, uv: Vec2) -> [f32; 4] {
-        let layer_data = &self.layers[layer];
-        let w = self.width as f32;
-        let h = self.height as f32;
-        let u = uv.x.clamp(0.0, 1.0);
-        let v = uv.y.clamp(0.0, 1.0);
-        let fx = u * w - 0.5;
-        let fy = v * h - 0.5;
-        let x0 = fx.floor().max(0.0) as u32;
-        let y0 = fy.floor().max(0.0) as u32;
-        let x1 = (x0 + 1).min(self.width - 1);
-        let y1 = (y0 + 1).min(self.height - 1);
-        let tx = (fx - fx.floor()).clamp(0.0, 1.0);
-        let ty = (fy - fy.floor()).clamp(0.0, 1.0);
-
-        let p00 = layer_data[(y0 * self.width + x0) as usize];
-        let p10 = layer_data[(y0 * self.width + x1) as usize];
-        let p01 = layer_data[(y1 * self.width + x0) as usize];
-        let p11 = layer_data[(y1 * self.width + x1) as usize];
-        let mut out = [0.0f32; 4];
-        for c in 0..4 {
-            let a = p00[c] * (1.0 - tx) + p10[c] * tx;
-            let b = p01[c] * (1.0 - tx) + p11[c] * tx;
-            out[c] = a * (1.0 - ty) + b * ty;
-        }
-        out
-    }
-
     /// NEAREST-sample one layer at a UV in [0, 1]. Mirrors engine
     /// `bitmap_2d_get_real_pixel_internal_c_durango_address_computer @
     /// 0x1804edbe0` — `pixel_x = clamp(floor(u * width), 0, width-1)`,
@@ -120,80 +81,6 @@ impl DecodedAtlas {
         layer_data[(y * self.width + x) as usize]
     }
 }
-
-/// Sample the dominant-light-intensity atlas at `uv` — engine-faithful
-/// mirror of the `lightprobe_intensity_atlas` half of
-/// `lightmap_sampling_fx.wgsl::sample_lightprobe_texture` (line 48-49,
-/// 64). The intensity bitmap is exactly 2 BC3 layers; the pair encodes
-/// one Vec3 via the same `decode_bpp16_luvw` primitive used for SH
-/// coefs, scaled by `compress[1][1]` (= `compression_vectors[8].x`).
-///
-/// Engine call site: `sample_lightprobe_textures @ ~0x180XXXXX` (inside
-/// the per-pixel atlas branch of `c_geometry_sampler::sample`). Feeds
-/// the `dom_intensity` argument of
-/// `reconstruct_quadratic_lightprobe_from_linear_and_intensity`.
-pub fn sample_lightprobe_intensity(
-    atlas: &DecodedAtlas,
-    uv: Vec2,
-    compress: &[[f32; 4]; 3],
-) -> Vec3 {
-    if atlas.layers.len() < 2 {
-        return Vec3::ZERO;
-    }
-    // Engine `bitmap_2d_get_real_pixel_internal` uses nearest, not bilinear.
-    let i0 = atlas.sample_nearest(0, uv);
-    let i1 = atlas.sample_nearest(1, uv);
-    decode_bpp16_luvw(i0, i1, compress[1][1])
-}
-
-/// CPU mirror of `lightmap_sampling_fx.wgsl::decode_bpp16_luvw`. Two
-/// BC3 atlas samples encode (L, U/V/W) as a half-pair; this
-/// reconstructs one SH coefficient (vec3) from them.
-pub fn decode_bpp16_luvw(s0: [f32; 4], s1: [f32; 4], l_range: f32) -> Vec3 {
-    let l = s0[3] * s1[3] * l_range;
-    let uvw = Vec3::new(s0[0] + s1[0], s0[1] + s1[1], s0[2] + s1[2]);
-    (uvw * 2.0 - Vec3::splat(2.0)) * l
-}
-
-/// Sample the per-cluster SH atlas at `uv` and decode 4 SH coefs
-/// (DC + 3 L1 bands), each as RGB. Mirror of
-/// `sample_lightprobe_texture` (lightmap_sampling_fx.wgsl).
-///
-/// `compress` is the lightmap_compress cbuffer's three vec4s as
-/// `[constant_0, constant_1, constant_2]`. Same memory layout used at
-/// `render::mod::upload_lightmap_atlases` (see comments there for the
-/// per-coef range mapping).
-pub fn sample_lightprobe_sh(
-    atlas: &DecodedAtlas,
-    uv: Vec2,
-    compress: &[[f32; 4]; 3],
-) -> [Vec3; 4] {
-    if atlas.layers.len() < 8 {
-        return [Vec3::ZERO; 4];
-    }
-    // Engine `sample_lightprobe_textures` — uses the raw raycast UV and
-    // NEAREST sampling. Engine `bitmap_2d_get_real_pixel_internal_c_durango_address_computer
-    // @ 0x1804edbe0` resolves `floor(u*w)` → single texel read. Bilinear
-    // dilutes chart-gap regions (most neighbors alpha=0) into dim values;
-    // nearest grabs one texel as-is, often landing on the authored bright
-    // chart pixel. That's the difference between MCC's bright object
-    // lighting and our previously-dim sample at chart-packing seams.
-    let s0 = atlas.sample_nearest(0, uv);
-    let s1 = atlas.sample_nearest(1, uv);
-    let s2 = atlas.sample_nearest(2, uv);
-    let s3 = atlas.sample_nearest(3, uv);
-    let s4 = atlas.sample_nearest(4, uv);
-    let s5 = atlas.sample_nearest(5, uv);
-    let s6 = atlas.sample_nearest(6, uv);
-    let s7 = atlas.sample_nearest(7, uv);
-    [
-        decode_bpp16_luvw(s0, s1, compress[0][0]), // SH coef 0 (DC) ← const_0.x
-        decode_bpp16_luvw(s2, s3, compress[0][1]), // SH coef 1 (L1 m=-1) ← const_0.y
-        decode_bpp16_luvw(s4, s5, compress[0][2]), // SH coef 2 (L1 m=0)  ← const_0.z
-        decode_bpp16_luvw(s6, s7, compress[1][0]), // SH coef 3 (L1 m=+1) ← const_1.x
-    ]
-}
-
 
 // ---------------------------------------------------------------------------
 // BC3 (DXT5) block decode — RGB via DXT1-style endpoints, alpha via 8-stop

@@ -167,6 +167,15 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
         calc_bumpmap(texcoord, in.fragment_to_camera_world, tangent, binormal, normal, &bump_normal_unnorm);
         calc_albedo(texcoord, &albedo, bump_normal_unnorm, misc);
         bump_normal = normalize(bump_normal_unnorm + 1e-6 * normal);
+        // Two-sided surfaces (glass etc.): point the normal toward the
+        // camera. Engine `decorators_hlsl.hlsl:265`:
+        //   two_sided_normal = world_normal * sign(dot(world_normal, frag_to_cam))
+        // Transparent BSP (e.g. guardian_glass_platform) is rendered without
+        // backface cull and its authored face normal points away from the
+        // top viewer, so N·V<0 → fresnel pins to ~1 → fully opaque. Flipping
+        // the normal to face the viewer restores correct fresnel/lighting on
+        // whichever side is seen.
+        bump_normal = bump_normal * sign(dot(bump_normal, in.fragment_to_camera_world));
         calc_specular_mask(texcoord, albedo.w, &specular_mask);
     }
 
@@ -226,9 +235,21 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // it lit every deep shadow (ghosttown's upper walls/ceilings). OFF by
     // default; construct's empty loose-tag atlas is a separate DATA gap to
     // fix in the loader, not by overriding real baked shadows here.
-    const LIGHTMAP_EMPTY_ATLAS_FALLBACK: bool = false;
+    // For TRANSPARENT BSP surfaces this const is forced true at assembly
+    // (blend_mode != opaque). Transparent geometry has NO reliable per-pixel
+    // lightmap chart in the loose tag (the chart is empty/dim, not just
+    // <0.01), so substitute the cluster ambient probe UNCONDITIONALLY — the
+    // old `dc < 0.01` threshold skipped the glass's dim-but-nonzero chart,
+    // leaving its diffuse ~0 so the A8 spec-mask's dark regions (which gate
+    // the only other light, the specular/reflection) went pure black. For the
+    // opaque diagnostic path (PROTOMORPH_ATLAS_FALLBACK=1) we keep the
+    // <0.01 guard so real baked shadows aren't lifted.
+    const LIGHTMAP_EMPTY_ATLAS_FALLBACK: bool = __LIGHTMAP_EMPTY_ATLAS_FALLBACK__;
+    const ATLAS_FALLBACK_IS_TRANSPARENT: bool = __ATLAS_FALLBACK_TRANSPARENT__;
     let _atlas_dc = probe.sh[0];
-    if (LIGHTMAP_EMPTY_ATLAS_FALLBACK && (_atlas_dc.r + _atlas_dc.g + _atlas_dc.b) < 0.01) {
+    if (LIGHTMAP_EMPTY_ATLAS_FALLBACK
+        && (ATLAS_FALLBACK_IS_TRANSPARENT
+            || (_atlas_dc.r + _atlas_dc.g + _atlas_dc.b) < 0.01)) {
         // `engine_lighting_ps.ravi` layout (per `build_default_sh_array`
         // in spherical_harmonics_fx.wgsl, mirroring engine
         // `calculate_and_set_ravi_constants_internal @ 0x1806aa650`):
@@ -329,7 +350,12 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     var out_rgb: vec3<f32>;
     var alpha_out: f32 = __ALPHA_CHANNEL_OUTPUT__;
     if (BLEND_MULTIPLICATIVE_ENABLED > 0.5) {
-        out_rgb = (albedo_for_illum + self_illum_radiance) * BLEND_MULTIPLICATIVE_FACTOR;
+        // HLSL applies APPLY_OVERLAYS BEFORE the multiply factor
+        // (entry_points_fx.hlsl:254-256).
+        out_rgb = albedo_for_illum + self_illum_radiance;
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
+        out_rgb = out_rgb * BLEND_MULTIPLICATIVE_FACTOR;
     } else if (BLEND_FRESNEL_ENABLED > 0.5) {
         // glass BLEND_FRESNEL (entry_points_fx.hlsl:258) — diffuse
         // PREMULTIPLIED by albedo.w; reflections add on top; output alpha
@@ -338,8 +364,39 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
             + self_illum_radiance
             + envmap_radiance
             + mat.specular_color.xyz;
+        // APPLY_OVERLAYS (overlays_fx.hlsl) — overlay then edge_fade,
+        // before extinction/exposure. Lives in the shared engine umbrella
+        // so it runs in EVERY lighting variant, not just StaticSh — a
+        // BSP halogram in a per-pixel-lit cluster (e.g. sidewinder
+        // heatprobe_cylinder) otherwise skips edge_fade and blows out.
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
         out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
         alpha_out = saturate(mat.specular_color.w + albedo.w);
+        // DIAGNOSTIC term isolation (PROTOMORPH_GLASS_VIZ=N): render one
+        // glass term opaque so we can see which is wrong vs MCC.
+        //   1 diffuse term (diffuse_radiance·albedo·albedo.w, the gray cloudy base)
+        //   2 envmap reflection (the green env_tint reflection)
+        //   3 analytic/area specular   4 raw diffuse_radiance (ambient irradiance)
+        //   5 albedo (base×tint)        6 spec_mask (the A8 alpha)  7 albedo.w (coverage)
+        const GLASS_VIZ_MODE: u32 = __GLASS_VIZ_MODE__;
+        if (GLASS_VIZ_MODE != 0u) {
+            var vv = vec3<f32>(0.0);
+            if (GLASS_VIZ_MODE == 1u) { vv = mat.diffuse_radiance * albedo_for_illum * albedo.w; }
+            else if (GLASS_VIZ_MODE == 2u) { vv = envmap_radiance; }
+            else if (GLASS_VIZ_MODE == 3u) { vv = mat.specular_color.xyz; }
+            else if (GLASS_VIZ_MODE == 4u) { vv = mat.diffuse_radiance; }
+            else if (GLASS_VIZ_MODE == 5u) { vv = albedo_for_illum; }
+            else if (GLASS_VIZ_MODE == 6u) { vv = vec3<f32>(specular_mask); }
+            else if (GLASS_VIZ_MODE == 7u) { vv = vec3<f32>(albedo.w); }
+            // 8 = lightmap UV (r=u, g=v) — is it valid/varied, or degenerate (0,0)?
+            else if (GLASS_VIZ_MODE == 8u) { vv = vec3<f32>(fract(in.lightmap_texcoord.x), fract(in.lightmap_texcoord.y), 0.0); }
+            // 9 = RAW atlas-sampled SH DC (probe.sh[0]) ×8, no exposure — is the
+            //     chart at the glass's UV empty (black) or baked (lit)?
+            else if (GLASS_VIZ_MODE == 9u) { out_rgb = probe.sh[0] * 1.0; alpha_out = 1.0; return AccumPixel(vec4<f32>(max(out_rgb, vec3<f32>(0.0)), 1.0), vec4<f32>(max(out_rgb, vec3<f32>(0.0)), 1.0)); }
+            out_rgb = vv * g_exposure();
+            alpha_out = 1.0;
+        }
     } else {
         // HLSL umbrella composition (entry_points_fx.hlsl):
         //   final = diffuse_radiance × albedo + specular_color + self_illum + envmap
@@ -349,7 +406,16 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
             + mat.specular_color.xyz
             + self_illum_radiance
             + envmap_radiance;
+        // APPLY_OVERLAYS — overlay then edge_fade, before extinction/exposure.
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
         out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
+        // DIAG: GLASS_VIZ=9 dumps raw SH DC on OPAQUE too, so glass-vs-metal
+        // lightmap SH can be compared directly in one frame.
+        if (__GLASS_VIZ_MODE__ == 9u) {
+            let a = vec4<f32>(max(probe.sh[0], vec3<f32>(0.0)), 1.0);
+            return AccumPixel(a, a);
+        }
     }
     // Underwater fog is applied by the separate `render_underwater_fog`
     // fullscreen post-pass (engine `c_water_renderer::render_underwater_fog

@@ -189,8 +189,4 @@ impl CameraClusterCache {
         self.initialized = true;
         self.last_result
     }
-
-    pub fn last(&self) -> Location {
-        self.last_result
-    }
 }

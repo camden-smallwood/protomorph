@@ -158,13 +158,6 @@ impl FlyingCamera {
         out.velocity = self.velocity;
         out
     }
-
-    pub fn rotate_towards_point(&mut self, point: Vec3, amount: f32) {
-        let distance = point - self.position;
-        let length = distance.length().max(1e-6);
-        self.rotation.x = (distance.y.atan2(distance.x)).to_degrees() * amount;
-        self.rotation.y = (distance.z / length).asin().to_degrees() * amount;
-    }
 }
 
 impl Default for FlyingCamera {

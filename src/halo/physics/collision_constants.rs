@@ -58,10 +58,6 @@ bitflags! {
     }
 }
 
-/// Number of distinct `e_collision_test_flag` values — matches engine's
-/// `k_collision_test_flags_count`.
-pub const NUMBER_OF_COLLISION_TEST_FLAGS: u32 = 22;
-
 // =============================================================================
 // e_collision_test_objects_flag
 // =============================================================================
@@ -118,10 +114,6 @@ bitflags! {
     }
 }
 
-pub const FIRST_OBJECT_TYPE_BIT: u32 = 1; // _collision_test_objects_first_type_bit
-pub const LAST_OBJECT_TYPE_BIT: u32 = 14; // _collision_test_objects_last_type_bit
-pub const NUMBER_OF_COLLISION_TEST_OBJECTS_FLAGS: u32 = 15;
-
 // =============================================================================
 // s_collision_test_flags
 // =============================================================================
@@ -162,34 +154,6 @@ impl CollisionTestFlagsPair {
         }
     }
 
-    /// `collision_test_flags_or`.
-    pub const fn or(a: Self, b: Self) -> Self {
-        Self {
-            collision_flags: a.collision_flags.union(b.collision_flags),
-            object_flags: a.object_flags.union(b.object_flags),
-        }
-    }
-
-    /// `collision_test_flags_and`.
-    pub const fn and(a: Self, b: Self) -> Self {
-        Self {
-            collision_flags: a.collision_flags.intersection(b.collision_flags),
-            object_flags: a.object_flags.intersection(b.object_flags),
-        }
-    }
-
-    /// `collision_test_flags_flip`.
-    pub const fn flip(a: Self) -> Self {
-        Self {
-            collision_flags: a.collision_flags.complement(),
-            object_flags: a.object_flags.complement(),
-        }
-    }
-
-    /// `collision_test_flags_empty`.
-    pub const fn empty(self) -> bool {
-        self.collision_flags.bits() == 0 && self.object_flags.bits() == 0
-    }
 }
 
 // Per-Ares header `static_assert(sizeof(s_collision_test_flags) == 8)`.

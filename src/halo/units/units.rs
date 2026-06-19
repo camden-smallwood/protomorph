@@ -119,18 +119,6 @@ fn game_engine_object_get_emblem_player(_unit_index: u32) -> i32 {
     -1
 }
 
-/// Engine `player_function_get_function_value(player_index, function,
-/// out_value, out_active) -> bool`. Returns false for invalid players;
-/// stubbed at false.
-fn player_function_get_function_value(
-    _player_index: i32,
-    _function: &str,
-    _value: &mut f32,
-    _active: &mut bool,
-) -> bool {
-    false
-}
-
 /// Engine debug knob (typically 0). When non-zero, modulates
 /// active_camouflage by a cosine over game-time. Stubbed at 0.
 const DEBUG_UNIT_ACTIVE_CAMO_FREQUENCY_MODULATOR: f32 = 0.0;

@@ -53,7 +53,8 @@ fn calc_albedo_chameleon_ps(
     let base = textureSample(base_map, base_map_sampler, transform_texcoord(texcoord, material.base_map_xform));
     let detail = textureSample(detail_map, detail_map_sampler, transform_texcoord(texcoord, material.detail_map_xform));
 
-    let color = calc_chameleon(normalize(normal), misc.xyz);
+    // HLSL passes the raw (already-unit) normal — no normalize.
+    let color = calc_chameleon(normal, misc.xyz);
 
     (*albedo).r = base.r * (detail.r * DETAIL_MULTIPLIER) * color.r;
     (*albedo).g = base.g * (detail.g * DETAIL_MULTIPLIER) * color.g;

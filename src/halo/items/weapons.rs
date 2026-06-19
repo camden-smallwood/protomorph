@@ -165,12 +165,6 @@ pub struct WeaponBody {
 // `ItemBody.inventory_state` / `WeaponBody.*` or return engine-default
 // "untouched, on the ground" values.
 
-/// Engine `weapon_get_owner_unit_index`. Returns `-1` for ground
-/// placements (no owner unit yet — inventory simulation deferred).
-fn weapon_get_owner_unit_index(_weapon_index: u32) -> i32 {
-    -1
-}
-
 /// Engine `item_in_hand` — true when the inventory_state == in_hand.
 fn item_in_hand(weapon_index: u32) -> bool {
     let datum = get_object_datum(weapon_index);

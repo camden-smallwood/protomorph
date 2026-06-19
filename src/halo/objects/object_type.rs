@@ -27,34 +27,7 @@ pub enum ObjectType {
     EffectScenery = 13,
 }
 
-/// `k_object_types_count` = 14.
-pub const OBJECT_TYPES_COUNT: usize = 14;
-
 impl ObjectType {
-    /// On-disk tag extension for this object type. Matches the engine's
-    /// per-type tag-group name from `blam_tags::paths::engine_name_for_group_tag`.
-    /// Used to resolve a placement's tag-relative path
-    /// (e.g. `objects\weapons\melee\gravity_hammer\gravity_hammer`) to
-    /// an absolute file path for `TagFile::read`.
-    pub fn tag_extension(self) -> &'static str {
-        match self {
-            Self::Biped         => "biped",
-            Self::Vehicle       => "vehicle",
-            Self::Weapon        => "weapon",
-            Self::Equipment     => "equipment",
-            Self::Terminal      => "device_terminal",
-            Self::Projectile    => "projectile",
-            Self::Scenery       => "scenery",
-            Self::Machine       => "device_machine",
-            Self::Control       => "device_control",
-            Self::SoundScenery  => "sound_scenery",
-            Self::Crate         => "crate",
-            Self::Creature      => "creature",
-            Self::Giant         => "giant",
-            Self::EffectScenery => "effect_scenery",
-        }
-    }
-
     /// 4-byte FOURCC tag group identifier — what `tag_reference`
     /// fields store on disk. Used as the cache key for
     /// [`crate::halo::tags::tag_get`].

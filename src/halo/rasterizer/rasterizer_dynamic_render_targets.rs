@@ -81,19 +81,6 @@ impl SurfaceTable {
         }
     }
 
-    /// Resolve a `Surface` to its current wgpu view, or `None` if
-    /// not allocated. Mirrors Halo's `get_surface` helper.
-    pub fn get(&self, surface: Surface) -> Option<&SurfaceEntry> {
-        self.entries
-            .get(surface as usize)
-            .and_then(|e| e.as_ref())
-    }
-    pub fn get_mut(&mut self, surface: Surface) -> Option<&mut SurfaceEntry> {
-        self.entries
-            .get_mut(surface as usize)
-            .and_then(|e| e.as_mut())
-    }
-
     /// Set the entry for a surface. Used during `allocate_*` calls
     /// at init / window resize.
     pub fn set(&mut self, surface: Surface, entry: SurfaceEntry) {
@@ -101,11 +88,6 @@ impl SurfaceTable {
         if idx < self.entries.len() {
             self.entries[idx] = Some(entry);
         }
-    }
-
-    /// `c_rasterizer::surface_valid`.
-    pub fn surface_valid(&self, surface: Surface) -> bool {
-        self.get(surface).is_some()
     }
 
     /// Allocate every surface in `SURFACE_DESCRIPTIONS` at the current
@@ -211,16 +193,6 @@ impl SurfaceTable {
         }
     }
 
-    /// Resize all owned surfaces to `(width, height)`. Re-runs
-    /// `allocate_default` after clearing entries.
-    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        self.display_width = width;
-        self.display_height = height;
-        for entry in self.entries.iter_mut() {
-            *entry = None;
-        }
-        self.allocate_default(device);
-    }
 }
 
 /// `c_dynamic_render_targets` mirror. Owns the dynamic texture-camera
@@ -238,42 +210,6 @@ impl DynamicRenderTargets {
             used_targets: [0; K_MAXIMUM_DYNAMIC_RENDER_TARGETS],
             targets: (0..K_MAXIMUM_DYNAMIC_RENDER_TARGETS).map(|_| None).collect(),
         }
-    }
-
-    /// `c_dynamic_render_targets::allocate_target`.
-    pub fn allocate_target(
-        &mut self,
-        _target_type: DynamicRenderTargetType,
-        _width: i32,
-        _height: i32,
-        _target_handle: i32,
-        _frame_index: i32,
-        _name: &str,
-    ) -> i32 {
-        todo!("DynamicRenderTargets::allocate_target — phase 6 (texture cameras)")
-    }
-
-    /// `c_dynamic_render_targets::get_target`.
-    pub fn get_target(&self, target_handle: i32) -> Option<&DynamicRenderTarget> {
-        self.targets
-            .get(target_handle as usize)
-            .and_then(|t| t.as_ref())
-    }
-
-    /// `c_dynamic_render_targets::get_target_from_target_type`.
-    pub fn get_target_from_target_type(
-        &self,
-        target_type: DynamicRenderTargetType,
-    ) -> Option<&DynamicRenderTarget> {
-        self.targets
-            .iter()
-            .filter_map(|t| t.as_ref())
-            .find(|t| t.target_type == target_type)
-    }
-
-    /// `c_dynamic_render_targets::target_allocated`.
-    pub fn target_allocated(&self, target_type: DynamicRenderTargetType) -> bool {
-        self.get_target_from_target_type(target_type).is_some()
     }
 }
 

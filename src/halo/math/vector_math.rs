@@ -19,7 +19,11 @@ use blam_tags::math::RealVector3d;
 ///     return result;
 /// }
 /// ```
+///
+/// Thin engine-named alias over `RealVector3d`'s `Mul<f32>` (the canonical
+/// implementation in `blam_tags::math`) — kept for call-site parity with the
+/// dllcache, but no longer re-derives the component multiply.
 #[inline]
 pub fn scale_vector3d(a: RealVector3d, c: f32) -> RealVector3d {
-    RealVector3d { i: c * a.i, j: c * a.j, k: c * a.k }
+    a * c
 }

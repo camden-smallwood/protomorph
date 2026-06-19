@@ -85,21 +85,6 @@ static OBJECT_HEADER_DATA: RwLock<Vec<ObjectHeaderDatum>> = RwLock::new(Vec::new
 /// parent_object_name_index` to its parent object.
 static OBJECT_NAME_MAP: RwLock<Vec<i32>> = RwLock::new(Vec::new());
 
-/// Bind `name_index → object_index` (engine
-/// `object_set_object_index_for_name_index`). Grows the map as needed;
-/// no-op for `name_index < 0`.
-pub fn object_set_object_index_for_name_index(name_index: i16, object_index: u32) {
-    if name_index < 0 {
-        return;
-    }
-    let mut guard = OBJECT_NAME_MAP.write().unwrap();
-    let ni = name_index as usize;
-    if ni >= guard.len() {
-        guard.resize(ni + 1, -1);
-    }
-    guard[ni] = object_index as i32;
-}
-
 /// Resolve `name_index → object_index` (engine
 /// `object_index_from_name_index`). `None` for an out-of-range or
 /// unbound name.
@@ -119,12 +104,6 @@ pub fn object_index_from_name_index(name_index: i16) -> Option<u32> {
 pub fn replace(entries: Vec<ObjectHeaderDatum>) {
     let mut guard = OBJECT_HEADER_DATA.write().unwrap();
     *guard = entries;
-}
-
-/// Wipe the global table + name map (e.g. before loading a new scenario).
-pub fn clear() {
-    OBJECT_HEADER_DATA.write().unwrap().clear();
-    OBJECT_NAME_MAP.write().unwrap().clear();
 }
 
 /// Append a header entry for a runtime-created object that has no
@@ -206,13 +185,6 @@ pub fn get_object_type(object_index: u32) -> ObjectType {
             guard.len()
         ),
     }
-}
-
-/// True iff the table has been populated for the current scenario.
-/// Some renderer call sites can avoid invoking the compute chain when
-/// `false` (engine-equivalent: `object_header_data == NULL` early-out).
-pub fn is_populated() -> bool {
-    !OBJECT_HEADER_DATA.read().unwrap().is_empty()
 }
 
 /// World matrix of `object_index` from its datum (the instance) — port of
@@ -343,7 +315,7 @@ pub fn populate_from_scenario(
     _tags_root: &Path,
 ) {
     use blam_tags::scenario::{ObjectPlacement, TagReferencePalette};
-    use crate::halo::tags::{tag_get, LoadedTag};
+    use crate::halo::tags::tag_get;
 
     let empty: Arc<ObjectDefinition> = Arc::new(ObjectDefinition::default());
 

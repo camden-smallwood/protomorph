@@ -22,7 +22,7 @@
 //! (`collision_surface_test_point` — only reached when caller's `test_surface_flag`
 //! is true, which the decorator-bake chain never sets).
 
-use blam_tags::math::{RealPlane3d, RealPoint3d, RealVector3d};
+use blam_tags::math::{RealPoint3d, RealVector3d};
 use blam_tags::structure_bsp::Bsp3d;
 
 use super::bsp2d;
@@ -114,7 +114,6 @@ pub const BACK_FACING_SURFACES: u32 = 1 << 1;
 pub const IGNORE_TWO_SIDED_SURFACES: u32 = 1 << 2;
 pub const IGNORE_INVISIBLE_SURFACES: u32 = 1 << 3;
 pub const IGNORE_BREAKABLE_SURFACES: u32 = 1 << 4;
-pub const ALLOW_EARLY_OUT: u32 = 1 << 5;
 
 // =============================================================================
 // test_vector_data — engine local struct that threads recursion state
@@ -475,18 +474,81 @@ fn test_vector_recursive(
 // collision_leaf_test_vector — leaf-level surface lookup (`@ 0x180514460`)
 // =============================================================================
 
-/// Engine `global_projection3d_mappings[3][2][2]` @ dllcache `0x180b255b0`.
-/// `[axis][sign]` gives the pair of 3D-axis indices to project onto for the
-/// 2D bsp2d test. `axis` is the dominant plane-normal component (0=X, 1=Y,
-/// 2=Z); `sign` controls orientation. Verbatim bytes from IDA dump.
+/// Engine `global_projection3d_mappings[3][2][3]` @ dllcache `0x180b255b0`.
 ///
-/// Engine also indexes this flat (`global_projection3d_mappings[0][v31][i]`)
-/// where `v31 = 2*axis + sign`; both indexing conventions reach the same byte.
-pub const PROJECTION3D_MAPPINGS: [[[u8; 2]; 2]; 3] = [
-    [[2, 1], [0, 1]], // axis 0 (X-normal dominant)
-    [[2, 0], [0, 2]], // axis 1 (Y-normal dominant)
-    [[1, 2], [0, 1]], // axis 2 (Z-normal dominant)
+/// SINGLE SOURCE OF TRUTH for the 2D-projection axis table shared by every
+/// collision/geometry path (this module, `structures::collision_bsp`, and
+/// `geometry::geometry_sampling`). Both the 3-wide and 2-wide forms below
+/// derive from this constant so they can never re-diverge (a prior bug had
+/// the two homes carrying inconsistent transcriptions — see git history).
+///
+/// `short[3][2][3]` indexed by `(projection_axis, projection_sign, kind)`:
+///   kind 0 → which 3D component becomes 2D X.
+///   kind 1 → which 3D component becomes 2D Y.
+///   kind 2 → the dropped component (= `projection_axis`; carried only for
+///            parity with the engine table, unused by 2D testing).
+///
+/// `projection_axis` is the dominant plane-normal component (0=X, 1=Y, 2=Z);
+/// `projection_sign` controls the 2D winding order. A projection MUST drop the
+/// dominant axis and keep the OTHER two — neither of kinds 0/1 may equal
+/// `projection_axis` (that would collapse the surface to a line). The guard
+/// test below enforces this invariant.
+pub const PROJECTION3D_MAPPINGS_FULL: [[[u8; 3]; 2]; 3] = [
+    [[2, 1, 0], [1, 2, 0]], // axis 0 (X dropped): project onto {Z,Y}/{Y,Z}
+    [[0, 2, 1], [2, 0, 1]], // axis 1 (Y dropped): project onto {X,Z}/{Z,X}
+    [[1, 0, 2], [0, 1, 2]], // axis 2 (Z dropped): project onto {Y,X}/{X,Y}
 ];
+
+/// 2-wide `[axis][sign] -> (2D-X, 2D-Y)` view, derived from
+/// [`PROJECTION3D_MAPPINGS_FULL`] by dropping the parity (kind-2) column.
+/// This is the form consumed by the 2D bsp2d / point-in-triangle tests.
+pub const PROJECTION3D_MAPPINGS: [[[u8; 2]; 2]; 3] = projection3d_mappings_2wide();
+
+const fn projection3d_mappings_2wide() -> [[[u8; 2]; 2]; 3] {
+    let f = PROJECTION3D_MAPPINGS_FULL;
+    [
+        [[f[0][0][0], f[0][0][1]], [f[0][1][0], f[0][1][1]]],
+        [[f[1][0][0], f[1][0][1]], [f[1][1][0], f[1][1][1]]],
+        [[f[2][0][0], f[2][0][1]], [f[2][1][0], f[2][1][1]]],
+    ]
+}
+
+#[cfg(test)]
+mod projection_mapping_tests {
+    use super::{PROJECTION3D_MAPPINGS, PROJECTION3D_MAPPINGS_FULL};
+
+    /// Every (axis, sign) entry must project onto the two axes OTHER than the
+    /// dropped/dominant `axis` — never onto `axis` itself (that would collapse
+    /// the triangle to a line). Guards against transcription drift.
+    #[test]
+    fn no_entry_projects_onto_dropped_axis() {
+        for axis in 0..3u8 {
+            for sign in 0..2 {
+                let pair = PROJECTION3D_MAPPINGS[axis as usize][sign];
+                assert_ne!(pair[0], axis, "axis {axis} sign {sign} projects onto dropped axis");
+                assert_ne!(pair[1], axis, "axis {axis} sign {sign} projects onto dropped axis");
+                assert_ne!(pair[0], pair[1], "axis {axis} sign {sign} has duplicate axis");
+                // kind-2 parity column must equal the dropped/dominant axis.
+                assert_eq!(
+                    PROJECTION3D_MAPPINGS_FULL[axis as usize][sign][2], axis,
+                    "axis {axis} sign {sign} parity column != dropped axis"
+                );
+            }
+        }
+    }
+
+    /// The 2-wide view must stay byte-identical to the first two columns of
+    /// the full table — this is what prevents the two homes from re-diverging.
+    #[test]
+    fn two_wide_matches_full() {
+        for axis in 0..3 {
+            for sign in 0..2 {
+                assert_eq!(PROJECTION3D_MAPPINGS[axis][sign][0], PROJECTION3D_MAPPINGS_FULL[axis][sign][0]);
+                assert_eq!(PROJECTION3D_MAPPINGS[axis][sign][1], PROJECTION3D_MAPPINGS_FULL[axis][sign][1]);
+            }
+        }
+    }
+}
 
 /// `collision_leaf_test_vector` @ dllcache `0x180514460`.
 ///

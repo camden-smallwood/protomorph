@@ -157,27 +157,12 @@ impl BakeMaterialLookup {
 
 thread_local! {
     /// Thread-local cache active during `c_geometry_sampler::sample`'s
-    /// bake-driven loops. Set by [`with_bake_lookup`]; readers see
+    /// bake-driven loops. Set by [`BakeLookupGuard`]; readers see
     /// `Some(&lookup)` only during the scoped closure.
     static BAKE_LOOKUP: RefCell<Option<BakeMaterialLookup>> = const { RefCell::new(None) };
 }
 
-/// Install `lookup` as the thread-local bake lookup for the duration of
-/// `f`. Restores the previous value (typically `None`) on return.
-pub fn with_bake_lookup<F, R>(lookup: BakeMaterialLookup, f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    let prior = BAKE_LOOKUP.with(|c| c.borrow_mut().replace(lookup));
-    let result = f();
-    BAKE_LOOKUP.with(|c| {
-        *c.borrow_mut() = prior;
-    });
-    result
-}
-
-/// RAII guard variant of [`with_bake_lookup`]. Installs `lookup` on
-/// construction and restores the prior thread-local on drop. Use when
+/// RAII guard for installing a thread-local bake lookup. Installs `lookup` on
 /// the bake scope spans an entire function body — wrapping it in a
 /// closure would force re-indenting hundreds of lines.
 pub struct BakeLookupGuard {
@@ -200,7 +185,7 @@ impl Drop for BakeLookupGuard {
 }
 
 /// Borrow the material's sampler entry for the duration of `f`. `f`
-/// receives `None` outside a [`with_bake_lookup`] scope, or when the
+/// receives `None` outside a [`BakeLookupGuard`] scope, or when the
 /// lookup doesn't carry an entry for the given key (uncached materials,
 /// load failures, etc.) — `sample_diffuse_textures` interprets `None` as
 /// "no postprocess data; return all-zero diffuse" (matches the engine's

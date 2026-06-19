@@ -32,13 +32,16 @@
 //! See dllcache `c_decal::build_mesh_fragment @ 0x18039CCC0` lines
 //! 108-172 for the engine's matrix3x4_inverse_compose path.
 
-use blam_tags::math::{RealPlane3d, RealPoint3d, RealVector3d};
+use blam_tags::math::RealPoint3d;
 use blam_tags::structure_bsp::{Bsp3d, BspInstance, BspInstanceDefinition};
 
 use crate::halo::structures::collision_bsp::{collision_bsp_test_vector, CollisionBspResult};
 use blam_tags::math::RealMatrix4x3;
 
 use super::mesh_builder::matrix4x3_inverse_transform_point;
+use crate::halo::math::matrix_math::{
+    matrix4x3_inverse_compose, matrix4x3_inverse_transform_vector,
+};
 
 /// Result of a successful instance-geometry raycast.
 #[derive(Debug, Clone)]
@@ -161,7 +164,7 @@ pub fn try_single_instance_hit(
         max_t,
     )?;
 
-    let local_proj = inverse_compose_projection(&m_inst, world_projection);
+    let local_proj = matrix4x3_inverse_compose(&m_inst, world_projection);
     let local_point = RealPoint3d {
         x: local_origin.x + r.t * local_vector[0],
         y: local_origin.y + r.t * local_vector[1],
@@ -222,90 +225,7 @@ fn fast_vector_intersects_sphere(
     disc > neg_along * neg_along
 }
 
-/// Mirror of `matrix4x3_inverse_transform_vector @ 0x1802c4d90`. Same
-/// math as `inverse_transform_point` but ignores translation. Engine
-/// clamps `|scale| >= 1e-4`.
-fn matrix4x3_inverse_transform_vector(m: &RealMatrix4x3, v: [f32; 3]) -> [f32; 3] {
-    let scale = m.scale;
-    let mut vx = v[0];
-    let mut vy = v[1];
-    let mut vz = v[2];
-    if scale != 1.0 {
-        const EPS: f32 = 0.000099999997;
-        let safe = if scale < 0.0 {
-            if scale > -EPS {
-                -EPS
-            } else {
-                scale
-            }
-        } else if scale <= EPS {
-            EPS
-        } else {
-            scale
-        };
-        let inv = 1.0 / safe;
-        vx *= inv;
-        vy *= inv;
-        vz *= inv;
-    }
-    [
-        vy * m.forward.j + vx * m.forward.i + vz * m.forward.k,
-        vy * m.left.j + vx * m.left.i + vz * m.left.k,
-        vy * m.up.j + vx * m.up.i + vz * m.up.k,
-    ]
-}
-
-/// Apply only the inverse rotation (`R^T`) — no scale-divide, no
-/// translation. Used to pull the projection's BASIS vectors (which
-/// are pure directions, not scaled by `M_inst.scale`) into
-/// instance-local space.
-fn matrix4x3_inverse_rotate_vector(m: &RealMatrix4x3, v: RealVector3d) -> RealVector3d {
-    RealVector3d {
-        i: m.forward.i * v.i + m.forward.j * v.j + m.forward.k * v.k,
-        j: m.left.i * v.i + m.left.j * v.j + m.left.k * v.k,
-        k: m.up.i * v.i + m.up.j * v.j + m.up.k * v.k,
-    }
-}
-
-/// `M_local_proj = M_inst^{-1} ∘ M_proj`. See module-level doc for
-/// derivation.
-fn inverse_compose_projection(
-    m_inst: &RealMatrix4x3,
-    m_proj: &RealMatrix4x3,
-) -> RealMatrix4x3 {
-    let scale = m_proj.scale / m_inst.scale.max(1e-4);
-    RealMatrix4x3 {
-        scale,
-        forward: matrix4x3_inverse_rotate_vector(m_inst, m_proj.forward),
-        left: matrix4x3_inverse_rotate_vector(m_inst, m_proj.left),
-        up: matrix4x3_inverse_rotate_vector(m_inst, m_proj.up),
-        position: matrix4x3_inverse_transform_point(m_inst, m_proj.position),
-    }
-}
-
 #[inline]
 fn point_from_arr(a: [f32; 3]) -> RealPoint3d {
     RealPoint3d { x: a[0], y: a[1], z: a[2] }
-}
-
-/// Inverse-transform a plane through `M_inst`. World-space plane
-/// `(n, d)` satisfies `n·p = d`. Instance-local plane has normal
-/// `R_inst^T · n` (rotation only — instance scale doesn't tilt the
-/// plane) and `d_local = d - n·t_inst` (then scale by `1/scale_inst`
-/// since world `p = R*s*p_local + t`).
-pub fn inverse_transform_plane(m_inst: &RealMatrix4x3, p: RealPlane3d) -> RealPlane3d {
-    let normal = matrix4x3_inverse_rotate_vector(
-        m_inst,
-        RealVector3d { i: p.i, j: p.j, k: p.k },
-    );
-    let s = m_inst.scale.max(1e-4);
-    let d_local = (p.d
-        - (p.i * m_inst.position.x + p.j * m_inst.position.y + p.k * m_inst.position.z))
-        / s;
-    RealPlane3d {
-        i: normal.i,
-        j: normal.j,
-        k: normal.k,
-        d: d_local,
-    }
 }

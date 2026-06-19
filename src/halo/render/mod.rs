@@ -1,7 +1,6 @@
 mod final_composite_pass;
 pub mod atmosphere_fog_interface;
 pub mod bind_group_cache;
-pub mod env_probe_pass;
 pub mod lighting_interface;
 pub mod render_method_data;
 pub mod select_entry_point;
@@ -35,17 +34,17 @@ pub mod render_decals;
 pub mod render_decorators;
 pub mod render_visibility;
 pub mod views;
+mod scenario_lighting_bake;
+mod rasg_load;
 
 use crate::game::GameState;
 use glam::Vec3;
 use crate::halo::geometry::MAXIMUM_NUMBER_OF_MODEL_NODES;
-use crate::halo::camera::CameraUniforms;
-use crate::halo::geometry::{ModelData, ModelMeshPart, ModelUniforms, SkyVertColorVertex};
+use crate::halo::geometry::{ModelData, ModelMeshPart, SkyVertColorVertex};
 use crate::halo::objects::ObjectIndex;
-use crate::halo::render::env_probe_pass::GpuSkyParams;
 use crate::halo::render_methods::material_bindings::{fallback_view_for_param, sample_intent_for_param};
 use crate::halo::render_methods::HaloEntryPoint;
-use crate::halo::render_methods::materials::{InlinePixelFormat, MaterialData, MaterialTextureUsage};
+use crate::halo::render_methods::materials::{InlinePixelFormat, MaterialData};
 use crate::halo::render_methods::pipeline_cache::{
     HaloPipelineCache, VariantArtifacts,
 };
@@ -309,6 +308,14 @@ pub(crate) struct GpuMaterial {
     /// sort (engine `transparent_layer_and_z_sort_proc`). `Normal` for
     /// opaque/stub materials.
     pub sort_layer: crate::halo::render::render_transparents::TransparentSortLayer,
+    /// @group(1) bind group for the alpha-tested shadow-generate pipeline
+    /// (`shadow_generate.wgsl::fs_alpha_test`): the material's
+    /// `alpha_test_map` view + sampler + `alpha_test_map_xform`. `Some`
+    /// only for OPAQUE materials whose render method has `alpha_test != off`
+    /// (grates, chain-link, foliage props) — they cast holey shadows.
+    /// Built once at load via `ShadowApplyPass::build_alpha_test_bind_group`.
+    /// `None` → the part draws through the plain (opaque) shadow pipeline.
+    pub shadow_alpha_test_bg: Option<wgpu::BindGroup>,
 }
 
 pub(crate) struct GpuModel {
@@ -427,7 +434,7 @@ pub struct ObjectLightingCacheEntry {
     pub sh_lum: f32,
     /// `e_object_type` discriminant — index into the chmt
     /// `per_object_type_min_luminance[]` table.
-    pub object_type: crate::halo::objects::object_constants::ObjectType,
+    pub object_type: crate::halo::objects::object_type::ObjectType,
     /// Byte offset into `engine_lighting_buffer` where this placement's
     /// 10-vec4 ravi cbuffer entry lives. Assigned sequentially as
     /// placements get baked (`structure_renderer.next_probe_slot`).
@@ -489,7 +496,7 @@ pub struct Renderer {
     /// data it needs (`scenario_sky_atmosphere` + `active_bsp_clusters` +
     /// `active_bsp_atmosphere_palette`), `views::render_player_view` rebuilds
     /// the cbuffer per frame from the eye's containing cluster.
-    scenario_atmosphere: env_probe_pass::GpuAtmosphereData,
+    scenario_atmosphere: atmosphere_fog_interface::GpuAtmosphereData,
     /// Cached `SkyAtmosphere` (the scenario's `atmospheric` →
     /// `.sky_atm_parameters`). Drives the L3 per-cluster resolve at
     /// frame time. `None` before a scenario loads.
@@ -502,6 +509,10 @@ pub struct Renderer {
     /// 0x1803AFBA0`.
     scenario_active_bsp_clusters: Vec<blam_tags::structure_bsp::BspCluster>,
     scenario_active_bsp_atmosphere_palette: Vec<blam_tags::structure_bsp::BspAtmospherePaletteEntry>,
+    /// Cluster portals + collision-BSP planes of the active BSP — needed by
+    /// the SP `compute_cluster_weights` sphere walk (structure_clusters_in_sphere).
+    scenario_active_bsp_cluster_portals: Vec<blam_tags::structure_bsp::BspClusterPortal>,
+    scenario_active_bsp_planes: Vec<blam_tags::math::RealPlane3d>,
     /// `c_atmosphere_fog_interface` singleton mirror — owns the
     /// accumulated `s_weighted_atmosphere_parameters` and the
     /// last-applied-cbuffer bookkeeping. Populated each frame by
@@ -517,7 +528,7 @@ pub struct Renderer {
     /// Sky sun (`get_sun_constants_from_sky @ 0x1803adcb0`) — engine's
     /// fallback when the picked atmosphere setting's bit-1 ("Override
     /// Real Sun Values") is unset.
-    scenario_sky_sun: Option<env_probe_pass::SkySun>,
+    scenario_sky_sun: Option<atmosphere_fog_interface::SkySun>,
     /// Active scenario's camera_fx_settings tag — drives bloom,
     /// color grading, SSAO, lightshafts via `ScreenPostprocess`.
     /// `None` until a scenario is loaded.
@@ -590,7 +601,7 @@ pub struct Renderer {
     /// GPU particle subsystem — the persistent RawParticleState grid +
     /// spawn/update/render compute (effects: waterfall mist, etc.).
     pub particle_gpu: crate::halo::gpu_particle::ParticleGpu,
-    pub light_volume_gpu: crate::halo::gpu_particle::light_volume::LightVolumeGpu,
+    pub light_volume_gpu: crate::halo::gpu_particle::light_volume_gpu::LightVolumeGpu,
 
     /// Engine-faithful per-frame camera visibility collection
     /// (Phase F-G). Populated by [`crate::halo::render::render_visibility::render_visibility_camera_collection_compute`]
@@ -647,8 +658,8 @@ pub struct Renderer {
 
     /// `c_lights_view` mirror — holds the up-to-8 simple lights for
     /// the active player view. Populated at scenario load (L2c) +
-    /// per-frame culled (L2d). Uploaded each frame to
-    /// `shared.simple_lights_buffer` via `GpuSimpleLights::from_lights_view`.
+    /// per-frame culled (L2d). Built each frame from `lights_view` and
+    /// uploaded to `shared.simple_lights_buffer`.
     pub lights_view: crate::halo::render::views::LightsView,
 
     /// `c_screen_postprocess` mirror — bloom + tonemap + color
@@ -884,8 +895,12 @@ impl Renderer {
             .normal_texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         // DepthOnly scene-depth view → transparent camera bind group's
-        // soft_z sampling (binding 15).
-        let gbuffer_depth_view = gbuffer.depth_texture.create_view(&wgpu::TextureViewDescriptor {
+        // soft_z sampling (binding 15). View the COPY texture, not the
+        // live depth attachment, so sampling doesn't alias the read-only
+        // depth attachment in the transparent pass (TBDR flicker — see
+        // `GBuffer::depth_sample_view`). Refreshed via
+        // `GBuffer::copy_depth_for_sampling` before the transparent pass.
+        let gbuffer_depth_view = gbuffer.depth_copy_texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("scene_depth_soft_z"),
             aspect: wgpu::TextureAspect::DepthOnly,
             ..Default::default()
@@ -912,6 +927,7 @@ impl Renderer {
             screen_postprocess.color_grading_active_view(),
             screen_postprocess.color_grading_back_view(),
             screen_postprocess.dof_blur_view(),
+            screen_postprocess.bling_result_view(),
         );
 
         // Phase 1 frame order. Halo's `c_player_view::render` ordering
@@ -955,7 +971,7 @@ impl Renderer {
         let sky_gpu = render_sky::SkyGpu::new(&shared);
         let particle_gpu = crate::halo::gpu_particle::ParticleGpu::new(&shared);
         let light_volume_gpu =
-            crate::halo::gpu_particle::light_volume::LightVolumeGpu::new(&shared);
+            crate::halo::gpu_particle::light_volume_gpu::LightVolumeGpu::new(&shared);
 
         Self {
             surface,
@@ -987,10 +1003,12 @@ impl Renderer {
             lighting_interface: lighting_interface::LightingInterface::fallback(),
             // Neutral atmosphere — `compute_scattering` returns ext=1,
             // ins=0 until a scenario is loaded.
-            scenario_atmosphere: env_probe_pass::GpuAtmosphereData::neutral(),
+            scenario_atmosphere: atmosphere_fog_interface::GpuAtmosphereData::neutral(),
             scenario_sky_atmosphere: None,
             scenario_active_bsp_clusters: Vec::new(),
             scenario_active_bsp_atmosphere_palette: Vec::new(),
+            scenario_active_bsp_cluster_portals: Vec::new(),
+            scenario_active_bsp_planes: Vec::new(),
             atmosphere_fog_interface:
                 crate::halo::render::atmosphere_fog_interface::AtmosphereFogInterface::default(),
             scenario_view_exposure: 0.67,
@@ -1083,52 +1101,9 @@ impl Renderer {
     /// caller then binds the rasg `DefaultDynamicCubeMap` fallback, as the
     /// engine does when `get_cluster_cubemap_index` returns -1).
     pub(crate) fn nearest_object_cubemap_probe(&self, pos: glam::Vec3) -> Option<u16> {
-        if self.object_cubemap_positions.is_empty() {
-            return None;
-        }
-        let mut best = 0u16;
-        let mut best_d2 = f32::INFINITY;
-        for (i, p) in self.object_cubemap_positions.iter().enumerate() {
-            let d2 = (pos - *p).length_squared();
-            if d2 < best_d2 {
-                best_d2 = d2;
-                best = i as u16;
-            }
-        }
-        Some(best)
+        nearest_by(&self.object_cubemap_positions, pos, |p| *p).map(|(i, _)| i as u16)
     }
 
-    /// Load a tag-relative `.bitmap` to a sampled view. `None` if the
-    /// path is empty or the bitmap fails to load.
-    fn load_bitmap_view(
-        &self,
-        tags_root: &std::path::Path,
-        rel: &str,
-    ) -> Option<wgpu::TextureView> {
-        self.load_bitmap_view_dims(tags_root, rel).map(|(v, _, _)| v)
-    }
-
-    /// Like [`Self::load_bitmap_view`] but also returns the base-mip
-    /// `(width, height)` — needed to bake the particle sprite corner's
-    /// bitmap-aspect factor.
-    fn load_bitmap_view_dims(
-        &self,
-        tags_root: &std::path::Path,
-        rel: &str,
-    ) -> Option<(wgpu::TextureView, u32, u32)> {
-        if rel.is_empty() {
-            return None;
-        }
-        let abs = blam_tags::paths::resolve_tag_path(tags_root, rel, "bitmap");
-        let tex = crate::halo::bitmaps::load(&abs)?;
-        let (w, h) = (tex.width, tex.height);
-        let view = crate::halo::structures::bsp_gpu::upload_inline_texture(
-            &self.shared,
-            &tex,
-            crate::halo::render::SampleIntent::FollowCurve,
-        );
-        Some((view, w, h))
-    }
 
     /// Build one render batch per particle system (loading each system's
     /// base/alpha/palette bitmaps) and register them with the GPU
@@ -1298,10 +1273,63 @@ impl Renderer {
     /// Returns the scenario as an `Arc` so the renderer can keep a
     /// per-frame reference (Phase I0a) while the caller retains
     /// access for diagnostics + object spawning.
+    /// Reset per-SCENARIO renderer state to its freshly-constructed
+    /// default so a second `load_scenario` (map switch) doesn't
+    /// append/leak onto the previous map's content. Called at the very
+    /// top of `load_scenario`, before any population.
+    ///
+    /// NO-OP on a fresh renderer's first load: every field cleared here
+    /// is already empty / default at that point (clearing an empty
+    /// Vec, setting `next_probe_slot` 1→1), so the first/only load is
+    /// byte-identical to today.
+    ///
+    /// What it clears and why it's safe (each is empty on first load AND
+    /// repopulated afterward):
+    /// - `structure_renderer.{bsps, bsp_cluster_meshes, bsp_cluster_bounds,
+    ///   bsp_instance_bounds, lightmap_bsp_data, cluster_parts,
+    ///   instance_parts}` + `next_probe_slot → 1` (via
+    ///   `StructureRenderer::reset`) — all repopulated by
+    ///   `Renderer::upload_bsp` (driven from `game.rs::load_scene` after
+    ///   `load_scenario` returns) or rebuilt per-frame by
+    ///   `submit_visibility`.
+    /// - `self.models` — the placement model pool, repopulated by
+    ///   `upload_model_data` / `load_object_tag` from `game.rs::load_scene`
+    ///   after `load_scenario` returns. (Each `GpuModel` owns its
+    ///   `bind_group_probes`, so this also drops the per-model cubemap
+    ///   bind groups.)
+    /// - `object_cubemap_probe_views` / `object_cubemap_positions` — the
+    ///   object dynamic-env probe atlas; repopulated in `upload_bsp`
+    ///   (which gates on `is_empty()`, so without this reset a second
+    ///   load would keep the FIRST map's atlas).
+    ///
+    /// Deliberately NOT cleared (initialized-once / per-frame, not
+    /// per-scenario content): `structure_renderer.identity_*` bindings
+    /// (shared identity scratch, reinit gated on `is_none()` in
+    /// `init_bsp_identity_bindings`), the device/queue/pipelines/sampler
+    /// caches, and `sky_model` (unconditionally reassigned later in
+    /// `load_scenario`).
+    ///
+    /// The process-global object/tag tables (`OBJECT_HEADER_DATA`,
+    /// `OBJECT_NAME_MAP`, `TAG_CACHE`) are reset by existing helpers
+    /// already invoked during this load: `LoadedScenario::load` calls
+    /// `tag_init` (clears `TAG_CACHE` + sets the new root) and
+    /// `populate_from_scenario` (full-`replace`s `OBJECT_HEADER_DATA` and
+    /// clears `OBJECT_NAME_MAP`). No extra reset is needed here.
+    fn reset_scene(&mut self) {
+        self.structure_renderer.reset();
+        self.models.clear();
+        self.object_cubemap_probe_views.clear();
+        self.object_cubemap_positions.clear();
+    }
+
     pub fn load_scenario(
         &mut self,
         path: &std::path::Path,
     ) -> Result<std::sync::Arc<crate::halo::scenario::LoadedScenario>, crate::halo::scenario::ScenarioLoadError> {
+        // Reset per-scenario state BEFORE any population so a map switch
+        // (a second `load_scenario`) doesn't append/leak onto the prior
+        // map. NO-OP on the first/only load (everything is already empty).
+        self.reset_scene();
         // Pre-load rasg + per-BSP cubemap atlas BEFORE
         // `LoadedScenario::load` so material bind-group construction
         // (which reads `fallback_view_for_param` for cube slots) sees
@@ -1313,6 +1341,7 @@ impl Renderer {
             || path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
         );
         self.preload_dynamic_cubemap_for_scenario(&tags_root, path);
+        crate::halo::structures::bsp_gpu::gpu_checkpoint(&self.shared, "preload_dynamic_cubemap (rasg)");
         let loaded = crate::halo::scenario::LoadedScenario::load(path)?;
         // Cache the atmospheric scattering parameters so all halo
         // shaders can read them via the `engine_atmosphere` cbuffer
@@ -1408,6 +1437,7 @@ impl Renderer {
                 self.screen_postprocess.color_grading_active_view(),
                 self.screen_postprocess.color_grading_back_view(),
                 self.screen_postprocess.dof_blur_view(),
+                self.screen_postprocess.bling_result_view(),
             );
             // Engine-faithful: route through `set_composite_params` so
             // tone curve constants are recomputed from
@@ -1419,6 +1449,7 @@ impl Renderer {
                 [0.0, 0.0, 0.0, 0.0],
                 self.screen_postprocess.settings_internal.tone_curve,
                 self.screen_postprocess.settings_internal.tone_curve_white_point,
+                self.screen_postprocess.bling_scale(),
             );
             match cfx.color_grading.as_ref() {
                 Some(cg) if cg.is_enabled() => {
@@ -1447,7 +1478,7 @@ impl Renderer {
         // 0.2`), which washed every distant pixel toward white.
         let sky_sun = loaded.sky_lighting.as_ref().and_then(|s| {
             match (s.lightgen_sun_intensity, s.lightgen_sun_direction) {
-                (Some(i), Some(d)) => Some(env_probe_pass::SkySun {
+                (Some(i), Some(d)) => Some(atmosphere_fog_interface::SkySun {
                     intensity: [i.i, i.j, i.k],
                     direction: [d.i, d.j, d.k],
                 }),
@@ -1455,8 +1486,8 @@ impl Renderer {
             }
         });
         self.scenario_atmosphere = loaded.atmosphere.as_ref()
-            .map(|atm| env_probe_pass::GpuAtmosphereData::from_sky_atmosphere_with_exposure(atm, view_exposure, sky_sun))
-            .unwrap_or_else(env_probe_pass::GpuAtmosphereData::neutral);
+            .map(|atm| atmosphere_fog_interface::GpuAtmosphereData::from_sky_atmosphere_with_exposure(atm, view_exposure, sky_sun))
+            .unwrap_or_else(atmosphere_fog_interface::GpuAtmosphereData::neutral);
         // Cache inputs for L3 per-cluster atmosphere resolve at frame
         // time (engine-faithful MP fast-path of compute_cluster_weights).
         self.scenario_sky_atmosphere = loaded.atmosphere.clone();
@@ -1485,9 +1516,18 @@ impl Renderer {
         if let Some(bsp) = loaded.active_bsps.first() {
             self.scenario_active_bsp_clusters = bsp.sbsp.clusters.clone();
             self.scenario_active_bsp_atmosphere_palette = bsp.sbsp.atmosphere_palette.clone();
+            self.scenario_active_bsp_cluster_portals = bsp.sbsp.cluster_portals.clone();
+            self.scenario_active_bsp_planes = bsp
+                .sbsp
+                .collision_bsp
+                .as_ref()
+                .map(|c| c.planes.clone())
+                .unwrap_or_default();
         } else {
             self.scenario_active_bsp_clusters.clear();
             self.scenario_active_bsp_atmosphere_palette.clear();
+            self.scenario_active_bsp_cluster_portals.clear();
+            self.scenario_active_bsp_planes.clear();
         }
         self.scenario_view_exposure = view_exposure;
         self.scenario_sky_sun = sky_sun;
@@ -1503,7 +1543,7 @@ impl Renderer {
         }
         if let Some(atm) = loaded.atmosphere.as_ref() {
             for (i, s) in atm.atmosphere_settings.iter().enumerate() {
-                let snap = env_probe_pass::GpuAtmosphereData::from_atmosphere_setting(s, view_exposure, sky_sun);
+                let snap = atmosphere_fog_interface::GpuAtmosphereData::from_atmosphere_setting(s, view_exposure, sky_sun);
                 let log2e = 1.442695_f32;
                 let beta_m  = [snap.slot2_beta_m_log2e_g1[0]/log2e, snap.slot2_beta_m_log2e_g1[1]/log2e, snap.slot2_beta_m_log2e_g1[2]/log2e];
                 let beta_p  = [snap.slot3_beta_p_log2e_refh[0]/log2e, snap.slot3_beta_p_log2e_refh[1]/log2e, snap.slot3_beta_p_log2e_refh[2]/log2e];
@@ -1575,14 +1615,27 @@ impl Renderer {
         if let Some(bsp) = loaded.active_bsps.first() {
             if let Some(lbsp) = bsp.lightmap.as_ref() {
                 self.upload_lightmap_atlases(&loaded.tags_root, lbsp);
+                crate::halo::structures::bsp_gpu::gpu_checkpoint(&self.shared, "upload_lightmap_atlases");
             }
+        }
+
+        // DIAGNOSTIC (PROTOMORPH_MINIMAL_LOAD=1): load ONLY scenario + BSP +
+        // lightmap + rasg. Skip sky scenery, decorators, scenario lights, and
+        // decals (and game.rs skips all object placements + weather). Bisection
+        // tool for the huge-BSP first-frame freeze that persists even with all
+        // structure DRAWING stripped — isolates whether a loaded auxiliary tag
+        // (decorator instance fields, decal projection meshes, etc.) or its
+        // per-frame pass is the hang, vs. the BSP/lightmap itself.
+        let minimal_load = std::env::var_os("PROTOMORPH_MINIMAL_LOAD").is_some();
+        if minimal_load {
+            eprintln!("[load] PROTOMORPH_MINIMAL_LOAD: skipping sky/decorators/lights/decals");
         }
 
         // Phase B17: load the sky scenery → render_model and stash
         // its GPU meshes/materials. Renders BEFORE BSP albedo with
         // camera-position-translated model_u (parallax-locked sky).
         // Engine equivalent: `c_object_renderer::submit_and_render_sky`.
-        self.sky_model = self.load_sky_scenery(&loaded);
+        self.sky_model = if minimal_load { None } else { self.load_sky_scenery(&loaded) };
 
         // Resolve wind tag + noise bitmap BEFORE decorator load_scenario
         // builds per-set bind groups (so they pick up the real noise
@@ -1638,12 +1691,14 @@ impl Renderer {
         // placement. Engine equivalent: `c_decorator_renderer::initialize`
         // chain. Walks `loaded.scenario.decorators[].sets[].placements[]`
         // and uploads (mesh + texture + instance buffer) per set.
-        self.decorator_renderer.load_scenario(&self.shared, &loaded);
+        if !minimal_load {
+            self.decorator_renderer.load_scenario(&self.shared, &loaded);
+        }
 
         // L2c-real: walk each active BSP's lighting_info, resolve
         // each instance against its definition, and stash the result
         // on the renderer.
-        self.scenario_lights = resolve_scenario_lights(&loaded);
+        self.scenario_lights = if minimal_load { Vec::new() } else { resolve_scenario_lights(&loaded) };
         eprintln!(
             "[scenario]   scenario_lights: {} resolved (from {} BSPs)",
             self.scenario_lights.len(),
@@ -1655,7 +1710,9 @@ impl Renderer {
         // and store the slot offset per cluster. Engine-faithful: each
         // cluster's draws bind their own slot (no per-frame
         // re-selection, no popping).
-        self.bake_cluster_simple_lights(&loaded);
+        if !minimal_load {
+            self.bake_cluster_simple_lights(&loaded);
+        }
 
         // L4: pre-bake per-scenery-placement engine_lighting slots from
         // each BSP's `lightmap_bsp_data.scenery_probes`. Engine equivalent:
@@ -1665,7 +1722,9 @@ impl Renderer {
         // equivalent because the probes are static authoring data — the
         // engine caches the converted sample anyway, only repeating the
         // conversion when the object is re-initialized.
-        self.bake_scenery_lighting_offsets(&loaded);
+        if !minimal_load {
+            self.bake_scenery_lighting_offsets(&loaded);
+        }
 
         // D2b/Step 4b — bake per-palette decal pipelines + bind groups
         // and per-BSP GPU vertex/index buffers. Must run BEFORE wrapping
@@ -1674,13 +1733,15 @@ impl Renderer {
         // palette entry's `c_render_method_shader_decal` chain, and
         // `c_decal_system::create` uploads the projection mesh into
         // the per-BSP allocator pools at scenario init.
-        self.decal_gpu = crate::halo::render::render_decals::bake_decals_gpu(
-            &self.shared,
-            &mut self.halo_pipelines,
-            &mut self.rasterizer.sampler_state_cache,
-            &self.scenario_tags_root,
-            &loaded,
-        );
+        if !minimal_load {
+            self.decal_gpu = crate::halo::render::render_decals::bake_decals_gpu(
+                &self.shared,
+                &mut self.halo_pipelines,
+                &mut self.rasterizer.sampler_state_cache,
+                &self.scenario_tags_root,
+                &loaded,
+            );
+        }
 
         // Phase I0a — stash the scenario for per-frame visibility
         // (`scenario_location_from_point` + `compute()`).
@@ -1689,790 +1750,9 @@ impl Renderer {
         Ok(arc)
     }
 
-    /// L2 per-cluster simple_lights bake. For each BSP cluster, finds
-    /// the up-to-8 nearest scenario lights and packs them into the
-    /// next available slot in `shared.simple_lights_buffer`. Stores
-    /// the slot's dynamic offset on the BSP runtime
-    /// (`cluster_simple_lights_offsets`).
-    ///
-    /// Engine equivalent: `c_lights_view::add_simple_light_to_draw_list`
-    /// called per cluster part inside `c_structure_renderer::render_cluster_mesh_part`.
-    /// Our offline bake gives the same result as long as scenario_lights
-    /// are static (which they are post-load — game-time effect lights
-    /// would still need a runtime path).
-    fn bake_cluster_simple_lights(
-        &mut self,
-        loaded: &crate::halo::scenario::LoadedScenario,
-    ) {
-        if self.scenario_lights.is_empty() {
-            return;
-        }
-        let stride = crate::halo::render::shared::SIMPLE_LIGHTS_STRIDE as u64;
-        let max_slots = crate::halo::render::shared::SIMPLE_LIGHTS_ENTRIES as usize;
-
-        // Phase 1: gather per-cluster (bsp_idx, cluster_idx, payload)
-        // using ONLY immutable borrows of `self.scenario_lights`.
-        struct Pack {
-            bsp_idx: usize,
-            cluster_idx: usize,
-            payload: crate::halo::lighting::GpuSimpleLights,
-        }
-        let mut packs: Vec<Pack> = Vec::new();
-        for (bsp_idx, bsp_loaded) in loaded.active_bsps.iter().enumerate() {
-            for (cluster_idx, cluster) in bsp_loaded.sbsp.clusters.iter().enumerate() {
-                let center = glam::Vec3::new(
-                    0.5 * (cluster.bounds_x.lower + cluster.bounds_x.upper),
-                    0.5 * (cluster.bounds_y.lower + cluster.bounds_y.upper),
-                    0.5 * (cluster.bounds_z.lower + cluster.bounds_z.upper),
-                );
-                let half = glam::Vec3::new(
-                    0.5 * (cluster.bounds_x.upper - cluster.bounds_x.lower),
-                    0.5 * (cluster.bounds_y.upper - cluster.bounds_y.lower),
-                    0.5 * (cluster.bounds_z.upper - cluster.bounds_z.lower),
-                );
-                let cluster_radius = half.length();
-
-                let mut candidates: Vec<(f32, usize)> = self
-                    .scenario_lights
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, l)| {
-                        let d = (l.position - center).length();
-                        if d <= l.max_dist + cluster_radius {
-                            Some((d, i))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                candidates.sort_by(|a, b| {
-                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                if candidates.is_empty() {
-                    continue;
-                }
-
-                let mut payload = crate::halo::lighting::GpuSimpleLights::default();
-                let take = candidates
-                    .len()
-                    .min(crate::halo::lighting::SIMPLE_LIGHTS_MAX);
-                payload.count[0] = take as f32;
-                for (slot_idx, (_dist, scenario_idx)) in
-                    candidates.iter().take(take).enumerate()
-                {
-                    let l = &self.scenario_lights[*scenario_idx];
-                    let mut tmp =
-                        crate::halo::render::views::lights_view::SimpleLight::default();
-                    crate::halo::render::views::lights_view::LightsView::initialize_simple_light(
-                        &mut tmp,
-                        l.position,
-                        l.color,
-                        l.size,
-                        l.max_dist,
-                        l.direction,
-                        l.cone_angle,
-                        l.cone_smoothness,
-                        l.sphere_percentage,
-                    );
-                    crate::halo::lighting::pack_simple_light_at(&mut payload, slot_idx, &tmp);
-                }
-                packs.push(Pack { bsp_idx, cluster_idx, payload });
-            }
-        }
-
-        // Phase 2: assign slot offsets and write to GPU + per-BSP runtime.
-        let mut next_slot: usize = 1; // slot 0 reserved as empty
-        let mut baked: usize = 0;
-        for pack in &packs {
-            if next_slot >= max_slots {
-                eprintln!(
-                    "[scenario]   simple_lights slot pool exhausted at {} slots",
-                    next_slot,
-                );
-                break;
-            }
-            let offset = (next_slot as u64) * stride;
-            self.shared.queue.write_buffer(
-                &self.shared.simple_lights_buffer,
-                offset,
-                bytemuck::bytes_of(&pack.payload),
-            );
-            if let Some(bsp_gpu) = self.structure_renderer.bsps.get_mut(pack.bsp_idx) {
-                if let Some(slot_offset) =
-                    bsp_gpu.cluster_simple_lights_offsets.get_mut(pack.cluster_idx)
-                {
-                    *slot_offset = offset as u32;
-                }
-            }
-            next_slot += 1;
-            baked += 1;
-        }
-        if baked > 0 {
-            eprintln!(
-                "[scenario]   baked simple_lights for {} clusters across {} BSPs",
-                baked,
-                loaded.active_bsps.len(),
-            );
-        }
-    }
-
-    /// L4: pre-bake one engine_lighting slot per scenery placement that
-    /// has a matching baked probe in any active BSP's
-    /// `lightmap_bsp_data.scenery_probes`. Stores slot offsets in
-    /// `scenery_lighting_offsets` for the per-draw bind path (L4.3).
-    ///
-    /// Engine equivalent: `lights_prepare_for_object_static_new @
-    /// 0x1808A2930` — routes per object type:
-    ///   - type 6 (scenery)        → `scenery_probes[obj.scenery_probe_index]`
-    ///   - type 7 (device_machine) → `device_machine_probes[idx]`
-    ///   - everything else          → `c_geometry_sampler::sample_one_air_probe`
-    ///                               (nearest airprobe by world-space distance)
-    ///
-    /// Each branch then calls `convert_probe_to_lighting_sample` to fill
-    /// the cached `s_geometry_sample`, then `c_chocalate_moutain::apply_*`
-    /// for the per-type minimum-luminance floor. We bake all of this at
-    /// scenario load since both placements and probes are static.
-    ///
-    /// Probe-to-placement correspondence:
-    ///   - SCENERY: positional (`scenery_probes[i] → scenery[i]`); engine
-    ///     does `c_object_identifier::is_equal` as a defensive sanity check.
-    ///   - NEAREST AIRPROBE: linear scan over `airprobes[]` selecting the
-    ///     entry whose `position` minimizes Euclidean distance to the
-    ///     placement's `object_data.position`. Engine uses a 3-airprobe
-    ///     trilinear interpolation; v1 takes the single nearest probe to
-    ///     keep the bake simple. Visual delta is small for sparse
-    ///     airprobe layouts (most MP maps).
-    ///
-    /// For multi-BSP scenarios we'd need per-placement BSP resolution;
-    /// v1 matches the engine when one BSP holds all placements.
-    fn bake_scenery_lighting_offsets(
-        &mut self,
-        loaded: &crate::halo::scenario::LoadedScenario,
-    ) {
-        use crate::halo::objects::object_constants::ObjectType;
-        use blam_tags::scenario_lightmap::LightmapProbe;
-
-        // Reset the per-placement cache on every scenario load. Each
-        // entry holds a slot_offset into `engine_lighting_buffer`; we
-        // can't reuse offsets across scenarios since the slot pool's
-        // `next_probe_slot` also resets.
-        self.object_lighting_cache.clear();
-
-        // Engine reads per-bsp probes — for v1 we use BSP 0 (single-BSP
-        // test scenarios). Multi-BSP support: walk `loaded.active_bsps`
-        // and resolve per-placement bsp.
-        let Some(bsp) = loaded.active_bsps.first() else {
-            self.scenery_lighting_offsets = Vec::new();
-            self.crate_lighting_offsets = Vec::new();
-            self.vehicle_lighting_offsets = Vec::new();
-            self.weapon_lighting_offsets = Vec::new();
-            self.equipment_lighting_offsets = Vec::new();
-            self.machine_lighting_offsets = Vec::new();
-            self.control_lighting_offsets = Vec::new();
-            return;
-        };
-        let Some(lbsp) = bsp.lightmap.as_ref() else {
-            self.scenery_lighting_offsets = Vec::new();
-            self.crate_lighting_offsets = Vec::new();
-            self.vehicle_lighting_offsets = Vec::new();
-            self.weapon_lighting_offsets = Vec::new();
-            self.equipment_lighting_offsets = Vec::new();
-            self.machine_lighting_offsets = Vec::new();
-            self.control_lighting_offsets = Vec::new();
-            return;
-        };
-
-        let scenery = &loaded.scenario.scenery;
-        let crates = &loaded.scenario.crates;
-        let vehicles = &loaded.scenario.vehicles;
-        let weapons = &loaded.scenario.weapons;
-        let equipment = &loaded.scenario.equipment;
-        let machines = &loaded.scenario.machines;
-        let controls = &loaded.scenario.controls;
-
-        // Sky-probe fallback for non-scenery placements. Engine equivalent:
-        // `lights_sky_lighing_at_point_new` → cluster's visible sky →
-        // render_model.default_lightprobe → SH3. On single-sky maps
-        // collapses to `skies[0]`'s probe (= `loaded.sky_lighting`). We
-        // pre-compute it as a `DequantizedLightmapProbe` so the bake's
-        // chmt + ravi-pack path treats it identically to an airprobe hit.
-        // Without this, placements with no airprobe inherit the frame
-        // default — bypassing per-type chmt boost.
-        let sky_fallback: Option<blam_tags::scenario_lightmap::DequantizedLightmapProbe> =
-            loaded.sky_lighting.as_ref().map(sky_probe_as_dequantized);
-
-        // Scenery: per-placement probe at `scenery_probes[i]` (positional;
-        // engine does identifier match as a defensive sanity check —
-        // matched-by-index is the common case in MCC tags). NO sky
-        // fallback — placements without a probe match engine-default
-        // behavior (offset = None inherits the frame default).
-        let scenery_offsets = self.bake_object_lighting_offsets(
-            scenery.len(),
-            ObjectType::Scenery,
-            "scenery",
-            |i, _pos| lbsp.scenery_probes.get(i).map(|p| p.probe.dequantize()),
-        );
-
-        // Non-scenery dynamic placements: engine fallback chain from
-        // `lights_prepare_for_object_static_new @ 0x1808A2930`'s
-        // LABEL_114 path (the "no per-object airprobe_index, no
-        // per-object scenery/device probe_index" final fallback). Engine
-        // order:
-        //   1. `lights_distant_lighting_at_point_new` — raycast BSP +
-        //      sample cluster lightprobe atlas at hit (Phase A here).
-        //   2. `lights_airprobe_lighting_at_point_new` — nearest-airprobe.
-        //   3. `lights_sky_lighing_at_point_new` — sky default lightprobe.
-        // Order matters: on maps where airprobes are stripped (e.g.
-        // deadlock has 0 airprobes), step 1 supplies dim cluster
-        // lighting; without it crates inherit bright sky DC and blow
-        // out. See [[project_object_lighting_fallback_2026_05_14]].
-        let airprobes: &[blam_tags::scenario_lightmap::LightmapAirprobe] = loaded
-            .scenario_lightmap
-            .as_ref()
-            .filter(|s| !s.airprobes.is_empty())
-            .map(|s| s.airprobes.as_slice())
-            .unwrap_or(lbsp.airprobes.as_slice());
-        eprintln!(
-            "[scenario]   airprobes available: {} (sky-probe fallback when 0)",
-            airprobes.len(),
-        );
-
-        // Phase 9.1 cutover: dropped the invented Raycaster construction.
-        // The new chain (`c_geometry_sampler::sample` via the
-        // `render::geometry_sampler` shim) resolves BSP geometry via the
-        // engine-faithful `collision_test_vector` + `geometry_test_collision_result`
-        // chain. Per-BSP atlas decode is still needed (same `decode_bake_resources`
-        // helper used by the decorator bake).
-        let bake_resources = crate::halo::render::render_decorators::decode_bake_resources(loaded);
-        let raycast_ready = !bake_resources.is_empty();
-        if raycast_ready {
-            eprintln!(
-                "[scenario]   geometry_sampler ready: {} BSP atlases (new c_geometry_sampler::sample chain)",
-                bake_resources.len(),
-            );
-        } else {
-            eprintln!(
-                "[scenario]   geometry_sampler unavailable (atlases={}) — falling through to airprobe/sky",
-                bake_resources.len(),
-            );
-        }
-
-        // PROTOMORPH_DIAG_OL4_PATH=<type>:<i> or "all" — prints the
-        // resolution chain (radius/flags/dispatch/outcome/airprobe) for
-        // matched placements. Use to diagnose "this object renders
-        // dim/black" — distinguishes default-branch-hits-dim-atlas vs
-        // airprobe-fallback vs sky-fallback.
-        let probe_for_diag = std::env::var("PROTOMORPH_DIAG_OL4_PATH").ok();
-        let probe_for = |pos: glam::Vec3, radius: f32, obj_def_flags: blam_tags::Flags<blam_tags::object::ObjectDefinitionFlags, u16>, diag_label: &str| -> Option<blam_tags::scenario_lightmap::DequantizedLightmapProbe> {
-            let log = probe_for_diag.as_deref() == Some(diag_label) || probe_for_diag.as_deref() == Some("all");
-            // Engine-faithful per-tag dispatch of
-            // `lights_prepare_for_object_static_new @ 0x1808A2930`:
-            // ```c
-            // v53 = (_object_datum.flags & 0x2000) != 0;   // bit 13 runtime
-            // if (_object_definition.flags & 2) v53 |= 1;   // bit 1 tag
-            // ```
-            // Bit 13 of `_object_datum.flags` is
-            // `_object_static_lighting_raycast_sideways_bit`. Confirmed
-            // setter audit (2026-05-24): the ONLY `*_new` setter is
-            // `machine_new @ 0x18087ce28` gated on `_machine_definition.flags
-            // & 0x04`. All other `*_new` (crate/scenery/weapon/equipment/
-            // biped/vehicle/creature) leave bit 13 = 0 at scenario load.
-            // Runtime setters (`effect_start`, `area_of_effect_cause_damage_
-            // to_object`, `object_scripting_set_shield_effect`,
-            // `vehicle_surge_update`, `object_update_decode`) fire on
-            // gameplay events, not scenario load.
-            //
-            // So at scenario load, for any non-machine placement: bit 13
-            // is 0. Engine MCC's dispatch is identical to ours when
-            // `_object_definition.flags & 2 == 0` too: it uses the
-            // default 1-ray branch. If our default branch produces
-            // visibly black objects where MCC renders them correctly,
-            // the divergence is in DATA (atlas bytes, per-vertex SH
-            // availability, default-fill semantic), NOT dispatch.
-            //
-            // Diag: with `PROTOMORPH_DIAG_GEOMETRY_SAMPLER="x,y,z,r"`
-            // matching the cast start, `sample()` dumps priority-chain
-            // decision + per-vertex / atlas SH values. Use this to
-            // discriminate the three hypotheses in
-            // [[feedback_ol4_dispatch_blocked_by_bit13]].
-            if log {
-                eprintln!(
-                    "[diag-ol4] {diag_label} pos=({:.3},{:.3},{:.3}) radius={radius:.4} obj_def_flags={obj_def_flags:?} (searches_lightmaps_on_failure={})",
-                    pos.x, pos.y, pos.z,
-                    obj_def_flags.contains(blam_tags::object::ObjectDefinitionFlags::SearchCardinalDirectionLightmapsOnFailure),
-                );
-                eprintln!(
-                    "[diag-ol4]   raycast_ready={raycast_ready} bake_resources.len()={}",
-                    bake_resources.len(),
-                );
-            }
-            if raycast_ready {
-                if let Some(ba) = bake_resources.first() {
-                    // Engine-verbatim `s_geometry_sample` (504 B, 11 fields).
-                    use crate::halo::geometry::geometry_sampling::{
-                        lights_distant_lighting_at_point_new, lights_distant_lighting_flags,
-                        GeometrySample, GeometrySamplerOutcome,
-                    };
-                    use crate::halo::math::globals::GLOBAL_UP_3D;
-                    use blam_tags::math::RealPoint3d;
-
-                    let use_sideways = obj_def_flags
-                        .contains(blam_tags::object::ObjectDefinitionFlags::SearchCardinalDirectionLightmapsOnFailure);
-                    let flags = if use_sideways { lights_distant_lighting_flags::SIDEWAYS } else { 0 };
-                    if log {
-                        if use_sideways {
-                            eprintln!("[diag-ol4]   dispatch: SIDEWAYS (9-ray)");
-                        } else {
-                            let v28 = if radius > 0.05 { radius.max(0.4) } else { 0.4 };
-                            let v29 = radius.max(0.05);
-                            eprintln!(
-                                "[diag-ol4]   dispatch: DEFAULT (1-ray) v28={v28:.3} v29={v29:.3} ray_start=(*,*,+{v29:.3}) ray_dir=(*,*,-{:.2})",
-                                10.0 * v28,
-                            );
-                        }
-                    }
-                    let mut gs = GeometrySample::default();
-                    // Engine reads object_class (n6), object_def_flags, object_radius,
-                    // and `up` from object_header_data + object_get_orientation. For
-                    // statically-placed scenery at scenario load we lack an object
-                    // index; pass a sentinel class (255) that falls into the
-                    // 1-ray default branch, world-up. The runtime datum
-                    // `object_def_flags` is unavailable here, and its only branch
-                    // (damaged biped) is gated on object class 0, so 0 is exact
-                    // under the sentinel class.
-                    let outcome = lights_distant_lighting_at_point_new(
-                        flags,
-                        /*object_class*/ 255,
-                        /*object_def_flags*/ 0,
-                        /*object_radius*/ radius,
-                        /*up*/ GLOBAL_UP_3D,
-                        /*ignore_object_index*/ -1,
-                        /*need_valid_sample*/ false,
-                        RealPoint3d { x: pos.x, y: pos.y, z: pos.z },
-                        &mut gs,
-                        /*override_direction*/ None,
-                        /*is_flying*/ false,
-                        loaded,
-                        Some(&ba.sh),
-                        ba.intensity.as_ref(),
-                        // H3: lightprobe atlas is paired-pixel (8 layers),
-                        // intensity atlas is paired-pixel (2 layers). These
-                        // are the `bitmap_data[8]` bytes the engine reads.
-                        /*lightprobe_pixels_per_probe*/ 8,
-                        /*dominant_pixels_per_probe*/ 2,
-                        /*scenario_flag_0x200*/ false,
-                    );
-                    if outcome == GeometrySamplerOutcome::Success {
-                        if log { eprintln!("[diag-ol4]   sample returned Success — using BSP probe"); }
-                        let mut red_terms = [0.0_f32; 9];
-                        let mut green_terms = [0.0_f32; 9];
-                        let mut blue_terms = [0.0_f32; 9];
-                        red_terms.copy_from_slice(&gs.light_probe_r[..9]);
-                        green_terms.copy_from_slice(&gs.light_probe_g[..9]);
-                        blue_terms.copy_from_slice(&gs.light_probe_b[..9]);
-                        return Some(blam_tags::scenario_lightmap::DequantizedLightmapProbe {
-                            dominant_light_direction: [
-                                gs.dominant_light_dir.i,
-                                gs.dominant_light_dir.j,
-                                gs.dominant_light_dir.k,
-                            ],
-                            dominant_light_intensity: [
-                                gs.dominant_light_intensity.red,
-                                gs.dominant_light_intensity.green,
-                                gs.dominant_light_intensity.blue,
-                            ],
-                            red_terms,
-                            green_terms,
-                            blue_terms,
-                        });
-                    }
-                    if log { eprintln!("[diag-ol4]   sample returned NoHit — falling through to airprobe"); }
-                }
-            }
-            // Step 2 — `lights_airprobe_lighting_at_point_new`.
-            let from_airprobe = nearest_airprobe(airprobes, pos)
-                .map(|a| a.probe.dequantize());
-            if log {
-                if let Some(p) = &from_airprobe {
-                    eprintln!(
-                        "[diag-ol4]   AIRPROBE fallback: DC=({:.4},{:.4},{:.4}) — this is the source of the bake",
-                        p.red_terms[0], p.green_terms[0], p.blue_terms[0],
-                    );
-                } else {
-                    eprintln!("[diag-ol4]   no airprobe match → SKY fallback");
-                }
-            }
-            from_airprobe
-                // Step 3 — `lights_sky_lighing_at_point_new`.
-                .or_else(|| sky_fallback.clone())
-        };
-
-        // Engine-faithful per-placement (radius, obj_def_flags) lookup
-        // via the OBJECT_HEADER_DATA table populated by
-        // `populate_from_scenario`. Each bake closure resolves its
-        // engine `object_index` from `(object_type, i)` and reads the
-        // pair from the global header table. See OL-1 + OL-4 in
-        // [[reference_object_lighting_full_2026_05_24]].
-        //
-        // Note: protomorph has two parallel `ObjectType` enums with
-        // matching discriminants — `object_constants::ObjectType` (used
-        // by the renderer) and `object_type::ObjectType` (used by the
-        // header table). Inline the mapping here rather than wiring a
-        // `From` impl across module boundaries.
-        let scenario_ref = &loaded.scenario;
-        let obj_meta_for = |object_type: ObjectType, i: u32| -> (f32, blam_tags::Flags<blam_tags::object::ObjectDefinitionFlags, u16>) {
-            use crate::halo::objects::object_type::ObjectType as OT;
-            let header_type = match object_type {
-                ObjectType::Biped         => OT::Biped,
-                ObjectType::Vehicle       => OT::Vehicle,
-                ObjectType::Weapon        => OT::Weapon,
-                ObjectType::Equipment     => OT::Equipment,
-                ObjectType::Terminal      => OT::Terminal,
-                ObjectType::Projectile    => OT::Projectile,
-                ObjectType::Scenery       => OT::Scenery,
-                ObjectType::Machine       => OT::Machine,
-                ObjectType::Control       => OT::Control,
-                ObjectType::SoundScenery  => OT::SoundScenery,
-                ObjectType::Crate         => OT::Crate,
-                ObjectType::Creature      => OT::Creature,
-                ObjectType::Giant         => OT::Giant,
-                ObjectType::EffectScenery => OT::EffectScenery,
-            };
-            let obj_idx = crate::halo::objects::object_header_data::header_index_for_placement(
-                scenario_ref,
-                header_type,
-                i,
-            );
-            let r = crate::halo::objects::object_header_data::bounding_sphere_radius(obj_idx);
-            let f = crate::halo::objects::object_header_data::object_definition_flags(obj_idx);
-            (r, f)
-        };
-
-        let crate_offsets = self.bake_object_lighting_offsets(
-            crates.len(),
-            ObjectType::Crate,
-            "crate",
-            |i, _| {
-                let (r, f) = obj_meta_for(ObjectType::Crate, i as u32);
-                let label = format!("crate:{i}");
-                probe_for(placement_position(&crates[i]), r, f, &label)
-            },
-        );
-        // Vehicles share the non-scenery dynamic fallback chain (no
-        // per-object scenery/device probe) — same as weapon/equipment:
-        // distant cluster lightprobe → airprobe → sky.
-        let vehicle_offsets = self.bake_object_lighting_offsets(
-            vehicles.len(),
-            ObjectType::Vehicle,
-            "vehicle",
-            |i, _| {
-                let (r, f) = obj_meta_for(ObjectType::Vehicle, i as u32);
-                let label = format!("vehicle:{i}");
-                probe_for(placement_position(&vehicles[i]), r, f, &label)
-            },
-        );
-        let weapon_offsets = self.bake_object_lighting_offsets(
-            weapons.len(),
-            ObjectType::Weapon,
-            "weapon",
-            |i, _| {
-                let (r, f) = obj_meta_for(ObjectType::Weapon, i as u32);
-                let label = format!("weapon:{i}");
-                probe_for(placement_position(&weapons[i]), r, f, &label)
-            },
-        );
-        let equipment_offsets = self.bake_object_lighting_offsets(
-            equipment.len(),
-            ObjectType::Equipment,
-            "equipment",
-            |i, _| {
-                let (r, f) = obj_meta_for(ObjectType::Equipment, i as u32);
-                let label = format!("equipment:{i}");
-                probe_for(placement_position(&equipment[i]), r, f, &label)
-            },
-        );
-        // Phase D — engine step 4 for type 7 (Machine):
-        // `lights_prepare_for_object_static_new @ 0x1808A2930` checks
-        // `obj.scenery_or_device_probe_index` and resolves
-        // `device_machine_probes[idx]` for type==7. Tool.exe bakes the
-        // matching positional, so machine[i] ↔ device_machine_probes[i]
-        // is the engine-correct mapping. Each container holds multiple
-        // per-position probes inside the machine's bbox; we take the
-        // first (machine-local centroid) — the engine's per-point
-        // interpolation across the container is a refinement for
-        // animated machine parts that scenario-load bake can skip.
-        // Lbsp vs sLdT preference matches the airprobe pattern: sLdT
-        // when populated, fall back to Lbsp.
-        let device_machine_probes: &[blam_tags::scenario_lightmap::LightmapDeviceMachineProbeData] = loaded
-            .scenario_lightmap
-            .as_ref()
-            .filter(|s| !s.device_machine_probes.is_empty())
-            .map(|s| s.device_machine_probes.as_slice())
-            .unwrap_or(lbsp.device_machine_probes.as_slice());
-        eprintln!(
-            "[scenario]   device_machine_probes available: {} (LABEL_114 fallback when machine[i] has no probe)",
-            device_machine_probes.len(),
-        );
-        let machine_offsets = self.bake_object_lighting_offsets(
-            machines.len(),
-            ObjectType::Machine,
-            "machine",
-            |i, pos| {
-                device_machine_probes
-                    .get(i)
-                    .and_then(|c| c.probes.first())
-                    .map(|p| p.probe.dequantize())
-                    .or_else(|| {
-                        let (r, f) = obj_meta_for(ObjectType::Machine, i as u32);
-                        let label = format!("machine:{i}");
-                        probe_for(pos, r, f, &label)
-                    })
-            },
-        );
-        let control_offsets = self.bake_object_lighting_offsets(
-            controls.len(),
-            ObjectType::Control,
-            "control",
-            |i, _| {
-                let (r, f) = obj_meta_for(ObjectType::Control, i as u32);
-                let label = format!("control:{i}");
-                probe_for(placement_position(&controls[i]), r, f, &label)
-            },
-        );
-
-        self.scenery_lighting_offsets = scenery_offsets;
-        self.crate_lighting_offsets = crate_offsets;
-        self.vehicle_lighting_offsets = vehicle_offsets;
-        self.weapon_lighting_offsets = weapon_offsets;
-        self.equipment_lighting_offsets = equipment_offsets;
-        self.machine_lighting_offsets = machine_offsets;
-        self.control_lighting_offsets = control_offsets;
-
-        // OL-4 dispatch summary: count placements by sample-branch
-        // choice. `_object_searches_lightmaps_on_failure_bit` (bit 1 of
-        // `_object_definition.flags`) gates sideways (9 rays) vs default
-        // (1 ray with offset, radius-scaled). Engine cites:
-        // `lights_prepare_for_object_static_new @ 0x1808A2930:376` for
-        // the dispatch decision. See OL-4 in
-        // [[reference_object_lighting_full_2026_05_24]].
-        let mut side_count = 0usize;
-        let mut deft_count = 0usize;
-        let count_dispatch =
-            |ot: ObjectType, placements_len: usize, side: &mut usize, deft: &mut usize| {
-                use crate::halo::objects::object_type::ObjectType as OT;
-                let header_type = match ot {
-                    ObjectType::Scenery => OT::Scenery,
-                    ObjectType::Crate => OT::Crate,
-                    ObjectType::Vehicle => OT::Vehicle,
-                    ObjectType::Weapon => OT::Weapon,
-                    ObjectType::Equipment => OT::Equipment,
-                    ObjectType::Machine => OT::Machine,
-                    ObjectType::Control => OT::Control,
-                    _ => return,
-                };
-                for i in 0..placements_len {
-                    let obj_idx = crate::halo::objects::object_header_data::header_index_for_placement(
-                        scenario_ref, header_type, i as u32,
-                    );
-                    let f = crate::halo::objects::object_header_data::object_definition_flags(obj_idx);
-                    if f.contains(blam_tags::object::ObjectDefinitionFlags::SearchCardinalDirectionLightmapsOnFailure) {
-                        *side += 1;
-                    } else {
-                        *deft += 1;
-                    }
-                }
-            };
-        count_dispatch(ObjectType::Crate, crates.len(), &mut side_count, &mut deft_count);
-        count_dispatch(ObjectType::Vehicle, vehicles.len(), &mut side_count, &mut deft_count);
-        count_dispatch(ObjectType::Weapon, weapons.len(), &mut side_count, &mut deft_count);
-        count_dispatch(ObjectType::Equipment, equipment.len(), &mut side_count, &mut deft_count);
-        count_dispatch(ObjectType::Machine, machines.len(), &mut side_count, &mut deft_count);
-        count_dispatch(ObjectType::Control, controls.len(), &mut side_count, &mut deft_count);
-        eprintln!(
-            "[scenario]   OL-4 dispatch: {side_count} via sideways (9-ray) + {deft_count} via default (1-ray-with-offset)"
-        );
-
-        // Help the borrow checker — re-import here so the closures
-        // above don't shadow this name's import.
-        let _: Option<&LightmapProbe> = None;
-    }
 
 
-    /// Bake per-placement engine_lighting cbuffer entries for one object
-    /// type. `probe_lookup(i, position)` returns the SH probe to use for
-    /// placement `i` (or None to skip and inherit the sky default).
-    ///
-    /// The resolved RAW SH (no chmt boost) is cached in
-    /// `self.object_lighting_cache`. The per-frame chmt boost is applied
-    /// later by [`Self::refresh_engine_lighting_for_frame`]. Dominant
-    /// light direction + intensity are written to
-    /// `engine_dominant_light_buffer` here at bake time — they don't get
-    /// the chmt boost and never change per frame (until OL-5 lands).
-    ///
-    /// Returns `Vec<Option<u32>>` keyed by placement index (byte offset
-    /// into the lighting buffer).
-    fn bake_object_lighting_offsets<F>(
-        &mut self,
-        placement_count: usize,
-        object_type: crate::halo::objects::object_constants::ObjectType,
-        type_label: &str,
-        probe_lookup: F,
-    ) -> Vec<Option<u32>>
-    where
-        F: Fn(usize, glam::Vec3) -> Option<blam_tags::scenario_lightmap::DequantizedLightmapProbe>,
-    {
-        use crate::halo::lighting::GpuEngineDominantLight;
-        use crate::halo::render::shared::{ENGINE_LIGHTING_ENTRIES, ENGINE_LIGHTING_STRIDE};
 
-        let mut offsets: Vec<Option<u32>> = vec![None; placement_count];
-        if placement_count == 0 {
-            return offsets;
-        }
-
-        let mut baked: usize = 0;
-        // PROTOMORPH_DIAG_LIGHTING filter formats (matched against type_label[i]):
-        //   "all"              — every placement of every type
-        //   "<type>"           — every placement of one type, e.g. "crate"
-        //   "<type>:<i>"       — single placement by index, e.g. "crate:41"
-        //   "<type>:<a>,<b>,…" — list of indices, e.g. "crate:41,43,12"
-        let diag_filter = std::env::var("PROTOMORPH_DIAG_LIGHTING").ok();
-        let diag_match = |i: usize| -> bool {
-            let Some(f) = diag_filter.as_deref() else { return false };
-            if f == "all" || f == type_label { return true; }
-            if let Some(rest) = f.strip_prefix(type_label).and_then(|s| s.strip_prefix(':')) {
-                return rest.split(',').any(|tok| tok.trim().parse::<usize>() == Ok(i));
-            }
-            false
-        };
-        for i in 0..placement_count {
-            let Some(dq) = probe_lookup(i, glam::Vec3::ZERO) else {
-                if diag_match(i) {
-                    eprintln!(
-                        "[diag-lighting] {type_label}[{i}] probe_lookup returned None — \
-                         placement will inherit frame-default (likely sky probe)",
-                    );
-                }
-                continue;
-            };
-            if diag_match(i) {
-                let r_dc = dq.red_terms[0];
-                let g_dc = dq.green_terms[0];
-                let b_dc = dq.blue_terms[0];
-                let dom_i = dq.dominant_light_intensity;
-                let dom_d = dq.dominant_light_direction;
-                let sh_lum = crate::halo::render::chocalate_mountain::sh_luminance_estimate(
-                    &dq.red_terms, &dq.green_terms, &dq.blue_terms,
-                );
-                eprintln!(
-                    "[diag-lighting] {type_label}[{i}] probe_for:\n  \
-                     SH_R={:?}\n  SH_G={:?}\n  SH_B={:?}\n  \
-                     DC=({r_dc:.4},{g_dc:.4},{b_dc:.4}) sh_lum={sh_lum:.4}\n  \
-                     dom_dir=({:.3},{:.3},{:.3}) dom_intensity=({:.4},{:.4},{:.4})",
-                    dq.red_terms, dq.green_terms, dq.blue_terms,
-                    dom_d[0], dom_d[1], dom_d[2],
-                    dom_i[0], dom_i[1], dom_i[2],
-                );
-            }
-            if self.structure_renderer.next_probe_slot >= ENGINE_LIGHTING_ENTRIES {
-                eprintln!(
-                    "[scenario]   WARNING: engine_lighting slot pool exhausted at {}[{}]",
-                    type_label, i,
-                );
-                break;
-            }
-
-            // Diag override: PROTOMORPH_FORCE_BRIGHT_SH=<type>:<idx>[,<idx>...]
-            // Replaces the baked SH for matching placements with a known-
-            // bright probe (DC=1.0 on all channels, no L1/L2). Discriminates
-            // "shader chain is correct, probe is dim" from "shader chain
-            // is broken, probe doesn't matter". If the placement renders
-            // visibly lit (~half-gray) with this override, the chain works.
-            // If it stays dark, the bug is downstream of the cbuffer.
-            let dq_cached = {
-                let env = std::env::var("PROTOMORPH_FORCE_BRIGHT_SH").ok();
-                let matches = env.as_deref().and_then(|f| {
-                    f.strip_prefix(type_label).and_then(|s| s.strip_prefix(':'))
-                        .map(|rest| rest.split(',').any(|tok| tok.trim().parse::<usize>() == Ok(i)))
-                }).unwrap_or(false);
-                if matches {
-                    let mut forced = dq.clone();
-                    // DC ≈ 1.0/√π × 1.0 → in our convention DC slot holds the
-                    // unnormalized value. 1.0 on each channel produces a
-                    // bright, neutrally-lit probe regardless of normal.
-                    forced.red_terms = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-                    forced.green_terms = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-                    forced.blue_terms = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-                    forced.dominant_light_intensity = [1.0, 1.0, 1.0];
-                    forced.dominant_light_direction = [0.0, 0.0, 1.0];
-                    eprintln!(
-                        "[diag-force-bright] {type_label}[{i}] overriding SH to DC=1.0 — \
-                         shader-chain discriminator test",
-                    );
-                    forced
-                } else {
-                    dq.clone()
-                }
-            };
-
-            let sh_lum = crate::halo::render::chocalate_mountain::sh_luminance_estimate(
-                &dq_cached.red_terms, &dq_cached.green_terms, &dq_cached.blue_terms,
-            );
-            let dom_payload = GpuEngineDominantLight {
-                direction: [
-                    dq_cached.dominant_light_direction[0],
-                    dq_cached.dominant_light_direction[1],
-                    dq_cached.dominant_light_direction[2],
-                    1.0,
-                ],
-                intensity: [
-                    dq_cached.dominant_light_intensity[0],
-                    dq_cached.dominant_light_intensity[1],
-                    dq_cached.dominant_light_intensity[2],
-                    0.0,
-                ],
-            };
-            let offset = self.structure_renderer.next_probe_slot * ENGINE_LIGHTING_STRIDE;
-            if diag_match(i) {
-                let slot = self.structure_renderer.next_probe_slot;
-                eprintln!(
-                    "[diag-lighting] {type_label}[{i}] bake-out:\n  \
-                     sh_lum={sh_lum:.4} (chmt boost applied per-frame, see refresh_engine_lighting_for_frame)\n  \
-                     engine_lighting slot={slot} offset=0x{offset:x} ({offset} bytes)\n  \
-                     dom_payload dir={:?} intensity={:?}",
-                    dom_payload.direction, dom_payload.intensity,
-                );
-            }
-            // Write dominant-light at bake — it doesn't carry a chmt
-            // boost and (until OL-5 lands per-frame refresh) doesn't
-            // change. Ravi gets written every frame by
-            // refresh_engine_lighting_for_frame.
-            self.shared.queue.write_buffer(
-                &self.shared.engine_dominant_light_buffer,
-                offset as u64,
-                bytemuck::bytes_of(&dom_payload),
-            );
-            self.object_lighting_cache.push(ObjectLightingCacheEntry {
-                sh_r: dq_cached.red_terms,
-                sh_g: dq_cached.green_terms,
-                sh_b: dq_cached.blue_terms,
-                sh_lum,
-                object_type,
-                slot_offset: offset,
-                dominant_dir: dq_cached.dominant_light_direction,
-            });
-            offsets[i] = Some(offset);
-            self.structure_renderer.next_probe_slot += 1;
-            baked += 1;
-        }
-
-        if baked > 0 {
-            eprintln!(
-                "[scenario]   cached {}_lighting for {}/{} placements (chmt boost applied per-frame)",
-                type_label, baked, placement_count,
-            );
-        }
-        offsets
-    }
 
     /// Engine-faithful per-frame chmt + ravi cbuffer write. Engine
     /// `c_lighting_interface::setup_object_lighting_for_entry_point @
@@ -2494,7 +1774,7 @@ impl Renderer {
     /// per-placement scale division + pack runs per entry.
     pub fn refresh_engine_lighting_for_frame(&mut self) {
         use crate::halo::lighting::{pack_ravi_constants, GpuEngineLightingPs};
-        use crate::halo::objects::object_constants::ObjectType;
+        use crate::halo::objects::object_type::ObjectType;
 
         if self.object_lighting_cache.is_empty() {
             return;
@@ -2625,148 +1905,8 @@ impl Renderer {
         Some(self.models.pop().expect("upload_model_data appended"))
     }
 
-    /// Load `LightmapBspData.lightprobe_texture` + `dominant_light_intensity_texture`
-    /// as wgpu Texture2DArray views, upload `compression_vectors[2k].x` for
-    /// k ∈ [0..4] into the lightmap_compress cbuffer, then rebuild the
-    /// camera bind group so terrain shaders sample the new atlases.
-    fn upload_lightmap_atlases(
-        &mut self,
-        tags_root: &std::path::Path,
-        lbsp: &blam_tags::scenario_lightmap::LightmapBspData,
-    ) {
-        // Compression scalars — engine pack format from
-        // `submit_extern_texture` case 11 in dllcache (verified IDA decompile,
-        // see reference_dllcache_lightmap_path.md). 9 ranges from
-        // `compression_vectors[2k].x` for k ∈ [0..9], packed 3-per-vec4 with
-        // .w = 0. The HLSL `sample_lightprobe_texture` reads:
-        //   constant_0.x/y/z → SH coefs 0/1/2 ranges
-        //   constant_1.x     → SH coef 3 range
-        //   constant_1.y     → dominant intensity range
-        //   (constants_1.z + constant_2.* unused at order-2)
-        let r = |i: usize| lbsp.compression_vectors.get(i).map(|v| v.i).unwrap_or(0.0);
-        let compress: [[f32; 4]; 3] = [
-            [r(0),  r(2),  r(4),  0.0],  // SH coefs 0/1/2
-            [r(6),  r(8),  r(10), 0.0],  // SH coef 3, dominant intensity, (order-3 coef 5)
-            [r(12), r(14), r(16), 0.0],  // (order-3 coefs 6/7/8 — zero at order-2)
-        ];
-        self.shared.queue.write_buffer(
-            &self.shared.lightmap_compress_buffer,
-            0,
-            bytemuck::cast_slice(&compress),
-        );
-
-        // Load the two .bitmap tags referenced by the lightmap.
-        // Read tag → upload via the helper, then assign the view.
-        // Done as two explicit calls (not a closure) so the immutable
-        // borrow of `&self.shared` ends before the mutable assignment
-        // of `self.shared.lightprobe_atlas_view`.
-        if !lbsp.lightprobe_texture.is_empty() {
-            let p = blam_tags::paths::resolve_tag_path(tags_root, &lbsp.lightprobe_texture, "bitmap");
-            if let Ok(tag) = blam_tags::file::TagFile::read(&p) {
-                if let Ok(bitmap) = blam_tags::bitmap::Bitmap::new(&tag) {
-                    if let Some(img) = bitmap.image(0) {
-                        eprintln!(
-                            "[lightmap]   lightprobe atlas: {}×{}, {} slices",
-                            img.width(),
-                            img.height(),
-                            img.layer_count(),
-                        );
-                        if let Some(tex) = upload_bc3_array_bitmap(&self.shared, &img) {
-                            self.shared.lightprobe_atlas_view = tex.create_view(&wgpu::TextureViewDescriptor {
-                                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                                ..Default::default()
-                            });
-                            self.shared.lightprobe_atlas = tex;
-                        }
-                    }
-                }
-            }
-        }
-        if !lbsp.dominant_light_intensity_texture.is_empty() {
-            let p = blam_tags::paths::resolve_tag_path(tags_root, &lbsp.dominant_light_intensity_texture, "bitmap");
-            if let Ok(tag) = blam_tags::file::TagFile::read(&p) {
-                if let Ok(bitmap) = blam_tags::bitmap::Bitmap::new(&tag) {
-                    if let Some(img) = bitmap.image(0) {
-                        if let Some(tex) = upload_bc3_array_bitmap(&self.shared, &img) {
-                            self.shared.lightprobe_intensity_atlas_view = tex.create_view(&wgpu::TextureViewDescriptor {
-                                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                                ..Default::default()
-                            });
-                            self.shared.lightprobe_intensity_atlas = tex;
-                        }
-                    }
-                }
-            }
-        }
-        self.shared.rebuild_camera_bind_group();
-        eprintln!(
-            "[lightmap] atlases bound: '{}' + '{}' (compression: {:.2}/{:.2}/{:.2}/{:.2}, dom={:.2})",
-            lbsp.lightprobe_texture.split('\\').last().unwrap_or(""),
-            lbsp.dominant_light_intensity_texture.split('\\').last().unwrap_or(""),
-            r(0), r(2), r(4), r(6), r(8),
-        );
-    }
 }
 
-/// Upload a `BitmapImage` (expected DXT5 array) to a Texture2DArray.
-/// One slice per layer, mip 0 only (atlases don't use mips). Returns
-/// `None` if the bitmap isn't DXT5 or fails to slice.
-fn upload_bc3_array_bitmap(
-    shared: &shared::SharedResources,
-    img: &blam_tags::bitmap::BitmapImage<'_>,
-) -> Option<wgpu::Texture> {
-    use blam_tags::bitmap::BitmapFormat;
-    let format = img.format().ok()?;
-    if !matches!(format, BitmapFormat::Dxt5) { return None; }
-    let width = img.width();
-    let height = img.height();
-    let layers = img.layer_count();
-    let mips = img.mipmap_levels().max(1);
-    if layers == 0 { return None; }
-    let pixels = img.pixel_bytes().ok()?;
-    // Halo bitmap pixel layout: [layer0_full_mipchain, layer1_full_mipchain, ...].
-    // The base mip is the first `block_w*block_h*16` bytes of each layer's chain;
-    // skip the rest of each chain to get to the next layer's base.
-    let bytes_per_layer = format.surface_bytes(width, height, mips) as usize;
-    let block_w = ((width + 3) / 4).max(1);
-    let block_h = ((height + 3) / 4).max(1);
-    let base_mip_bytes = (block_w * block_h * 16) as usize;
-    let total = bytes_per_layer.saturating_mul(layers as usize);
-    if pixels.len() < total {
-        eprintln!("[lightmap] atlas pixel slice {} < expected {}", pixels.len(), total);
-        return None;
-    }
-    let texture = shared.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("lightprobe_atlas"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: layers },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Bc3RgbaUnorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    for layer in 0..layers {
-        let off = (layer as usize) * bytes_per_layer;
-        let src = &pixels[off..off + base_mip_bytes];
-        shared.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
-                aspect: wgpu::TextureAspect::All,
-            },
-            src,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(block_w * 16),
-                rows_per_image: Some(block_h),
-            },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
-    }
-    Some(texture)
-}
 
 impl Renderer {
     /// Upload a [`crate::halo::scenario::loader::LoadedBsp`] through
@@ -3146,7 +2286,17 @@ impl Renderer {
                     Vec::with_capacity(artifacts.bindings.textures.len());
                 for tb in &artifacts.bindings.textures {
                     let view = match mat.find_texture_by_name(&tb.name) {
-                        Some(tex) => upload_view(tex, sample_intent_for_param(&tb.name)),
+                        // Bind the authored texture only when its dimension
+                        // matches the BGL slot. A force_cube / cube-classified
+                        // slot fed a 2D bitmap (some rmop authors point
+                        // `environment_map` at a 2D map — crashes on shrine)
+                        // would otherwise put a D2 view in a Cube binding →
+                        // `create_bind_group` validation panic. The mismatched
+                        // cases fall through to the dimension-matched fallback
+                        // below (engine binds the cube register regardless).
+                        Some(tex) if tex.is_cube == tb.is_cube => {
+                            upload_view(tex, sample_intent_for_param(&tb.name))
+                        }
                         // Dynamic-env cube slots (`dynamic_environment_map_*`,
                         // and a fallback `environment_map`) get the rasg
                         // `DefaultDynamicCubeMap` as the BASE view (engine's
@@ -3156,7 +2306,9 @@ impl Renderer {
                         // `render_method_submit_dynamic_cubemap`), so glass /
                         // env-mapped objects reflect the real environment. The
                         // base view is used only when no probe atlas is loaded.
-                        None if tb.is_cube
+                        // (Also catches a cube slot whose authored bitmap was
+                        // 2D — the dimension guard above fell through.)
+                        _ if tb.is_cube
                             && (tb.name.starts_with("dynamic_environment_map")
                                 || tb.name == "environment_map") =>
                         {
@@ -3167,7 +2319,7 @@ impl Renderer {
                                 )
                                 .clone()
                         }
-                        None => fallback_view_for_param(&self.shared, &tb.name, tb.is_cube),
+                        _ => fallback_view_for_param(&self.shared, &tb.name, tb.is_cube),
                     };
                     texture_views.push((tb.slot, view));
                 }
@@ -3427,8 +2579,13 @@ impl Renderer {
                         Vec::with_capacity(arts.bindings.textures.len());
                     for tb in &arts.bindings.textures {
                         let view = match real_mat.find_texture_by_name(&tb.name) {
-                            Some(tex) => upload_view(tex, sample_intent_for_param(&tb.name)),
-                            None => fallback_view_for_param(&self.shared, &tb.name, tb.is_cube),
+                            // Dimension must match the BGL slot (see the
+                            // SH/albedo path above) — a 2D bitmap in a cube
+                            // slot panics `create_bind_group`.
+                            Some(tex) if tex.is_cube == tb.is_cube => {
+                                upload_view(tex, sample_intent_for_param(&tb.name))
+                            }
+                            _ => fallback_view_for_param(&self.shared, &tb.name, tb.is_cube),
                         };
                         real_texture_views.push((tb.slot, view));
                     }
@@ -3543,6 +2700,41 @@ impl Renderer {
                     (None, None, None)
                 };
 
+                // Alpha-tested shadow casters: an OPAQUE material whose
+                // render method has `alpha_test = simple` must discard masked
+                // texels in the shadow-generate PS (engine `shadow_generate_ps`
+                // + `calc_alpha_test_on_ps`) so it casts a holey shadow rather
+                // than a solid silhouette. Build the per-material @group(1)
+                // bind group (alpha_test_map view + sampler + xform).
+                // `multiply_map` (rmcs deadlock-net custom) is deferred — those
+                // are alpha_blend/transparent and skipped from shadows anyway.
+                let shadow_alpha_test_bg = if !is_transparent
+                    && choices.get_or("alpha_test", "none") == "simple"
+                {
+                    let xform = mat
+                        .cbuffer
+                        .find("alpha_test_map")
+                        .map(|s| s.value)
+                        .unwrap_or([1.0, 1.0, 0.0, 0.0]);
+                    mat.find_texture_by_name("alpha_test_map").map(|tex| {
+                        if std::env::var_os("PROTOMORPH_DIAG_SHADOW_ALPHA_TEST").is_some() {
+                            eprintln!(
+                                "[shadow] alpha-test caster material '{}' (xform={:?})",
+                                mat.name, xform,
+                            );
+                        }
+                        let view =
+                            upload_view(tex, sample_intent_for_param("alpha_test_map"));
+                        self.shadow_apply.build_alpha_test_bind_group(
+                            &self.shared.device,
+                            &view,
+                            xform,
+                        )
+                    })
+                } else {
+                    None
+                };
+
                 GpuMaterial {
                     bind_group,
                     bind_group_probes,
@@ -3593,6 +2785,7 @@ impl Renderer {
                             )
                         })
                         .unwrap_or(crate::halo::render::render_transparents::TransparentSortLayer::Normal),
+                    shadow_alpha_test_bg,
                 }
             })
             .collect();
@@ -3748,6 +2941,11 @@ impl Renderer {
             node_local_matrices: model.node_local_matrices.clone(),
             marker_transforms: model.marker_transforms.clone(),
         });
+        // Drain this model's texture/mesh staging now so the per-object
+        // uploads (a scenario can place hundreds of unique object tags) don't
+        // accumulate into the first-frame `queue.submit` — the GPU-watchdog
+        // hang that bit the BSP material path. See `bsp_gpu::flush_staging`.
+        crate::halo::structures::bsp_gpu::flush_staging(&self.shared);
         index
     }
 
@@ -3784,8 +2982,10 @@ impl Renderer {
             .normal_texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         // Fresh DepthOnly-aspect scene-depth view for the transparent
-        // camera bind group's soft_z sampling (binding 15).
-        let gbuffer_depth_view = self.gbuffer.depth_texture.create_view(&wgpu::TextureViewDescriptor {
+        // camera bind group's soft_z sampling (binding 15). Views the
+        // COPY texture, not the live depth attachment (TBDR flicker —
+        // see `GBuffer::depth_sample_view`).
+        let gbuffer_depth_view = self.gbuffer.depth_copy_texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("scene_depth_soft_z"),
             aspect: wgpu::TextureAspect::DepthOnly,
             ..Default::default()
@@ -3819,6 +3019,7 @@ impl Renderer {
             self.screen_postprocess.color_grading_active_view(),
             self.screen_postprocess.color_grading_back_view(),
             self.screen_postprocess.dof_blur_view(),
+            self.screen_postprocess.bling_result_view(),
         );
     }
 
@@ -4271,117 +3472,7 @@ impl Renderer {
         self.load_material_textures_from_rasg(tags_root);
     }
 
-    /// Mirror of `c_rasterizer_globals::initialize` for the 3
-    /// pre-integrated Cook-Torrance BRDF LUTs (`material_textures[]`).
-    /// Sampled by `cook_torrance_fx.hlsl::sh_glossy_ct_3` at view /
-    /// roughness UV to produce the specular distribution shape. Without
-    /// these loaded, every cook_torrance material renders with a
-    /// uniform white spec response (no shape / no roughness reaction).
-    ///
-    /// Engine path: rasg's `material_textures[0..2]` references three
-    /// `rasterizer\<name>.bitmap` tags; `c_render_method::submit` routes
-    /// these into the `g_sampler_cc0236/dd0236/c78d78` extern slots
-    /// when the rmt2 declares the corresponding `RenderMethodExtern`
-    /// values (24/25/26 — `TextureCookTorranceCc0236/Dd0236/C78d78`).
-    fn load_material_textures_from_rasg(&mut self, tags_root: &std::path::Path) {
-        let count = self.rasterizer_globals.material_textures.len();
-        if count == 0 {
-            return;
-        }
-        let mut views: Vec<wgpu::TextureView> = Vec::with_capacity(count);
-        let mut loaded = 0usize;
-        for (idx, rel_path) in self.rasterizer_globals.material_textures.iter().enumerate() {
-            if rel_path.is_empty() {
-                views.push(self.shared.fallback_textures.white_view.clone());
-                continue;
-            }
-            let abs = blam_tags::paths::resolve_tag_path(tags_root, rel_path, "bitmap");
-            let Some(tex) = crate::halo::bitmaps::load(&abs) else {
-                eprintln!(
-                    "[scenario]   material_textures[{idx}] = '{rel_path}' — load failed, using white fallback",
-                );
-                views.push(self.shared.fallback_textures.white_view.clone());
-                continue;
-            };
-            // Pre-integrated BRDF LUTs — physical reflectance / Schlick
-            // fresnel terms, not display-encoded color → force linear.
-            let view = crate::halo::structures::bsp_gpu::upload_inline_texture(
-                &self.shared, &tex, SampleIntent::ForceLinear,
-            );
-            views.push(view);
-            loaded += 1;
-        }
-        eprintln!(
-            "[scenario]   material_textures loaded: {loaded}/{count}",
-        );
-        self.shared.fallback_textures.material_texture_views = views;
-    }
 
-    /// Mirror of `c_rasterizer_globals::initialize` — load the bitmap
-    /// at every populated `default_bitmaps[]` slot from rasg into a
-    /// wgpu cube/2D texture and stash on
-    /// `FallbackTextures::default_bitmap_views`. Per-slot failures
-    /// (missing tag, unsupported format) leave the slot's view as a
-    /// black-cube/black-2D fallback so `default_bitmap_view` always
-    /// returns something bindable. Rasg holds 12 entries (see
-    /// `blam_tags::rasterizer_globals::DefaultBitmap`); slot 2
-    /// (`DefaultDynamicCubeMap`) is what every cube-typed extern slot
-    /// reads when the per-cluster lookup fails (always on MCC).
-    fn load_default_bitmaps_from_rasg(&mut self, tags_root: &std::path::Path) {
-        use blam_tags::rasterizer_globals::DefaultBitmap;
-        let count = self.rasterizer_globals.default_bitmaps.len();
-        if count == 0 {
-            return;
-        }
-        let mut views: Vec<wgpu::TextureView> = Vec::with_capacity(count);
-        let mut loaded = 0usize;
-        for (idx, rel_path) in self.rasterizer_globals.default_bitmaps.iter().enumerate() {
-            let placeholder = if idx == DefaultBitmap::DefaultDynamicCubeMap as usize {
-                self.shared.fallback_textures.black_cube_view.clone()
-            } else if idx == DefaultBitmap::DefaultVector as usize {
-                self.shared.fallback_textures.default_normal_view.clone()
-            } else if idx == DefaultBitmap::ColorWhite as usize {
-                self.shared.fallback_textures.white_view.clone()
-            } else {
-                self.shared.fallback_textures.black_view.clone()
-            };
-            if rel_path.is_empty() {
-                views.push(placeholder);
-                continue;
-            }
-            // rasg stores Halo-style paths with `\` separators
-            // (`shaders\default_bitmaps\bitmaps\color_white`); use the
-            // engine path resolver so the separator is normalized for
-            // the host filesystem and the `.bitmap` extension is
-            // stamped on.
-            let abs = blam_tags::paths::resolve_tag_path(tags_root, rel_path, "bitmap");
-            let Some(tex) = crate::halo::bitmaps::load(&abs) else {
-                eprintln!(
-                    "[scenario]   default_bitmaps[{idx}] = '{rel_path}' — load failed, using placeholder",
-                );
-                views.push(placeholder);
-                continue;
-            };
-            // Trust the authored curve for color/env defaults — notably
-            // `DefaultDynamicCubeMap` is RGBW gamma-encoded, so forcing it
-            // linear was the same over-bright bug as the scenario cube atlas.
-            // `DefaultVector` is a tangent-space normal → force linear.
-            let intent = if idx == DefaultBitmap::DefaultVector as usize {
-                SampleIntent::ForceLinear
-            } else {
-                SampleIntent::FollowCurve
-            };
-            let view = crate::halo::structures::bsp_gpu::upload_inline_texture(
-                &self.shared, &tex, intent,
-            );
-            views.push(view);
-            loaded += 1;
-        }
-        eprintln!(
-            "[scenario]   default_bitmaps loaded: {loaded}/{count}",
-        );
-        self.shared.fallback_textures.default_bitmap_views = views;
-    }
 
     /// Re-pack `engine_exposure_buffer` from the values computed by
     /// `setup_camera_fx_parameters`. `g_exposure.r = m_render_exposure`,
@@ -4482,6 +3573,7 @@ fn build_bsp_cubemap_routing(
             crate::halo::structures::bsp_gpu::upload_inline_texture(shared, tex, SampleIntent::FollowCurve)
         })
         .collect();
+    crate::halo::structures::bsp_gpu::gpu_checkpoint(shared, "bsp cubemap probe atlas (27 cubes)");
     // Synthesize `cluster_to_probe[]` — engine
     // `structure_bsp_build_instance_cubemap_references` partitions
     // scenario probes into cluster_cubemaps[] by point-in-BSP test
@@ -4494,22 +3586,15 @@ fn build_bsp_cubemap_routing(
         .clusters
         .iter()
         .map(|c| {
-            let cx = (c.bounds_x.lower + c.bounds_x.upper) * 0.5;
-            let cy = (c.bounds_y.lower + c.bounds_y.upper) * 0.5;
-            let cz = (c.bounds_z.lower + c.bounds_z.upper) * 0.5;
-            let mut best_idx = 0u16;
-            let mut best_dist_sq = f32::INFINITY;
-            for (i, probe) in scenario_cubemaps.iter().take(probe_count).enumerate() {
-                let dx = cx - probe.position.x;
-                let dy = cy - probe.position.y;
-                let dz = cz - probe.position.z;
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 < best_dist_sq {
-                    best_dist_sq = d2;
-                    best_idx = i as u16;
-                }
-            }
-            best_idx
+            let center = glam::Vec3::new(
+                (c.bounds_x.lower + c.bounds_x.upper) * 0.5,
+                (c.bounds_y.lower + c.bounds_y.upper) * 0.5,
+                (c.bounds_z.lower + c.bounds_z.upper) * 0.5,
+            );
+            nearest_by(&scenario_cubemaps[..probe_count], center, |probe| {
+                glam::Vec3::new(probe.position.x, probe.position.y, probe.position.z)
+            })
+            .map_or(0u16, |(i, _)| i as u16)
         })
         .collect();
     Some(crate::halo::structures::bsp_gpu::BspCubemapRouting {
@@ -4522,123 +3607,28 @@ fn build_bsp_cubemap_routing(
 // Shared pipeline helper (used by pass modules)
 // ---------------------------------------------------------------------------
 
-fn create_fullscreen_pipeline(
-    device: &wgpu::Device,
-    shader_source: wgpu::ShaderModuleDescriptor,
-    bind_group_layouts: &[&wgpu::BindGroupLayout],
-    color_targets: &[Option<wgpu::ColorTargetState>],
-    label: &str,
-) -> wgpu::RenderPipeline {
-    create_fullscreen_pipeline_with_depth(device, shader_source, bind_group_layouts, color_targets, None, label)
-}
-
-fn create_fullscreen_pipeline_with_depth(
-    device: &wgpu::Device,
-    shader_source: wgpu::ShaderModuleDescriptor,
-    bind_group_layouts: &[&wgpu::BindGroupLayout],
-    color_targets: &[Option<wgpu::ColorTargetState>],
-    depth_stencil: Option<wgpu::DepthStencilState>,
-    label: &str,
-) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(shader_source);
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(&format!("{label}_layout")),
-        bind_group_layouts,
-        immediate_size: 0,
-    });
-
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(label),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[QuadVertex::layout()],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            targets: color_targets,
-            compilation_options: Default::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            ..Default::default()
-        },
-        depth_stencil,
-        multisample: Default::default(),
-        multiview_mask: None,
-        cache: None,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Shared draw loop — used by all geometry passes
-// ---------------------------------------------------------------------------
-
-/// Draw all visible models. Caller must set pipeline and group 0 (camera)
-/// before calling. Groups 1 (model) and 3 (node matrices) are set
-/// per-object with dynamic offsets. If `bind_materials` is true, sets
-/// group 2 per mesh part from material bind groups. Otherwise group 2
-/// is assumed pre-set by the caller (e.g., depth-only shadow passes
-/// that don't sample textures).
-///
-/// Mirrors Halo's `c_object_renderer::render_object_contexts(entry_point,
-/// mesh_part_mask)` pattern. Future: take an `EntryPoint` arg + filter
-/// mesh parts by `mesh_part_flags & mask` once per-pass shader variants
-/// land.
-
-pub(crate) fn draw_models<'a>(
-    rpass: &mut wgpu::RenderPass<'a>,
-    shared: &'a SharedResources,
-    ctx: &'a FrameContext<'a>,
-    bind_materials: bool,
-) {
-    for (obj_slot, &(_obj_idx, model_idx)) in ctx.render_list.iter().enumerate() {
-        let gpu_model = &ctx.models[model_idx];
-        let model_offset = (obj_slot * shared.model_stride) as u32;
-        let nm_offset = (obj_slot * shared.node_matrices_stride) as u32;
-
-        rpass.set_bind_group(1, &shared.model_bind_group, &[model_offset]);
-        rpass.set_bind_group(3, &shared.node_matrices_bind_group, &[nm_offset]);
-
-        for mesh in &gpu_model.meshes {
-            rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            rpass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-
-            for part in &mesh.parts {
-                if bind_materials {
-                    if let Some(material) = gpu_model.materials.get(part.material_index) {
-                        // Each material carries its own variant
-                        // artifacts (pipeline + cbuffer layout, keyed
-                        // by VariantKey).
-                        rpass.set_pipeline(&material.artifacts.pipeline);
-                        // Path B: cbuffer dynamic-offset; offset 0 for static.
-                        rpass.set_bind_group(2, &material.bind_group, &[0u32]);
-                    }
-                }
-                rpass.draw_indexed(part.index_start..part.index_start + part.index_count, 0, 0..1);
-            }
+/// Return the item nearest to `pos` by squared distance, with its index.
+/// `key` extracts each item's world position. Ties keep the FIRST (lowest
+/// index) item — strict-less-than replacement. `None` for an empty slice.
+pub(super) fn nearest_by<T>(
+    items: &[T],
+    pos: glam::Vec3,
+    key: impl Fn(&T) -> glam::Vec3,
+) -> Option<(usize, &T)> {
+    let mut best: Option<(usize, &T, f32)> = None;
+    for (i, item) in items.iter().enumerate() {
+        let d2 = (key(item) - pos).length_squared();
+        match best {
+            Some((_, _, bd)) if bd <= d2 => {}
+            _ => best = Some((i, item, d2)),
         }
     }
+    best.map(|(i, item, _)| (i, item))
 }
 
 // ---------------------------------------------------------------------------
 // Helper Functions
 // ---------------------------------------------------------------------------
-
-pub fn color_clear_attach(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
-    wgpu::RenderPassColorAttachment {
-        view,
-        resolve_target: None,
-        ops: wgpu::Operations {
-            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
-            store: wgpu::StoreOp::Store,
-        },
-        depth_slice: None,
-    }
-}
 
 pub fn create_1x1_texture(device: &wgpu::Device, queue: &wgpu::Queue, rgba: [u8; 4], label: &str, format: wgpu::TextureFormat) -> wgpu::Texture {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -4693,19 +3683,6 @@ pub fn cube_tex_entry(binding: u32, sample_type: wgpu::TextureSampleType) -> wgp
         ty: wgpu::BindingType::Texture {
             sample_type,
             view_dimension: wgpu::TextureViewDimension::Cube,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
-
-pub fn depth_tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Depth,
-            view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         },
         count: None,
@@ -4772,61 +3749,3 @@ fn resolve_scenario_lights(
     Vec::new()
 }
 
-/// Build a [`blam_tags::scenario_lightmap::DequantizedLightmapProbe`]
-/// from the scenario's sky lighting. Engine equivalent of
-/// `lights_sky_lighing_at_point_new`'s happy path: copy the sky's
-/// `default_lightprobe` SH3 into the per-object lighting sample, with
-/// dominant direction + intensity from
-/// `calculate_dominant_light_from_lightprobe`. Protomorph already
-/// computed those into `sky_lighting.sun_direction` / `sun_intensity`
-/// at load time — reuse them.
-fn sky_probe_as_dequantized(
-    sky: &crate::halo::scenario::loader::SkyLighting,
-) -> blam_tags::scenario_lightmap::DequantizedLightmapProbe {
-    blam_tags::scenario_lightmap::DequantizedLightmapProbe {
-        dominant_light_direction: [
-            sky.sun_direction.i,
-            sky.sun_direction.j,
-            sky.sun_direction.k,
-        ],
-        dominant_light_intensity: [
-            sky.sun_intensity.i,
-            sky.sun_intensity.j,
-            sky.sun_intensity.k,
-        ],
-        red_terms: sky.probe.r,
-        green_terms: sky.probe.g,
-        blue_terms: sky.probe.b,
-    }
-}
-
-/// Find the airprobe whose world-space `position` is closest to `pos`.
-/// Engine `c_geometry_sampler::sample_one_air_probe` does a 3-probe
-/// trilinear blend; v1 returns the single nearest probe — visually close
-/// for sparse airprobe layouts (most MP maps), but sharper transitions
-/// at probe boundaries than the engine. Refine to a 3-probe weighted blend
-/// if visual seams show up on dense layouts.
-fn nearest_airprobe<'a>(
-    airprobes: &'a [blam_tags::scenario_lightmap::LightmapAirprobe],
-    pos: glam::Vec3,
-) -> Option<&'a blam_tags::scenario_lightmap::LightmapAirprobe> {
-    let mut best: Option<(&blam_tags::scenario_lightmap::LightmapAirprobe, f32)> = None;
-    for probe in airprobes {
-        let d = glam::Vec3::new(probe.position.x, probe.position.y, probe.position.z) - pos;
-        let dsq = d.length_squared();
-        match best {
-            Some((_, b)) if b <= dsq => {}
-            _ => best = Some((probe, dsq)),
-        }
-    }
-    best.map(|(p, _)| p)
-}
-
-/// Extract the world-space `(x, y, z)` of an [`ObjectPlacement`].
-fn placement_position(placement: &blam_tags::scenario::ObjectPlacement) -> glam::Vec3 {
-    glam::Vec3::new(
-        placement.object_data.position.x,
-        placement.object_data.position.y,
-        placement.object_data.position.z,
-    )
-}

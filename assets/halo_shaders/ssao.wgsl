@@ -206,5 +206,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Intensity falloff (engine lines 182-184).
     let intensity = u.ssao_params.w * saturate(2.0 - lin_depth / 1000.0);
-    return vec4<f32>(mix(vec3<f32>(1.0), vec3<f32>(ssao), intensity), 1.0);
+    // Engine `ssao_hlsl.hlsl:188` returns `lerp(1.0, ssao, intensity)` as a
+    // float4 — the scalar broadcasts to ALL channels, so alpha = the lerped
+    // AO value too (not 1.0). Downstream ssao_blur reads `.r` only, so this
+    // is cosmetic, but kept 1:1 with the HLSL.
+    let ao = mix(1.0, ssao, intensity);
+    return vec4<f32>(vec3<f32>(ao), ao);
 }

@@ -271,6 +271,38 @@ pub enum HaloEntryPoint {
 /// SAME WGSL program — that's exactly Halo's offline-compiler equivalence
 /// class. group_tag in the key keeps rmsh and rmtr (with possibly
 /// overlapping category names) on separate pipelines.
+///
+/// The choices ALONE don't fully determine the WGSL + BGL, though: two
+/// per-material facts that the assembler reads also shape the output and
+/// so must be in the key, or distinct-layout materials would collide on
+/// a cache hit and reuse a mismatched binding layout:
+///   - `cube_mask`: per-texture-slot cube-vs-2D classification. The
+///     assembler emits `texture_cube<f32>` vs `texture_2d<f32>` (and
+///     the BGL view-dimension Cube vs D2) per slot based on
+///     `MaterialBindings::from_resolved` (force-cube names + the bitm
+///     tag's `is_cube()`). Two materials with identical choices but a
+///     different cube classification on some slot produce different WGSL.
+///   - `sampler_signature`: the per-material `MaterialSamplerMap`
+///     signature (a hash over the unique `SamplerKey` set — address /
+///     filter modes). The assembler emits one `s_dedupe_K` sampler per
+///     unique key and rewrites `<tex>_sampler` references against the
+///     per-binding dedup map; a different sampler-mode set → different
+///     unique-key count / WGSL + BGL.
+///   - `layout_signature`: a hash of the cbuffer's ordered slot names
+///     and the ordered texture-binding names. The `choices` fix the
+///     shader LOGIC, but not the cbuffer STRUCT layout: two materials
+///     with identical choices can still resolve their cbuffers in
+///     different orders (rmt2-baked `float_constants` order vs author-
+///     format rmop-param order, which may interleave extra scalars such
+///     as `no_dynamic_lights`). They assemble different WGSL structs and
+///     the renderer uploads bytes positionally, so sharing one cached
+///     variant reads the second material's bytes through the first's
+///     offsets. See `VariantKey::layout_signature`.
+/// All components are necessary (each changes WGSL/BGL or byte layout)
+/// and, together with the choices, sufficient: any two materials with
+/// the same full key assemble byte-identical WGSL + an identical BGL
+/// over an identical cbuffer layout, so they correctly share one cache
+/// entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VariantKey {
     pub entry_point: HaloEntryPoint,
@@ -281,19 +313,98 @@ pub struct VariantKey {
     /// Resolved (category_name → option_name) pairs from the rmdf —
     /// what the offline compiler used to pick HLSL macro expansions.
     pub choices: CategoryChoices,
+    /// Bitmask of cube-classified texture slots: bit `i` set iff
+    /// `bindings.textures[i].is_cube`. Distinguishes materials whose
+    /// per-slot `texture_cube` vs `texture_2d` declarations differ.
+    /// Slot counts past 64 fold into the high bit (extremely unlikely;
+    /// max baseline is ~22) — see [`VariantKey::cube_mask_of`].
+    pub cube_mask: u64,
+    /// Stable hash of the material's deduped sampler-key set
+    /// (`MaterialSamplerMap::signature`). Distinguishes materials whose
+    /// authored address/filter sampler modes differ.
+    pub sampler_signature: u64,
+    /// Stable hash of the cbuffer's ordered slot names plus the ordered
+    /// texture-binding names. The assembled WGSL declares its material
+    /// cbuffer struct in `cbuffer.slots` order and its texture bindings
+    /// in `bindings.textures` order; the renderer then uploads per-
+    /// material bytes positionally and binds textures by those same
+    /// slots. Two materials can share identical `choices` yet compile
+    /// to DIFFERENT layouts — e.g. an rmt2-baked shader (slots in
+    /// `rmt2.float_constants` order) vs an author-format shader with no
+    /// baked rmt2 (slots in rmop-param order, which can interleave extra
+    /// scalars like `no_dynamic_lights`). Without this component they
+    /// collide on one cached variant, and the second material's bytes
+    /// are read through the first's struct offsets — scrambling colors
+    /// and reading an xform scale out of a color slot (observed: the
+    /// snowbound battery plasma core, sharing the airlock_field variant,
+    /// rendered red with ~9× over-tiling). See `cov_battery_illum_core`
+    /// vs `airlock_field`.
+    pub layout_signature: u64,
 }
 
 impl VariantKey {
+    /// Build the key from a material's resolved render method plus its
+    /// already-computed `bindings` (for the cube mask) and `sampler_map`
+    /// (for the sampler signature). Threading these in avoids a second
+    /// bitm-tag read at key time — `ensure` computes them once and reuses
+    /// the same instances when it assembles the variant on a cache miss.
     pub fn from_resolved(
         rm: &ResolvedRenderMethod,
         entry_point: HaloEntryPoint,
         choices: &CategoryChoices,
+        cbuffer: &blam_tags::render_method::ResolvedCbuffer,
+        bindings: &material_bindings::MaterialBindings,
+        sampler_map: &material_samplers::MaterialSamplerMap,
     ) -> Self {
         Self {
             entry_point,
             group_tag: rm.group_tag,
             choices: choices.clone(),
+            cube_mask: Self::cube_mask_of(bindings),
+            sampler_signature: sampler_map.signature,
+            layout_signature: Self::layout_signature_of(cbuffer, bindings),
         }
+    }
+
+    /// Hash the assembled material's layout — the ordered cbuffer slot
+    /// names and the ordered texture-binding names. The WGSL struct +
+    /// texture bindings are emitted in exactly these orders, and the
+    /// renderer uploads/binds positionally against them, so any change
+    /// to the order or membership produces an incompatible cached
+    /// variant. Two shaders with identical `choices` but different
+    /// layouts (rmt2-baked vs rmop-param order, extra interleaved
+    /// scalars, …) hash differently here and get separate variants.
+    pub fn layout_signature_of(
+        cbuffer: &blam_tags::render_method::ResolvedCbuffer,
+        bindings: &material_bindings::MaterialBindings,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        cbuffer.slots.len().hash(&mut h);
+        for s in &cbuffer.slots {
+            s.source_name.hash(&mut h);
+            s.is_xform.hash(&mut h);
+        }
+        bindings.textures.len().hash(&mut h);
+        for tb in &bindings.textures {
+            tb.name.hash(&mut h);
+            tb.slot.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Fold the per-slot cube classification into a single bitmask.
+    /// Bit `i` set iff `bindings.textures[i]` is a cube. Slots `>= 64`
+    /// wrap (`i % 64`); the realistic max slot count (~22) never reaches
+    /// the wrap, so no two distinct-layout materials collide in practice.
+    pub fn cube_mask_of(bindings: &material_bindings::MaterialBindings) -> u64 {
+        let mut mask = 0u64;
+        for (i, tb) in bindings.textures.iter().enumerate() {
+            if tb.is_cube {
+                mask |= 1u64 << (i % 64);
+            }
+        }
+        mask
     }
 }
 
@@ -330,6 +441,26 @@ pub fn assemble(
     choices: &CategoryChoices,
     entry_point: HaloEntryPoint,
     tags_root: &std::path::Path,
+) -> AssembledVariant {
+    let bindings = material_bindings::MaterialBindings::from_resolved(rm, tags_root);
+    let sampler_map = material_samplers::MaterialSamplerMap::from_resolved(rm, &bindings);
+    assemble_with(rm, cb, choices, entry_point, bindings, sampler_map)
+}
+
+/// Same as [`assemble`] but takes the already-computed `bindings` +
+/// `sampler_map` (so it needs no `tags_root` — the only consumer of it
+/// was the bindings construction, which the caller now owns). `ensure`
+/// computes these once to derive the [`VariantKey`] (cube mask + sampler
+/// signature) and hands the same instances back here on a cache miss, so
+/// the bitm-tag reads inside `MaterialBindings::from_resolved` happen
+/// exactly once per build.
+pub fn assemble_with(
+    rm: &ResolvedRenderMethod,
+    cb: &ResolvedCbuffer,
+    choices: &CategoryChoices,
+    entry_point: HaloEntryPoint,
+    bindings: material_bindings::MaterialBindings,
+    sampler_map: material_samplers::MaterialSamplerMap,
 ) -> AssembledVariant {
     let mut wgsl = String::new();
 
@@ -380,8 +511,7 @@ pub fn assemble(
     //    Sampler dedup: each `BitmapBinding`'s authored
     //    `BitmapAddressMode` / `BitmapFilterMode` is honored via a
     //    per-material deduped sampler set (typically 2-4 unique keys).
-    let bindings = material_bindings::MaterialBindings::from_resolved(rm, tags_root);
-    let sampler_map = material_samplers::MaterialSamplerMap::from_resolved(rm, &bindings);
+    //    `bindings` + `sampler_map` arrive precomputed (see `assemble_with`).
     wgsl.push_str(&bindings.emit_wgsl_per_binding(&sampler_map));
     wgsl.push('\n');
 
@@ -782,27 +912,19 @@ pub fn assemble(
             // anywhere in the module, so we always include the helper.
             wgsl.push_str(SIMPLE_LIGHTS_FX);
             wgsl.push('\n');
-            // `material_model == glass` defines BLEND_FRESNEL in the engine
-            // (material_models_fx.hlsl:180): the entry composes
+            // BLEND_FRESNEL — engine defines it IFF `material_type == glass`
+            // (material_models_fx.hlsl:178-180):
             //   out_rgb = diffuse·albedo·albedo.w + self_illum + env + specular
             //   alpha   = saturate(specular.w/*fresnel*/ + albedo.w)
-            // i.e. the diffuse is PREMULTIPLIED by alpha (glass surface is
-            // coverage-weighted) while reflections add on top. Device blend
-            // stays the shader's blend_mode (alpha_blend) — BLEND_FRESNEL
-            // only changes the output color/alpha. Without this the glass
-            // diffuse shows at full strength (~4× too bright = white frost).
-            // BLEND_FRESNEL (engine glass output: premultiplied diffuse +
-            // `alpha = saturate(fresnel + albedo.w)`) is DISABLED for now.
-            // It's engine-faithful ONLY when the glass probe is correct; our
-            // per-instance baked lighting reads empty/dim for glass instances
-            // (atlas charts empty → bright fallback; per-vertex SH dim), and
-            // BLEND_FRESNEL amplifies that into blown-white / opaque-black.
-            // Until the per-instance lightmap read is fixed, fall back to the
-            // generic alpha_blend path (alpha = albedo.w) which is robust to
-            // the wrong probe (uniformly translucent glass). Re-enable by
-            // restoring `if mat_model == "glass" { "1.0" }` here. The branch
-            // is kept (gated off) in the entry_static_* WGSL.
-            let fresnel_enabled = "0.0";
+            // Kept ON (faithful). The earlier "fresnel makes glass opaque" was
+            // a back-facing normal: guardian_glass_platform is a two-sided
+            // transparent surface whose authored normal points away from a
+            // top viewer, so N·V<0 → fresnel pinned to ~1.15 → opaque. The
+            // fix is the engine's two-sided flip (decorators_hlsl.hlsl:265,
+            // `world_normal * sign(dot(world_normal, frag_to_cam))`) applied in
+            // the transparent branch of the static entry shaders — NOT
+            // disabling fresnel. See 2026-06-18 glass investigation.
+            let fresnel_enabled = if mat_model == "glass" { "1.0" } else { "0.0" };
             let entry_sub = apply_blend_fx_substitutions(entry, &blend_fx)
                 .replace("__BLEND_FRESNEL_ENABLED__", fresnel_enabled);
             wgsl.push_str(&entry_sub);
@@ -956,6 +1078,51 @@ pub fn assemble(
         .map(|m| format!("{m}u"))
         .unwrap_or_else(|| "0u".to_string());
     let wgsl = wgsl.replace("__DECAL_VIZ_MODE__", &decal_viz_mode);
+    // DIAGNOSTIC: `PROTOMORPH_ENV_GAIN=N` scales the dynamic env-reflection
+    // term (environment_mapping_fx_dynamic.wgsl), default 1.0 = off. Used
+    // to A/B the env-reflection magnitude on glass/metal floors against MCC
+    // and localize the pre-existing reflection/exposure deficit.
+    let env_gain = std::env::var("PROTOMORPH_ENV_GAIN")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|g| g.is_finite() && *g >= 0.0)
+        .unwrap_or(1.0);
+    let wgsl = wgsl.replace("__ENV_REFLECTION_GAIN__", &format!("{env_gain:?}"));
+    // Empty-lightmap-atlas fallback: substitute the cluster default sky-probe
+    // SH when the per-pixel atlas DC is ~0. TRANSPARENT BSP surfaces (glass,
+    // etc.) have NO baked per-pixel lightmap chart in the loose `.bitmap` tag
+    // (atlas DC ≈ 0) → zero SH → zero diffuse → the surface shows only its env
+    // reflection (the guardian glass's dark-green-instead-of-lit-gray bug,
+    // measured via PROTOMORPH_GLASS_VIZ: albedo present, diffuse term black,
+    // ambient ~0). MCC renders on tool.exe's compiled cache atlas where those
+    // charts are baked; we approximate that with the cluster ambient probe.
+    //
+    // Gated ON for transparent materials (blend_mode != opaque): their empty
+    // chart is a KNOWN data gap, not a real baked shadow, so the probe
+    // substitution is safe. OPAQUE surfaces keep it OFF — their DC≈0 is a
+    // legitimately-baked shadow that must not be lifted. `PROTOMORPH_ATLAS_FALLBACK=1`
+    // forces it on everywhere (diagnostic).
+    // NOTE: the cluster-probe substitution is GREEN for guardian (its frame-
+    // default sky probe is teal), so it can't stand in for the glass's LOCAL
+    // gray ambient — it greens the reflection (env_tint is already green) and
+    // the diffuse. Diagnostic-only now (PROTOMORPH_ATLAS_FALLBACK=1); the real
+    // fix routes transparent glass to the cluster's baked SH (see below).
+    let atlas_fallback = std::env::var("PROTOMORPH_ATLAS_FALLBACK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let wgsl = wgsl.replace("__LIGHTMAP_EMPTY_ATLAS_FALLBACK__", if atlas_fallback { "true" } else { "false" });
+    let wgsl = wgsl.replace("__ATLAS_FALLBACK_TRANSPARENT__", "false");
+    // DIAGNOSTIC: `PROTOMORPH_GLASS_VIZ=N` isolates one glass lighting term
+    // (entry_static_per_pixel BLEND_FRESNEL branch) so we can see which term
+    // is wrong vs MCC. 0 = off (normal).
+    let glass_viz = std::env::var("PROTOMORPH_GLASS_VIZ")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|m| *m <= 9)
+        .unwrap_or(0);
+    let wgsl = wgsl.replace("__GLASS_VIZ_MODE__", &format!("{glass_viz}u"));
+    let areaspec_dc = std::env::var("PROTOMORPH_GLASS_AREASPEC_DC").is_ok();
+    let wgsl = wgsl.replace("__GLASS_AREASPEC_DC__", if areaspec_dc { "1u" } else { "0u" });
     // entry_decal::fs_main picks the RT1 payload — bump-packed for
     // pre_lighting (G-buffer normal), duplicated color for
     // post_lighting (hdr_dark accumulator). Mirrors engine
@@ -1135,7 +1302,19 @@ fn blend_fx_substitutions(blend_mode: &str) -> BlendFxSubstitutions {
             multiplicative_enabled: "0.0",
             multiplicative_factor: "1.0",
             alpha_channel_output: "albedo.a",
-            alpha_premultiply: "albedo.a",
+            // Engine `convert_to_render_target_premultiplied_alpha`
+            // (render_target_fx.hlsl:63) does `color.xyz *= color.w` — it
+            // premultiplies by the FINAL output alpha (`out_color.w`), NOT a
+            // separate `albedo.a`. For the BLEND_FRESNEL (glass) path
+            // `out_color.w = saturate(fresnel + albedo.w)`, which is much
+            // larger than `albedo.a` at grazing angles. Using `albedo.a` here
+            // under-multiplied the RGB while the device blend (One,
+            // 1-srcAlpha) still occluded the background by the high fresnel
+            // alpha → black/opaque glass (construct, guardian channels).
+            // Mirror the engine: premultiply by the computed `alpha_out`
+            // (which equals `albedo.a` for non-fresnel pre_mult materials, so
+            // those are unchanged).
+            alpha_premultiply: "alpha_out",
         },
         // Unknown mode — fall back to alpha_blend's table. Walker should
         // never produce a name outside the blend_fx.hlsl set; keep it

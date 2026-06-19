@@ -74,6 +74,14 @@ pub(crate) struct CompositeParams {
     /// `/tmp/divergence_tracker.md` D-415 for the full reverse-engineer
     /// trail.
     tone_curve_constants: [f32; 4],
+    /// Engine `intensity` cbuffer (slot 0x1D0000) = `(natural, bloom,
+    /// bling, persist)` — the shader-18 (`copy_target.hlsl`) weighted
+    /// combine of the separate scene/bloom/bling/persist buffers. Engine
+    /// caller passes `(1.0, m_bloom_intensity, m_bling_intensity, 0.5)`;
+    /// protomorph bakes bloom_intensity into the bloom pyramid (so bloom
+    /// weight is 1.0 here) and omits persist (no persist buffer ported),
+    /// leaving `(1.0, 1.0, bling_scale, 0.0)`.
+    intensity: [f32; 4],
 }
 
 impl CompositeParams {
@@ -94,6 +102,9 @@ impl CompositeParams {
         // (65535, 1.4938016, 0, 0) — saturation effectively unbounded,
         // linear-only brightness scale of 1.4938016.
         tone_curve_constants: [65535.0, 1.4938016, 0.0, 0.0],
+        // natural=1, bloom=1 (intensity baked in pyramid), bling=0
+        // (inactive), persist=0 (not ported).
+        intensity: [1.0, 1.0, 0.0, 0.0],
     };
 }
 
@@ -182,6 +193,7 @@ impl FinalCompositePass {
         cg_active_view: &wgpu::TextureView,
         cg_back_view: &wgpu::TextureView,
         dof_blur_view: &wgpu::TextureView,
+        star_view: &wgpu::TextureView,
     ) -> Self {
         let device = &shared.device;
         let filterable = wgpu::TextureSampleType::Float { filterable: true };
@@ -232,6 +244,9 @@ impl FinalCompositePass {
                     count: None,
                 },
                 sampler_entry(12, wgpu::SamplerBindingType::Filtering),
+                // Bling/star buffer (engine copy_target.hlsl sampler 3).
+                tex_entry(13, filterable),
+                sampler_entry(14, wgpu::SamplerBindingType::Filtering),
             ],
         });
 
@@ -248,7 +263,7 @@ impl FinalCompositePass {
         // The shader reads them at runtime — no compile-time bake.
         // Engine-faithful per `copy_accumulation_target`.
         let shader = device.create_shader_module(wgpu::include_wgsl!(
-            "../../../assets/shaders/final_composite.wgsl"
+            "../../../assets/halo_shaders/final_composite.wgsl"
         ));
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -309,29 +324,25 @@ impl FinalCompositePass {
                     },
                 ],
             });
-        // `postprocess_copy.wgsl` reads PostprocessParams.scale.xy. We
-        // pass scale = (1, 1, 1, 1) — plain passthrough.
-        #[repr(C, align(16))]
-        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-        struct PostprocessParams {
-            pixel_size: [f32; 4],
-            scale: [f32; 4],
-            intensity_vector: [f32; 4],
-            dark_color_multiplier: [f32; 4],
-        }
+        // `postprocess_copy.wgsl` reads the shared postprocess uniform's
+        // scale.xy. We pass scale = (1, 1, 1, 1) — plain passthrough. Reuse
+        // `PostprocessUniforms` (same `postprocess_copy.wgsl` cbuffer) rather
+        // than redeclaring an identical local struct.
         let swapchain_blit_uniform_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("swapchain_blit_uniforms"),
-                contents: bytemuck::bytes_of(&PostprocessParams {
-                    pixel_size: [0.0; 4],
-                    scale: [1.0, 1.0, 1.0, 1.0],
-                    intensity_vector: [0.0; 4],
-                    dark_color_multiplier: [0.0; 4],
-                }),
+                contents: bytemuck::bytes_of(
+                    &crate::halo::render::screen_postprocess::PostprocessUniforms {
+                        pixel_size: [0.0; 4],
+                        scale: [1.0, 1.0, 1.0, 1.0],
+                        intensity_vector: [0.0; 4],
+                        dark_color_multiplier: [0.0; 4],
+                    },
+                ),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
         let swapchain_blit_shader = device.create_shader_module(wgpu::include_wgsl!(
-            "../../../assets/shaders/postprocess_copy.wgsl"
+            "../../../assets/halo_shaders/postprocess_copy.wgsl"
         ));
         let swapchain_blit_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -440,6 +451,14 @@ impl FinalCompositePass {
                     binding: 12,
                     resource: wgpu::BindingResource::Sampler(&shared.filtering_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(star_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::Sampler(&shared.filtering_sampler),
+                },
             ],
         });
 
@@ -490,6 +509,7 @@ impl FinalCompositePass {
         cg_active_view: &wgpu::TextureView,
         cg_back_view: &wgpu::TextureView,
         dof_blur_view: &wgpu::TextureView,
+        star_view: &wgpu::TextureView,
     ) {
         self.blit_bind_group = shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit_bg"),
@@ -545,6 +565,14 @@ impl FinalCompositePass {
                 },
                 wgpu::BindGroupEntry {
                     binding: 12,
+                    resource: wgpu::BindingResource::Sampler(&shared.filtering_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(star_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
                     resource: wgpu::BindingResource::Sampler(&shared.filtering_sampler),
                 },
             ],
@@ -722,9 +750,11 @@ impl FinalCompositePass {
         cg_active_view: &wgpu::TextureView,
         cg_back_view: &wgpu::TextureView,
         dof_blur_view: &wgpu::TextureView,
+        star_view: &wgpu::TextureView,
     ) {
         self.rebind(
             shared, intermediates, gbuffer, bloom_view, cg_active_view, cg_back_view, dof_blur_view,
+            star_view,
         );
     }
 
@@ -745,12 +775,17 @@ impl FinalCompositePass {
         dof_focus: [f32; 4],
         tone_curve_enabled: bool,
         tone_curve_white_point: f32,
+        bling_scale: f32,
     ) {
         let mut params = CompositeParams::IDENTITY;
         params.cg_blend_factor[0] = cg_blend_factor;
         params.dof_focus = dof_focus;
         params.tone_curve_constants =
             compute_tone_curve_constants(tone_curve_enabled, tone_curve_white_point);
+        // Engine `intensity` = (natural, bloom, bling, persist). bloom is
+        // pre-baked in the pyramid (weight 1); bling = m_bling_intensity
+        // (0 when inactive); persist not ported.
+        params.intensity = [1.0, 1.0, bling_scale, 0.0];
         queue.write_buffer(
             &self.composite_uniform_buffer,
             0,
@@ -758,35 +793,31 @@ impl FinalCompositePass {
         );
     }
 
-    /// Update the `cg_blend_factor` uniform fed to the composite shader
-    /// (engine's `g_fColorGradingBlendFactor`). Preserves DoF state and
-    /// uses engine-default tone curve (enabled, WHITE=1.0).
-    pub fn set_cg_blend_factor(&self, queue: &wgpu::Queue, factor: f32) {
-        // Preserve DoF off (callers wanting DoF should use
-        // `set_composite_params` instead — this stays a no-op for DoF
-        // until that path is wired). Tone curve defaults to engine
-        // static-init values (enabled, WHITE=1.0).
-        self.set_composite_params(queue, factor, [0.0, 0.0, 0.0, 0.0], true, 1.0);
-    }
 }
 
 /// Convert a world-space focus distance + half-width into the
 /// `(focus_depth_ndc, half_width_ndc)` pair the composite shader's
 /// DoF blend expects.
 ///
-/// Forward-Z perspective: `depth_ndc = F*(z - N) / (z * (F-N))`.
-/// `half_width_ndc ≈ half_world × F*N / ((F-N) * z²)` (linearization
-/// of `d(depth_ndc)/d(z)` evaluated at `focus_world`).
+/// The renderer uses a REVERSE-Z infinite-far projection
+/// (`Mat4::perspective_infinite_reverse_rh`, near=1), so the depth buffer
+/// the composite shader samples stores `depth = near / z` (1 at the near
+/// plane, →0 at infinity) — the same mapping the particle/water shaders
+/// linearize as `near_clip / depth`. The DoF focus value MUST be in this
+/// encoding to be comparable to the sampled depth (a prior forward-Z
+/// `F*(z-N)/(z*(F-N))` form here was incompatible with the reverse-Z buffer).
+/// `far` is unused for an infinite far plane; kept for caller symmetry.
 pub fn dof_world_to_ndc(
     focus_world: f32,
     half_width_world: f32,
     near: f32,
-    far: f32,
+    _far: f32,
 ) -> (f32, f32) {
-    let denom = (far - near).max(1e-3);
     let focus_z = focus_world.max(near + 1e-3);
-    let focus_ndc = (far * (focus_z - near)) / (focus_z * denom);
-    let dz = (far * near) / (denom * focus_z * focus_z);
-    let half_ndc = (half_width_world * dz).max(1e-4);
+    // Reverse-Z infinite-far: depth_ndc = near / z.
+    let focus_ndc = near / focus_z;
+    // |d(depth_ndc)/dz| = near / z² → half-focus-band width in depth units.
+    let dz = near / (focus_z * focus_z);
+    let half_ndc = (half_width_world * dz).max(1e-6);
     (focus_ndc, half_ndc)
 }

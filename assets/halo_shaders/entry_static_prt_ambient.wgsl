@@ -196,6 +196,9 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
         calc_bumpmap(texcoord, in.fragment_to_camera_world, tangent, binormal, normal, &bump_normal_unnorm);
         calc_albedo(texcoord, &albedo, bump_normal_unnorm, misc);
         bump_normal = normalize(bump_normal_unnorm + 1e-6 * normal);
+        // Two-sided transparent surfaces (glass): face the normal toward the
+        // camera (engine decorators_hlsl.hlsl:265). See entry_static_per_pixel.
+        bump_normal = bump_normal * sign(dot(bump_normal, in.fragment_to_camera_world));
         calc_specular_mask(texcoord, albedo.w, &specular_mask);
     }
 
@@ -246,15 +249,40 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
 
     const BLEND_MULTIPLICATIVE_ENABLED: f32 = __BLEND_MULTIPLICATIVE_ENABLED__;
     const BLEND_MULTIPLICATIVE_FACTOR:  f32 = __BLEND_MULTIPLICATIVE_FACTOR__;
+    const BLEND_FRESNEL_ENABLED: f32 = __BLEND_FRESNEL_ENABLED__;
 
     var out_rgb: vec3<f32>;
+    var alpha_out: f32 = __ALPHA_CHANNEL_OUTPUT__;
     if (BLEND_MULTIPLICATIVE_ENABLED > 0.5) {
-        out_rgb = (albedo_for_illum + self_illum_radiance) * BLEND_MULTIPLICATIVE_FACTOR;
+        // APPLY_OVERLAYS runs BEFORE the multiply factor (entry_points_fx.hlsl:254-256).
+        out_rgb = albedo_for_illum + self_illum_radiance;
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
+        out_rgb = out_rgb * BLEND_MULTIPLICATIVE_FACTOR;
+    } else if (BLEND_FRESNEL_ENABLED > 0.5) {
+        // HLSL `#elif defined(BLEND_FRESNEL)` (entry_points_fx.hlsl:258) — glass.
+        // Diffuse PREMULTIPLIED by albedo.w; env + specular add on top; alpha
+        // = saturate(fresnel + albedo.w). `static_prt_ps` shares the
+        // `calc_output_color_with_explicit_light_quadratic` umbrella with
+        // `static_sh_ps`, so it carries the same three branches. (Currently
+        // gated off via __BLEND_FRESNEL_ENABLED__=0 like every entry — see
+        // render_methods/mod.rs `fresnel_enabled`.)
+        out_rgb = mat.diffuse_radiance * albedo_for_illum * albedo.w
+            + self_illum_radiance
+            + envmap_radiance
+            + mat.specular_color.xyz;
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
+        out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
+        alpha_out = saturate(mat.specular_color.w + albedo.w);
     } else {
         out_rgb = mat.diffuse_radiance * albedo_for_illum
             + mat.specular_color.xyz
             + self_illum_radiance
             + envmap_radiance;
+        // APPLY_OVERLAYS (shared umbrella, all lighting variants) — overlay then edge_fade.
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
         out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
     }
     // Engine applies underwater fog via the separate `render_underwater_fog`
@@ -263,7 +291,6 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // the fog when underwater. Match the engine-faithful `entry_static_sh`
     // / `entry_static_per_pixel` paths — leave fog to the fullscreen pass.
 
-    let alpha_out: f32 = __ALPHA_CHANNEL_OUTPUT__;
     out_rgb = out_rgb * __ALPHA_PREMULTIPLY__;
 
     // Engine `convert_to_render_target` clamps RGB ≥ 0 before RT write

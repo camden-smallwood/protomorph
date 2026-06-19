@@ -14,6 +14,8 @@ use blam_tags::math::{RealPoint3d, RealVector3d};
 
 use blam_tags::math::RealMatrix4x3;
 
+use crate::halo::math::matrix_math::{cross, normalize3d};
+
 use super::types::{flag, DecalProjectionBuilder, Fold};
 
 impl DecalProjectionBuilder {
@@ -103,15 +105,15 @@ impl DecalProjectionBuilder {
         let forward = self.projection.forward;
         let (mut left, up);
         if (self.flags & flag::LEFT_HANDED) != 0 {
-            left = cross(&forward, &up_basis);
+            left = cross(forward, up_basis);
         } else {
-            left = cross(&up_basis, &forward);
+            left = cross(up_basis, forward);
         }
         normalize3d(&mut left);
         if (self.flags & flag::LEFT_HANDED) != 0 {
-            up = cross(&left, &forward);
+            up = cross(left, forward);
         } else {
-            up = cross(&forward, &left);
+            up = cross(forward, left);
         }
         self.projection.left = left;
         self.projection.up = up;
@@ -259,11 +261,11 @@ impl DecalProjectionBuilder {
             if (self.flags & flag::NEEDS_RENORMALIZE) != 0 {
                 normalize3d(&mut self.projection.forward);
                 let mut new_left =
-                    cross(&self.projection.up, &self.projection.forward);
+                    cross(self.projection.up, self.projection.forward);
                 self.projection.left = new_left;
                 normalize3d(&mut self.projection.left);
                 new_left = self.projection.left;
-                let new_up = cross(&self.projection.forward, &new_left);
+                let new_up = cross(self.projection.forward, new_left);
                 self.projection.up = new_up;
                 normalize3d(&mut self.projection.up);
                 if (self.flags & flag::LEFT_HANDED) != 0 {
@@ -282,26 +284,6 @@ impl DecalProjectionBuilder {
 // =============================================================================
 // Inline math helpers
 // =============================================================================
-
-#[inline]
-fn cross(a: &RealVector3d, b: &RealVector3d) -> RealVector3d {
-    RealVector3d {
-        i: a.j * b.k - a.k * b.j,
-        j: a.k * b.i - a.i * b.k,
-        k: a.i * b.j - a.j * b.i,
-    }
-}
-
-#[inline]
-fn normalize3d(v: &mut RealVector3d) {
-    let len_sq = v.i * v.i + v.j * v.j + v.k * v.k;
-    if len_sq > 0.0 {
-        let inv_len = len_sq.sqrt().recip();
-        v.i *= inv_len;
-        v.j *= inv_len;
-        v.k *= inv_len;
-    }
-}
 
 /// Mirror of `matrix4x3_rotation_from_axis_and_angle @ 0x1802C3EF0`.
 /// Builds a rotation-only `real_matrix4x3` (scale = 1, position = 0)

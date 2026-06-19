@@ -1070,11 +1070,15 @@ fn fs_main(in: VsOut) -> AccumPixel {
     let bed_world0 = bed_world_h0.xyz / max(bed_world_h0.w, 1e-6);
     let depth_water_for_bump = length(bed_world0 - in.world_position);
 
-    // incident_ws follows engine: world-space dir from surface to camera
-    // (`Camera_Position - position_ws`, normalized; .w = pre-norm length).
-    let incident_ws_dir = water_shared_ps.k_ps_camera_position.xyz
+    // incident_ws follows engine (water_shading_fx.hlsl:335-337): world-space
+    // dir from surface to camera, NORMALIZED (.xyz), with .w = pre-norm length.
+    // The refraction bump uses incident_ws.yx — the NORMALIZED components
+    // (magnitude ≤ 1); using the raw (un-normalized) delta over-scales the
+    // distortion by ~the view distance.
+    let incident_ws_raw = water_shared_ps.k_ps_camera_position.xyz
                         - in.world_position;
-    let incident_ws_w = length(incident_ws_dir);
+    let incident_ws_w = length(incident_ws_raw);
+    let incident_ws_dir = incident_ws_raw / max(incident_ws_w, 1e-6);
 
     var bump = slope_refraction_p
              * vec2<f32>(incident_ws_dir.y, incident_ws_dir.x)

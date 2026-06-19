@@ -169,9 +169,12 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     var out_rgb: vec3<f32>;
     if (BLEND_MULTIPLICATIVE_ENABLED > 0.5) {
         // HLSL `#ifdef BLEND_MULTIPLICATIVE`: no fog, no exposure.
+        // NOTE: `static_per_vertex_color_ps` (entry_points_fx.hlsl:886) does
+        // NOT call APPLY_OVERLAYS — unlike the shared calc_output_color_*
+        // umbrella. The sky/per-vertex-color path has no overlay/edge_fade.
         out_rgb = (diffuse_radiance * albedo.xyz + self_illum_radiance) * BLEND_MULTIPLICATIVE_FACTOR;
     } else {
-        // HLSL default branch.
+        // HLSL default branch (entry_points_fx.hlsl:889) — no APPLY_OVERLAYS.
         out_rgb = diffuse_radiance * albedo.xyz + self_illum_radiance;
         out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
     }

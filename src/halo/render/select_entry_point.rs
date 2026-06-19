@@ -182,10 +182,28 @@ pub fn select_instance_entry_point(
             return out;
         }
     } else if (entry.pervertex_block_index as usize) < lbsp.bsp_per_vertex_data.len() {
-        // Has a per-vertex SH block. The engine reads the runtime
-        // vertex buffer index from byte offset 12 of the 16-byte
-        // pervertex block; we hand that off to the caller via the
-        // closure (which knows whether the GPU buffer was uploaded).
+        // Has a per-vertex SH block. The engine (`select_instance_entry_point
+        // @ 0x180691340`) reads the runtime vertex-buffer index `v22` from
+        // byte offset 12 of the 16-byte pervertex block
+        // (`LightmapPerVertexBlock.vertex_buffer_index`) and branches THREE
+        // ways — we previously collapsed it to two and sent the first case
+        // to the flat default-lighting fallback:
+        //
+        //   v22 == -1            → `goto LABEL_43` with the entry STILL
+        //                          `_entry_point_static_lighting_per_pixel`.
+        //                          i.e. render PER-PIXEL off the mesh's own
+        //                          lightmap UVs (no per-instance stream
+        //                          override) — NOT the flat SH fallback.
+        //   v22 != -1, buf ok    → `_entry_point_static_lighting_per_vertex`
+        //   v22 != -1, buf null  → falls through to the SH default fallback.
+        let block = &lbsp.bsp_per_vertex_data[entry.pervertex_block_index as usize];
+        if block.vertex_buffer_index == -1 {
+            // Engine returns per_pixel here (the radial floor panels on
+            // guardian land in this case — per-vertex block authored but no
+            // runtime SH stream, so the engine uses the per-pixel atlas).
+            out.entry = HaloEntryPoint::StaticPerPixel;
+            return out;
+        }
         if has_pervertex_runtime_buffer(entry.pervertex_block_index) {
             // Engine-faithful path: dedicated `static_sh_per_vertex`
             // entry shader reads SH from a SECONDARY vertex buffer

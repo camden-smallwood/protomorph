@@ -1,7 +1,9 @@
+pub mod sh;
+
 use bytemuck::{Pod, Zeroable};
 
 use crate::halo::render::lighting_interface::LightingInterface;
-use crate::halo::render::views::lights_view::{LightsView, SimpleLight};
+use crate::halo::render::views::lights_view::SimpleLight;
 
 // ---------------------------------------------------------------------------
 // Engine-wide forward-pipeline lighting cbuffer
@@ -168,23 +170,6 @@ impl Default for GpuSimpleLights {
 }
 
 impl GpuSimpleLights {
-    /// Build the cbuffer payload from a `LightsView`. Mirrors
-    /// `c_lights_view::submit_simple_light_draw_list_to_shader @ 0x1806c7e60`.
-    /// LightsView's internal `simple_lights` array still holds Halo's
-    /// 8-slot legacy form; we copy whatever's there and zero-fill the
-    /// rest. Direct scenario-light packing bypasses this via
-    /// [`pack_simple_light_at`] called from the Renderer.
-    pub fn from_lights_view(view: &LightsView) -> Self {
-        let mut out = Self::default();
-        out.count[0] = view.simple_light_count as f32;
-        for (i, src) in view.simple_lights.iter().enumerate() {
-            if i >= SIMPLE_LIGHTS_MAX {
-                break;
-            }
-            out.lights[i] = pack_simple_light(src);
-        }
-        out
-    }
 }
 
 /// Pack a single light into the cbuffer at `slot`. Caller is

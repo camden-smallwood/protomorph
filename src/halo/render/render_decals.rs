@@ -72,6 +72,16 @@ impl LoadedBspDecals {
         let vertex_start = self.vertices.len() as u32;
         let index_start = self.indices.len() as u32;
         let base = vertex_start;
+        // Indices are u16 and rebased by `base`; the index buffer is bound as
+        // Uint16. Once a BSP's decal pool exceeds u16::MAX vertices, `base as
+        // u16` wraps and the rebased indices point at the wrong vertices →
+        // silent garbage triangles. Catch it in debug builds.
+        debug_assert!(
+            self.vertices.len() + packed_vertices.len() <= u16::MAX as usize,
+            "BSP decal vertex pool exceeded u16::MAX ({} + {}); u16 index rebasing would wrap",
+            self.vertices.len(),
+            packed_vertices.len(),
+        );
         self.vertices.extend_from_slice(packed_vertices);
         // Engine writes per-fragment indices that reference the
         // per-fragment vertex range (0..fragment.output_vertex_count).
@@ -110,15 +120,6 @@ impl DecalRenderer {
         Self { per_bsp }
     }
 
-    pub fn total_decals(&self) -> usize {
-        self.per_bsp.iter().map(|b| b.decals.len()).sum()
-    }
-    pub fn total_vertices(&self) -> usize {
-        self.per_bsp.iter().map(|b| b.vertices.len()).sum()
-    }
-    pub fn total_indices(&self) -> usize {
-        self.per_bsp.iter().map(|b| b.indices.len()).sum()
-    }
 }
 
 // ============================================================================

@@ -25,7 +25,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use crate::halo::render::SampleIntent;
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::halo::bitmaps::atlas_decode::DecodedAtlas;
@@ -36,7 +36,7 @@ use crate::halo::geometry::{
 use crate::halo::render::shared::{FrameContext, SharedResources};
 use crate::halo::scenario::loader::LoadedScenario;
 use blam_tags::decorator_set::RenderShader;
-use blam_tags::math::{RealPoint2d, RealQuaternion};
+use blam_tags::math::RealPoint2d;
 
 /// Number of `s_decorator_set::e_render_shader` variants — see
 /// `blam_tags::decorator_set::RenderShader`. Used to size the per-variant
@@ -610,191 +610,11 @@ impl DecoratorRenderer {
         // sample-diag's per-ray SH (same atlas, different hit UVs) to
         // diagnose dim-decorator-on-bright-ground complaints.
         if let Ok(s) = std::env::var("PROTOMORPH_DIAG_GROUND_AT") {
-            let parts: Vec<f32> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
-            if parts.len() == 3 {
-                eprintln!("[ground-diag] target world XYZ=({:.3},{:.3},{:.3})", parts[0], parts[1], parts[2]);
-                // Dump the per-BSP compression vectors that gate every SH
-                // coef. Atlas SH formula = `(p_a + p_b - 1) × 2 × cv[2k].x`
-                // — if cv is small, all SH values come out small regardless
-                // of underlying atlas pixel content. Riverworld's atlas
-                // appears uniformly dim per the diags; cv being undersized
-                // would explain it.
-                if let Some(bsp) = scenario.active_bsps.first() {
-                    if let Some(lbsp) = &bsp.lightmap {
-                        let cvs = &lbsp.compression_vectors;
-                        eprintln!(
-                            "[ground-diag] compression_vectors len={} (need ≥9 for full SH chain)",
-                            cvs.len(),
-                        );
-                        for (i, v) in cvs.iter().take(20).enumerate() {
-                            eprintln!(
-                                "  cv[{i}] = ({:.4}, {:.4}, {:.4})",
-                                v.i, v.j, v.k,
-                            );
-                        }
-                    }
-                }
-                if let Some(ba) = bake_resources.first() {
-                    use crate::halo::geometry::geometry_sampling::{
-                        geometry_test_vector, sample as c_geometry_sampler_sample,
-                        GeometrySample, GeometrySamplerOutcome, GeometryTestResult,
-                    };
-                    use blam_tags::math::{RealPoint3d, RealVector3d};
-
-                    // Cast geometry_test_vector ourselves to grab lightmap_uv
-                    // for the hit, so we can dump raw atlas pixel data
-                    // separately from the SH evaluation pipeline.
-                    let ray_start_probe = RealPoint3d { x: parts[0], y: parts[1], z: parts[2] + 1.0 };
-                    let ray_dir_probe = RealVector3d { i: 0.0, j: 0.0, k: -10.0 };
-                    let mut probe_test = GeometryTestResult::default();
-                    let _ = geometry_test_vector(
-                        scenario, ray_start_probe, ray_dir_probe,
-                        true, -1, false, false, true, &mut probe_test,
-                    );
-                    let lm_uv = probe_test.lightmap_uv;
-                    eprintln!(
-                        "[ground-diag] lightmap_uv at hit: ({:.4}, {:.4})",
-                        lm_uv.x, lm_uv.y,
-                    );
-                    let raw_uv = RealPoint2d { x: lm_uv.x, y: lm_uv.y };
-                    // SH coef index 0 = atlas image_index 0 + 1.
-                    let pa = bitmap_group_2d_get_real_pixel(
-                        &ba.sh, 0, &raw_uv, 0, true,
-                    );
-                    let pb = bitmap_group_2d_get_real_pixel(
-                        &ba.sh, 1, &raw_uv, 0, true,
-                    );
-                    eprintln!(
-                        "[ground-diag] raw atlas pixel_a img0: R={:.4} G={:.4} B={:.4} A={:.4}",
-                        pa.red, pa.green, pa.blue, pa.alpha,
-                    );
-                    eprintln!(
-                        "[ground-diag] raw atlas pixel_b img1: R={:.4} G={:.4} B={:.4} A={:.4}",
-                        pb.red, pb.green, pb.blue, pb.alpha,
-                    );
-                    let cv0 = scenario.active_bsps.first()
-                        .and_then(|b| b.lightmap.as_ref())
-                        .and_then(|l| l.compression_vectors.first())
-                        .map(|v| v.i).unwrap_or(0.0);
-                    let alpha_sq = pa.alpha * pb.alpha;
-                    let signed_rgb = (pa.red + pb.red - 1.0,
-                                      pa.green + pb.green - 1.0,
-                                      pa.blue + pb.blue - 1.0);
-                    eprintln!(
-                        "[ground-diag] decode: alpha² = {:.4}, signed_value_RGB = ({:.4}, {:.4}, {:.4}), cv[0] = {:.4}",
-                        alpha_sq, signed_rgb.0, signed_rgb.1, signed_rgb.2, cv0,
-                    );
-                    eprintln!(
-                        "[ground-diag] sh_r[0] (alpha-gated) = signed × 2 × alpha² × cv = {:.4}",
-                        signed_rgb.0 * 2.0 * alpha_sq * cv0,
-                    );
-                    eprintln!(
-                        "[ground-diag] sh_r[0] (alpha-IGNORED) = signed × 2 × cv = {:.4}  ← what we'd get without alpha gating",
-                        signed_rgb.0 * 2.0 * cv0,
-                    );
-
-                    let ray_start = RealPoint3d { x: parts[0], y: parts[1], z: parts[2] + 1.0 };
-                    let ray_dir = RealVector3d { i: 0.0, j: 0.0, k: -10.0 };
-                    let mut sample = GeometrySample::default();
-                    let outcome = c_geometry_sampler_sample(
-                        scenario,
-                        Some(&ba.sh),
-                        ba.intensity.as_ref(),
-                        /*lightprobe_pixels_per_probe*/ 8,
-                        /*dominant_pixels_per_probe*/ 2,
-                        ray_start, ray_dir,
-                        /*ignore_all_objects*/ true,
-                        /*ignore_object_index*/ -1,
-                        /*light_probe*/ true,
-                        /*diffuse*/ true,
-                        &mut sample,
-                    );
-                    eprintln!(
-                        "[ground-diag] outcome={outcome:?} hit=({:.3},{:.3},{:.3}) normal=({:.3},{:.3},{:.3})",
-                        sample.sample_point.x, sample.sample_point.y, sample.sample_point.z,
-                        sample.normal.i, sample.normal.j, sample.normal.k,
-                    );
-                    eprintln!(
-                        "[ground-diag] sh_r[0..4]=({:.4},{:.4},{:.4},{:.4})",
-                        sample.light_probe_r[0], sample.light_probe_r[1],
-                        sample.light_probe_r[2], sample.light_probe_r[3],
-                    );
-                    eprintln!(
-                        "[ground-diag] sh_g[0..4]=({:.4},{:.4},{:.4},{:.4})",
-                        sample.light_probe_g[0], sample.light_probe_g[1],
-                        sample.light_probe_g[2], sample.light_probe_g[3],
-                    );
-                    eprintln!(
-                        "[ground-diag] sh_b[0..4]=({:.4},{:.4},{:.4},{:.4})",
-                        sample.light_probe_b[0], sample.light_probe_b[1],
-                        sample.light_probe_b[2], sample.light_probe_b[3],
-                    );
-                    eprintln!(
-                        "[ground-diag] diffuse=({:.4},{:.4},{:.4})",
-                        sample.diffuse.i, sample.diffuse.j, sample.diffuse.k,
-                    );
-                    // Terrain shader ultimately evaluates ravi(N, SH) at the
-                    // pixel's interpolated normal for the ambient term. Dump
-                    // that for an up-normal (the closest reference to "ground
-                    // shaded at a horizontal surface") so the user can compare
-                    // a single scalar against the decorator's bake bright.
-                    let n_up = glam::Vec3::Z;
-                    let sh_r9: &[f32; 9] = (&sample.light_probe_r[..9]).try_into().unwrap();
-                    let sh_g9: &[f32; 9] = (&sample.light_probe_g[..9]).try_into().unwrap();
-                    let sh_b9: &[f32; 9] = (&sample.light_probe_b[..9]).try_into().unwrap();
-                    let ambient_r = crate::halo::decorators::light_placement::ravi_order_3(n_up, sh_r9).max(0.0);
-                    let ambient_g = crate::halo::decorators::light_placement::ravi_order_3(n_up, sh_g9).max(0.0);
-                    let ambient_b = crate::halo::decorators::light_placement::ravi_order_3(n_up, sh_b9).max(0.0);
-                    eprintln!(
-                        "[ground-diag] ravi(+Z, SH) ambient_only=({:.4},{:.4},{:.4})  — what the bake's plain ravi computes",
-                        ambient_r, ambient_g, ambient_b,
-                    );
-                    eprintln!(
-                        "[ground-diag] dom_dir=({:.3},{:.3},{:.3}) dom_intensity=({:.4},{:.4},{:.4})",
-                        sample.dominant_light_dir.i, sample.dominant_light_dir.j, sample.dominant_light_dir.k,
-                        sample.dominant_light_intensity.red,
-                        sample.dominant_light_intensity.green,
-                        sample.dominant_light_intensity.blue,
-                    );
-                    // Mirror of `ravi_order_2_with_dominant_light` (terrain
-                    // shader's actual diffuse evaluator). Subtract the dom
-                    // contribution from SH L1, ravi the remainder, then add
-                    // back analytical Lambertian `max(0, N·L) × intensity × 0.281`.
-                    // Done at the diag layer only (no dependency on the
-                    // shader's matrix-packed cbuffer layout).
-                    let dom_dir = glam::Vec3::new(
-                        sample.dominant_light_dir.i,
-                        sample.dominant_light_dir.j,
-                        sample.dominant_light_dir.k,
-                    );
-                    let dom_int = glam::Vec3::new(
-                        sample.dominant_light_intensity.red,
-                        sample.dominant_light_intensity.green,
-                        sample.dominant_light_intensity.blue,
-                    );
-                    let dom_norm = dom_dir.length();
-                    let n_dot_l_pos =
-                        if dom_norm > 1e-5 { (dom_dir / dom_norm).dot(n_up).max(0.0) } else { 0.0 };
-                    let analytical_lambert = dom_int * n_dot_l_pos * 0.281;
-                    eprintln!(
-                        "[ground-diag] analytical sun lambert (+Z)=({:.4},{:.4},{:.4})  — the ~0.281×N·L term the bake MISSES",
-                        analytical_lambert.x, analytical_lambert.y, analytical_lambert.z,
-                    );
-                    eprintln!(
-                        "[ground-diag] TOTAL terrain diffuse ≈ ambient + sun = ({:.4},{:.4},{:.4})",
-                        ambient_r + analytical_lambert.x,
-                        ambient_g + analytical_lambert.y,
-                        ambient_b + analytical_lambert.z,
-                    );
-                    let _ = outcome;
-                }
-            } else {
-                eprintln!("[ground-diag] PROTOMORPH_DIAG_GROUND_AT needs 3 floats: x,y,z");
-            }
+            diag_ground_at(scenario, &bake_resources, &s);
         }
 
         let mut total_placements = 0usize;
-        let mut total_hits = 0usize;
+        let total_hits = 0usize;
         let mut total_baked = 0usize;
 
         for (block_idx, block) in scenario.scenario.decorators.iter().enumerate() {
@@ -852,6 +672,10 @@ impl DecoratorRenderer {
                 if set_entry.placements.is_empty() {
                     continue;
                 }
+                // Drain prior set's instance-buffer + texture staging so a
+                // decorator-heavy map doesn't batch every set into the
+                // first-frame submit (GPU-watchdog hang — see `flush_staging`).
+                crate::halo::structures::bsp_gpu::flush_staging(shared);
                 let Some(loaded_set) = scenario
                     .decorator_sets
                     .get(block_idx)
@@ -1989,7 +1813,7 @@ fn build_instance(
     subpart_pose: Mat4,
 ) -> DecoratorInstance {
     let pos = Vec3::new(p.position.x, p.position.y, p.position.z);
-    let rot = quat_from_real(&p.rotation);
+    let rot = crate::halo::math::matrix_math::quat_from_real(p.rotation);
     let scale = if p.scale > 0.0 { p.scale } else { 1.0 };
     // Engine cache-build composition (see the subpart-pose lookup site
     // for the engine reference): the per-subpart `instance_placement`
@@ -2102,12 +1926,199 @@ pub(crate) struct BakeAtlas {
     pub compress: [[f32; 4]; 3],
 }
 
-fn quat_from_real(q: &RealQuaternion) -> Quat {
-    // glam Quat is (x, y, z, w); RealQuaternion is (i, j, k, w).
-    let v = Quat::from_xyzw(q.i, q.j, q.k, q.w);
-    if v.length_squared() > 0.0001 {
-        v.normalize()
-    } else {
-        Quat::IDENTITY
+
+/// `PROTOMORPH_DIAG_GROUND_AT="x,y,z"` one-shot ground-SH diagnostic,
+/// extracted verbatim from [`Decorators::load_scenario`]. Casts a ray
+/// straight DOWN from `(x, y, z + 1.0)` to find the ground hit, then dumps
+/// the per-pixel atlas SH + terrain-diffuse reconstruction at that hit —
+/// what the terrain shader implicitly reads when shading a ground pixel
+/// there. Pure read-only over `scenario` / `bake_resources`; no behavior
+/// change. `raw` is the unparsed env-var value (the `is_ok()` gate is at
+/// the call site).
+fn diag_ground_at(
+    scenario: &LoadedScenario,
+    bake_resources: &[BakeAtlas],
+    raw: &str,
+) {
+    let parts: Vec<f32> = raw.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    if parts.len() != 3 {
+        eprintln!("[ground-diag] PROTOMORPH_DIAG_GROUND_AT needs 3 floats: x,y,z");
+        return;
+    }
+    eprintln!("[ground-diag] target world XYZ=({:.3},{:.3},{:.3})", parts[0], parts[1], parts[2]);
+    // Dump the per-BSP compression vectors that gate every SH
+    // coef. Atlas SH formula = `(p_a + p_b - 1) × 2 × cv[2k].x`
+    // — if cv is small, all SH values come out small regardless
+    // of underlying atlas pixel content. Riverworld's atlas
+    // appears uniformly dim per the diags; cv being undersized
+    // would explain it.
+    if let Some(bsp) = scenario.active_bsps.first() {
+        if let Some(lbsp) = &bsp.lightmap {
+            let cvs = &lbsp.compression_vectors;
+            eprintln!(
+                "[ground-diag] compression_vectors len={} (need ≥9 for full SH chain)",
+                cvs.len(),
+            );
+            for (i, v) in cvs.iter().take(20).enumerate() {
+                eprintln!(
+                    "  cv[{i}] = ({:.4}, {:.4}, {:.4})",
+                    v.i, v.j, v.k,
+                );
+            }
+        }
+    }
+    if let Some(ba) = bake_resources.first() {
+        use crate::halo::geometry::geometry_sampling::{
+            geometry_test_vector, sample as c_geometry_sampler_sample,
+            GeometrySample, GeometryTestResult,
+        };
+        use blam_tags::math::{RealPoint3d, RealVector3d};
+
+        // Cast geometry_test_vector ourselves to grab lightmap_uv
+        // for the hit, so we can dump raw atlas pixel data
+        // separately from the SH evaluation pipeline.
+        let ray_start_probe = RealPoint3d { x: parts[0], y: parts[1], z: parts[2] + 1.0 };
+        let ray_dir_probe = RealVector3d { i: 0.0, j: 0.0, k: -10.0 };
+        let mut probe_test = GeometryTestResult::default();
+        let _ = geometry_test_vector(
+            scenario, ray_start_probe, ray_dir_probe,
+            true, -1, false, false, true, &mut probe_test,
+        );
+        let lm_uv = probe_test.lightmap_uv;
+        eprintln!(
+            "[ground-diag] lightmap_uv at hit: ({:.4}, {:.4})",
+            lm_uv.x, lm_uv.y,
+        );
+        let raw_uv = RealPoint2d { x: lm_uv.x, y: lm_uv.y };
+        // SH coef index 0 = atlas image_index 0 + 1.
+        let pa = bitmap_group_2d_get_real_pixel(
+            &ba.sh, 0, &raw_uv, 0, true,
+        );
+        let pb = bitmap_group_2d_get_real_pixel(
+            &ba.sh, 1, &raw_uv, 0, true,
+        );
+        eprintln!(
+            "[ground-diag] raw atlas pixel_a img0: R={:.4} G={:.4} B={:.4} A={:.4}",
+            pa.red, pa.green, pa.blue, pa.alpha,
+        );
+        eprintln!(
+            "[ground-diag] raw atlas pixel_b img1: R={:.4} G={:.4} B={:.4} A={:.4}",
+            pb.red, pb.green, pb.blue, pb.alpha,
+        );
+        let cv0 = scenario.active_bsps.first()
+            .and_then(|b| b.lightmap.as_ref())
+            .and_then(|l| l.compression_vectors.first())
+            .map(|v| v.i).unwrap_or(0.0);
+        let alpha_sq = pa.alpha * pb.alpha;
+        let signed_rgb = (pa.red + pb.red - 1.0,
+                          pa.green + pb.green - 1.0,
+                          pa.blue + pb.blue - 1.0);
+        eprintln!(
+            "[ground-diag] decode: alpha² = {:.4}, signed_value_RGB = ({:.4}, {:.4}, {:.4}), cv[0] = {:.4}",
+            alpha_sq, signed_rgb.0, signed_rgb.1, signed_rgb.2, cv0,
+        );
+        eprintln!(
+            "[ground-diag] sh_r[0] (alpha-gated) = signed × 2 × alpha² × cv = {:.4}",
+            signed_rgb.0 * 2.0 * alpha_sq * cv0,
+        );
+        eprintln!(
+            "[ground-diag] sh_r[0] (alpha-IGNORED) = signed × 2 × cv = {:.4}  ← what we'd get without alpha gating",
+            signed_rgb.0 * 2.0 * cv0,
+        );
+
+        let ray_start = RealPoint3d { x: parts[0], y: parts[1], z: parts[2] + 1.0 };
+        let ray_dir = RealVector3d { i: 0.0, j: 0.0, k: -10.0 };
+        let mut sample = GeometrySample::default();
+        let outcome = c_geometry_sampler_sample(
+            scenario,
+            Some(&ba.sh),
+            ba.intensity.as_ref(),
+            /*lightprobe_pixels_per_probe*/ 8,
+            /*dominant_pixels_per_probe*/ 2,
+            ray_start, ray_dir,
+            /*ignore_all_objects*/ true,
+            /*ignore_object_index*/ -1,
+            /*light_probe*/ true,
+            /*diffuse*/ true,
+            &mut sample,
+        );
+        eprintln!(
+            "[ground-diag] outcome={outcome:?} hit=({:.3},{:.3},{:.3}) normal=({:.3},{:.3},{:.3})",
+            sample.sample_point.x, sample.sample_point.y, sample.sample_point.z,
+            sample.normal.i, sample.normal.j, sample.normal.k,
+        );
+        eprintln!(
+            "[ground-diag] sh_r[0..4]=({:.4},{:.4},{:.4},{:.4})",
+            sample.light_probe_r[0], sample.light_probe_r[1],
+            sample.light_probe_r[2], sample.light_probe_r[3],
+        );
+        eprintln!(
+            "[ground-diag] sh_g[0..4]=({:.4},{:.4},{:.4},{:.4})",
+            sample.light_probe_g[0], sample.light_probe_g[1],
+            sample.light_probe_g[2], sample.light_probe_g[3],
+        );
+        eprintln!(
+            "[ground-diag] sh_b[0..4]=({:.4},{:.4},{:.4},{:.4})",
+            sample.light_probe_b[0], sample.light_probe_b[1],
+            sample.light_probe_b[2], sample.light_probe_b[3],
+        );
+        eprintln!(
+            "[ground-diag] diffuse=({:.4},{:.4},{:.4})",
+            sample.diffuse.i, sample.diffuse.j, sample.diffuse.k,
+        );
+        // Terrain shader ultimately evaluates ravi(N, SH) at the
+        // pixel's interpolated normal for the ambient term. Dump
+        // that for an up-normal (the closest reference to "ground
+        // shaded at a horizontal surface") so the user can compare
+        // a single scalar against the decorator's bake bright.
+        let n_up = glam::Vec3::Z;
+        let sh_r9: &[f32; 9] = (&sample.light_probe_r[..9]).try_into().unwrap();
+        let sh_g9: &[f32; 9] = (&sample.light_probe_g[..9]).try_into().unwrap();
+        let sh_b9: &[f32; 9] = (&sample.light_probe_b[..9]).try_into().unwrap();
+        let ambient_r = crate::halo::decorators::light_placement::ravi_order_3(n_up, sh_r9).max(0.0);
+        let ambient_g = crate::halo::decorators::light_placement::ravi_order_3(n_up, sh_g9).max(0.0);
+        let ambient_b = crate::halo::decorators::light_placement::ravi_order_3(n_up, sh_b9).max(0.0);
+        eprintln!(
+            "[ground-diag] ravi(+Z, SH) ambient_only=({:.4},{:.4},{:.4})  — what the bake's plain ravi computes",
+            ambient_r, ambient_g, ambient_b,
+        );
+        eprintln!(
+            "[ground-diag] dom_dir=({:.3},{:.3},{:.3}) dom_intensity=({:.4},{:.4},{:.4})",
+            sample.dominant_light_dir.i, sample.dominant_light_dir.j, sample.dominant_light_dir.k,
+            sample.dominant_light_intensity.red,
+            sample.dominant_light_intensity.green,
+            sample.dominant_light_intensity.blue,
+        );
+        // Mirror of `ravi_order_2_with_dominant_light` (terrain
+        // shader's actual diffuse evaluator). Subtract the dom
+        // contribution from SH L1, ravi the remainder, then add
+        // back analytical Lambertian `max(0, N·L) × intensity × 0.281`.
+        // Done at the diag layer only (no dependency on the
+        // shader's matrix-packed cbuffer layout).
+        let dom_dir = glam::Vec3::new(
+            sample.dominant_light_dir.i,
+            sample.dominant_light_dir.j,
+            sample.dominant_light_dir.k,
+        );
+        let dom_int = glam::Vec3::new(
+            sample.dominant_light_intensity.red,
+            sample.dominant_light_intensity.green,
+            sample.dominant_light_intensity.blue,
+        );
+        let dom_norm = dom_dir.length();
+        let n_dot_l_pos =
+            if dom_norm > 1e-5 { (dom_dir / dom_norm).dot(n_up).max(0.0) } else { 0.0 };
+        let analytical_lambert = dom_int * n_dot_l_pos * 0.281;
+        eprintln!(
+            "[ground-diag] analytical sun lambert (+Z)=({:.4},{:.4},{:.4})  — the ~0.281×N·L term the bake MISSES",
+            analytical_lambert.x, analytical_lambert.y, analytical_lambert.z,
+        );
+        eprintln!(
+            "[ground-diag] TOTAL terrain diffuse ≈ ambient + sun = ({:.4},{:.4},{:.4})",
+            ambient_r + analytical_lambert.x,
+            ambient_g + analytical_lambert.y,
+            ambient_b + analytical_lambert.z,
+        );
+        let _ = outcome;
     }
 }

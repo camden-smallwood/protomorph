@@ -20,12 +20,9 @@ use wgpu::util::DeviceExt;
 use crate::halo::geometry::ModelVertex;
 use crate::halo::render::shared::SharedResources;
 use crate::halo::render_methods::material_bindings::{fallback_view_for_param, sample_intent_for_param};
-use crate::halo::render_methods::materials::{
-    InlinePixelFormat, InlineTexture, MaterialData, MaterialTextureUsage,
-};
+use crate::halo::render_methods::materials::{InlineTexture, MaterialData};
 use crate::halo::render_methods::pipeline_cache::{HaloPipelineCache, VariantArtifacts};
 use crate::halo::render_methods::serializer::serialize as serialize_material;
-use crate::halo::render_methods::HaloEntryPoint;
 use crate::halo::render_methods::animated::AnimatedMaterial;
 
 use glam::Vec3;
@@ -197,16 +194,6 @@ pub struct BspMaterial {
     /// `sort layer` mapped to `TransparentSortLayer`. Primary key of the
     /// back-to-front transparent sort. `Normal` for opaque/stub materials.
     pub sort_layer: crate::halo::render::render_transparents::TransparentSortLayer,
-}
-
-impl BspMaterial {
-    /// `true` when the WGSL pipelines for this material's subclass
-    /// are ported and built. `false` for transparent subclasses we
-    /// haven't ported (rmw, rmd, rmhg, etc.) — the classifier still
-    /// queues them, the draw path skips on missing pipeline.
-    pub fn is_renderable(&self) -> bool {
-        self.artifacts.is_some()
-    }
 }
 
 /// Render_method subclasses that are ALWAYS transparent regardless
@@ -496,6 +483,12 @@ impl BspGpu {
         // material. Empty when the BSP has no TagFunction-time materials.
         let mut animated_materials: Vec<AnimatedMaterial> = Vec::new();
         for (mi, mat) in bsp.sbsp.materials.iter().enumerate() {
+            // Drain pending uploads each material so this loop's texture /
+            // cbuffer staging doesn't accumulate into one giant first-frame
+            // submit (GPU-watchdog hang — see `flush_staging`). Per-material
+            // is the granularity verified to clear the s3d_sky_bridgenew hang.
+            let _ = mi;
+            flush_staging(shared);
             let mat_data = if mat.render_method.is_empty() {
                 // Genuinely unauthored material slot — engine-faithful
                 // no-op stub. (Distinct from a load FAILURE, which
@@ -622,6 +615,24 @@ impl BspGpu {
                 let mut animated_layout: Option<
                     crate::halo::render_methods::cbuffer::CbufferLayout,
                 > = None;
+                // Engine-faithful dynamic-cube source for TRANSPARENT BSP
+                // (glass): MCC's compiled cache STRIPS per-cluster cubemaps
+                // (`get_cluster_cubemap_index @0x1806e0f40` → -1), so
+                // `render_method_submit_dynamic_cubemap @0x180684950` binds the
+                // rasg `DefaultDynamicCubeMap` (a blue-zenith sky cube), NOT a
+                // per-cluster probe. protomorph's per-cluster reconstruction is
+                // a flat NEUTRAL-GRAY probe → `gray × green env_tint = green`
+                // glass. Binding the real default sky cube (it has blue) keeps
+                // the reflection blue-ish, matching MCC. Scoped to transparent
+                // so the opaque env path (deliberately black to avoid blowout)
+                // is untouched.
+                let is_transparent = !mat_data.category_choices.is_empty()
+                    && mat_data.category_choices.get_or("blend_mode", "opaque") != "opaque";
+                let default_cube_view = shared
+                    .fallback_textures
+                    .default_bitmap_views
+                    .get(blam_tags::rasterizer_globals::DefaultBitmap::DefaultDynamicCubeMap as usize)
+                    .cloned();
                 let mut build_per_probe = |arts: &VariantArtifacts| -> Vec<wgpu::BindGroup> {
                     let resources =
                         resolve_material_resources(shared, &mat_data, arts, sampler_cache);
@@ -631,6 +642,12 @@ impl BspGpu {
                             animated_layout = Some(arts.layout.clone());
                         }
                     }
+                    // Transparent → rasg default cube (engine MCC behavior).
+                    let transparent_cube = if is_transparent {
+                        default_cube_view.as_ref()
+                    } else {
+                        None
+                    };
                     match cubemap_routing {
                         Some(routing) if !routing.probe_views.is_empty() => routing
                             .probe_views
@@ -640,12 +657,12 @@ impl BspGpu {
                                     shared,
                                     arts,
                                     &resources,
-                                    Some(view),
+                                    transparent_cube.or(Some(view)),
                                 )
                             })
                             .collect(),
                         _ => vec![build_material_bind_group(
-                            shared, arts, &resources, None,
+                            shared, arts, &resources, transparent_cube,
                         )],
                     }
                 };
@@ -747,7 +764,14 @@ impl BspGpu {
         }
 
         let mut meshes: Vec<BspMesh> = Vec::with_capacity(bsp.meshes.len());
-        for mesh in &bsp.meshes {
+        for (mesh_idx, mesh) in bsp.meshes.iter().enumerate() {
+            // Drain pending uploads every 16 meshes so the mesh vertex/index
+            // buffer staging doesn't pile into the first-frame submit (see
+            // `flush_staging`). Meshes are light (~150 KiB avg) so 16-at-a-time
+            // is plenty small; per-material above carries the heavy textures.
+            if mesh_idx % 16 == 0 {
+                flush_staging(shared);
+            }
             if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                 meshes.push(BspMesh {
                     vertex_buffer: shared.device.create_buffer(&wgpu::BufferDescriptor {
@@ -826,6 +850,7 @@ impl BspGpu {
 
             meshes.push(BspMesh { vertex_buffer, index_buffer, parts, water, prt_ambient_buffer });
         }
+        gpu_checkpoint(shared, "bsp mesh vertex/index buffers");
 
         let cluster_mesh_indices: Vec<i16> = bsp.sbsp.clusters.iter().map(|c| c.mesh_index).collect();
 
@@ -988,6 +1013,7 @@ impl BspGpu {
                 bsp.scenario_bsp_index, n_pv_sh_built,
             );
         }
+        gpu_checkpoint(shared, "bsp per-instance per-vertex SH buffers");
 
         // PRT Ambient bake stats — how many def-meshes carry a
         // pre-baked PRT vertex stream from `per_mesh_prt_data[i].mesh
@@ -1035,12 +1061,24 @@ impl BspGpu {
                 // mesh. blam-tags surfaces this as
                 // `RenderMesh::has_prt_vertex_stream`. See
                 // `project_research_per_mesh_prt_2026_05_11.md`.
+                //
+                // CRITICAL: gate on the actual GPU `prt_ambient_buffer`, not
+                // just the declaration. A mesh can DECLARE a PRT stream
+                // (`has_prt_vertex_stream`) yet have NO baked transfer data
+                // (`prt_ambient_stream` empty → `prt_ambient_buffer == None`,
+                // see the BspMesh build above). If the selector picks
+                // `StaticPrtAmbient` (a 2-vertex-buffer pipeline) for such a
+                // mesh, the draw binds nothing to vertex slot 1 and wgpu
+                // panics with "requires vertex buffer 1 to be set" the moment
+                // the instance enters view (chillout, looking right). Mirror
+                // `has_pv`, which already checks the buffer, by gating on the
+                // built GPU buffer here.
                 let mesh_has_prt_stream = bsp
                     .sbsp
                     .instance_definitions
                     .get(inst.definition_index as usize)
-                    .and_then(|def| bsp.meshes.get(def.mesh_index as usize))
-                    .map(|m| m.has_prt_vertex_stream)
+                    .and_then(|def| meshes.get(def.mesh_index as usize))
+                    .map(|m| m.prt_ambient_buffer.is_some())
                     .unwrap_or(false);
                 select_instance_entry_point(
                     HaloEntryPoint::StaticPerPixel,
@@ -1579,6 +1617,40 @@ fn convert_bsp_vertex(v: &blam_tags::render_model::RenderVertex) -> ModelVertex 
     }
 }
 
+/// Flush pending `queue.write_*` / `create_buffer_init` staging to the GPU
+/// and wait for it to drain. Called periodically during scenario load so the
+/// thousands of load-time resource uploads (material textures, mesh/SH
+/// buffers, atlases) don't all batch into the FIRST FRAME's single
+/// `queue.submit`. On resource-heavy maps (e.g. s3d_sky_bridgenew: 345
+/// materials + 485 meshes + 1129 SH buffers) that one colossal submit
+/// overwhelms the Metal driver and triggers a GPU-watchdog hang / system-wide
+/// bog. Draining incrementally keeps each submit small. Cheap during load —
+/// the GPU is otherwise idle, so each wait returns almost immediately.
+pub fn flush_staging(shared: &SharedResources) {
+    let _ = shared.queue.submit(std::iter::empty());
+    let _ = shared.device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+}
+
+/// DIAGNOSTIC (PROTOMORPH_GPU_BISECT=1): flush all pending queue uploads
+/// and BLOCK on the GPU, bracketing each load-time upload step. The
+/// `submitted, waiting after: X` line with no matching `survived: X`
+/// names the upload that wedges the device. No-op unless the env is set.
+pub fn gpu_checkpoint(shared: &SharedResources, label: &str) {
+    if std::env::var_os("PROTOMORPH_GPU_BISECT").is_none() {
+        return;
+    }
+    let _ = shared.queue.submit(std::iter::empty());
+    eprintln!("[upload_bisect] submitted, waiting after: {label}");
+    let _ = shared.device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    eprintln!("[upload_bisect] survived: {label}");
+}
+
 /// Mirror of `Renderer::upload_model_data`'s inline texture upload —
 /// kept local until we have a shared `GpuTextureBuilder` extracted.
 /// Same layout: `tex.data` is one concat blob holding the full mip
@@ -1811,7 +1883,6 @@ fn resolve_material_resources(
     artifacts: &VariantArtifacts,
     sampler_cache: &mut crate::halo::rasterizer::dx11::SamplerStateCache,
 ) -> ResolvedMaterialResources {
-    use blam_tags::render_method::RenderMethodExtern;
     let bindings = &artifacts.bindings;
     let mut slots: Vec<(u32, ResolvedSlotView)> = Vec::with_capacity(bindings.textures.len());
     for tb in &bindings.textures {

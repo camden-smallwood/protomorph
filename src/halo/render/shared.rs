@@ -33,12 +33,10 @@ use crate::halo::lighting::{
 use crate::halo::objects::ObjectIndex;
 use crate::halo::render::{
     GpuModel, MAX_OBJECTS, create_1x1_texture, create_screen_texture, cube_tex_entry,
-    env_probe_pass::{GpuAtmosphereData, GpuSkyParams},
+    atmosphere_fog_interface::{GpuAtmosphereData, GpuSkyParams},
     sampler_entry, tex_entry, uniform_entry,
 };
 use bytemuck::{Pod, Zeroable};
-use std::cell::RefCell;
-use std::rc::Rc;
 use wgpu::util::DeviceExt;
 
 // ---------------------------------------------------------------------------
@@ -262,21 +260,6 @@ impl GpuEngineExposure {
     }
 }
 
-impl QuadVertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
-        0 => Float32x2,
-        1 => Float32x2,
-    ];
-
-    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: size_of::<QuadVertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &Self::ATTRIBS,
-        }
-    }
-}
-
 pub const QUAD_VERTICES: [QuadVertex; 6] = [
     QuadVertex { position: [-1.0,  1.0], texcoord: [0.0, 0.0] },
     QuadVertex { position: [-1.0, -1.0], texcoord: [0.0, 1.0] },
@@ -302,10 +285,25 @@ pub struct GBuffer {
     /// depth as a texture while also leaving it attached read-only —
     /// e.g. water's extern 3 binding (`_surface_depth_stencil` in
     /// `c_player_view::render_water @ 0x18068c120`).
+    ///
+    /// This is a view of [`Self::depth_copy_texture`], NOT the live
+    /// depth attachment. Sampling the live depth texture while it is the
+    /// pass's (read-only) depth attachment aliases one resource as both
+    /// attachment and shader-read; on tile-based GPUs (Apple Silicon)
+    /// that makes the depth TEST incoherent and flickers depth-tested
+    /// transparents — most visibly a stack of additive layers (the
+    /// sidewinder heatprobe hologram). The engine likewise samples a
+    /// separate depth copy, not the live z-buffer. Refresh the copy via
+    /// [`Self::copy_depth_for_sampling`] after opaque depth is final and
+    /// before the transparent/water passes that sample it.
     pub depth_sample_view: wgpu::TextureView,
     /// Held to keep the GPU resource alive when callers create
     /// additional views downstream.
     pub depth_texture: wgpu::Texture,
+    /// Separate destination for the pre-transparent depth copy that
+    /// [`Self::depth_sample_view`] views. Decouples depth sampling from
+    /// the live depth attachment (see `depth_sample_view`).
+    pub depth_copy_texture: wgpu::Texture,
     /// World-space normal G-buffer (engine: `_surface_post_HDR` second
     /// MRT slot — Halo 3 stores per-pixel normal alongside scene HDR).
     /// `Rgba8Unorm` — encoded as `(n * 0.5 + 0.5, 1.0)`. Read by SSAO,
@@ -333,7 +331,25 @@ impl GBuffer {
             view_formats: &[],
         });
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
-        let depth_sample_view = depth.create_view(&wgpu::TextureViewDescriptor {
+        // Separate copy target sampled by the transparent/water passes.
+        // Sampling the live `depth` while it is the pass's read-only
+        // depth attachment aliases attachment + shader-read and flickers
+        // the depth test on TBDR GPUs (see `depth_sample_view` doc).
+        let depth_copy = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene_depth_copy"),
+            size: wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let depth_sample_view = depth_copy.create_view(&wgpu::TextureViewDescriptor {
             label: Some("scene_depth_sample"),
             aspect: wgpu::TextureAspect::DepthOnly,
             ..Default::default()
@@ -358,9 +374,36 @@ impl GBuffer {
             depth_view,
             depth_sample_view,
             depth_texture: depth,
+            depth_copy_texture: depth_copy,
             normal_view,
             normal_texture: normal,
         }
+    }
+
+    /// Copy the live scene depth into `depth_copy_texture` (which
+    /// `depth_sample_view` views). Call after the opaque/g-buffer pass
+    /// has finalized depth and BEFORE the transparent + water passes
+    /// sample it, so those passes read a separate texture rather than
+    /// the depth attachment they also bind read-only. No pass may have
+    /// the depth attached when this runs (copy_texture_to_texture
+    /// requires the source not be an active attachment).
+    pub fn copy_depth_for_sampling(&self, encoder: &mut wgpu::CommandEncoder) {
+        let size = self.depth_texture.size();
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.depth_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.depth_copy_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            size,
+        );
     }
 }
 
@@ -612,8 +655,6 @@ impl FallbackTextures {
 // ---------------------------------------------------------------------------
 // RenderPass trait + FrameContext
 // ---------------------------------------------------------------------------
-
-pub type SharedBindGroup = Rc<RefCell<wgpu::BindGroup>>;
 
 pub struct FrameContext<'a> {
     pub shared: &'a SharedResources,

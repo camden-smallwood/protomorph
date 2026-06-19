@@ -218,6 +218,32 @@ impl StructureRenderer {
         }
     }
 
+    /// Reset per-scenario BSP state to the freshly-constructed default
+    /// so a second `load_scenario` (map switch) doesn't append/leak onto
+    /// the previous map's geometry. A NO-OP on a fresh renderer's first
+    /// load: every field below is already empty / `next_probe_slot == 1`,
+    /// so the clears are byte-identical to today.
+    ///
+    /// `lightmap_bsp_data`, `bsps`, `bsp_cluster_meshes`,
+    /// `bsp_cluster_bounds` and `bsp_instance_bounds` are all repopulated
+    /// by `Renderer::upload_bsp` (driven from `game.rs::load_scene` after
+    /// `load_scenario` returns). `cluster_parts` / `instance_parts` are
+    /// rebuilt every frame by `submit_visibility`, so they're cleared here
+    /// only for tidiness. `identity_*` bindings are reinitialized by
+    /// `upload_bsp` → `init_bsp_identity_bindings` (which gates on
+    /// `is_none()`), so they're left alone — they're shared per-frame
+    /// scratch bindings, not per-scenario content.
+    pub fn reset(&mut self) {
+        self.lightmap_bsp_data.clear();
+        self.cluster_parts.clear();
+        self.instance_parts.clear();
+        self.bsps.clear();
+        self.bsp_cluster_meshes.clear();
+        self.bsp_cluster_bounds.clear();
+        self.bsp_instance_bounds.clear();
+        self.next_probe_slot = 1; // slot 0 = frame default
+    }
+
     /// `submit_visibility(submit_transparents) @ 0x18068E860`.
     ///
     /// Walks visible clusters + instances and appends to the flat
@@ -237,9 +263,7 @@ impl StructureRenderer {
         transparency: &mut crate::halo::render::render_transparents::TransparencyRenderer,
         frustum_planes: Option<&[glam::Vec4; 5]>,
     ) {
-        use crate::halo::render::render_transparents::{
-            TransparentDispatch, TransparentSortLayer,
-        };
+        use crate::halo::render::render_transparents::TransparentDispatch;
 
         let sphere_in_frustum = |center: glam::Vec3, radius: f32| -> bool {
             let Some(planes) = frustum_planes else { return true; };
@@ -274,6 +298,13 @@ impl StructureRenderer {
         self.instance_parts.clear();
         transparency.reset();
 
+        // DIAGNOSTIC (PROTOMORPH_NO_BSP_CLUSTERS=1): skip ALL cluster parts too
+        // (pairs with PROTOMORPH_NO_BSP_INSTANCES). With both set + NO_OBJECTS,
+        // nothing structural is drawn — if the first-frame freeze SURVIVES, the
+        // hang is not in the structure draw path at all (look upstream: lightmap
+        // / env-probe / cubemap upload, geometry decode, a non-draw pass).
+        let skip_clusters = std::env::var_os("PROTOMORPH_NO_BSP_CLUSTERS").is_some();
+
         for (bsp_idx, bsp) in self.bsps.iter().enumerate() {
             let bsp_index = bsp_idx as u8;
 
@@ -281,6 +312,9 @@ impl StructureRenderer {
             let cluster_bounds_for_bsp = self.bsp_cluster_bounds.get(bsp_idx);
             if let Some(cluster_meshes) = self.bsp_cluster_meshes.get(bsp_idx) {
                 for (cluster_idx, &mesh_idx) in cluster_meshes.iter().enumerate() {
+                    if skip_clusters {
+                        break;
+                    }
                     if mesh_idx < 0 {
                         continue;
                     }
@@ -364,8 +398,17 @@ impl StructureRenderer {
             // `render_structure_instance` lookup: instance →
             // definitions[instance.definition_index].mesh_index →
             // bsp.meshes[mesh_index].parts[*].
+            //
+            // DIAGNOSTIC (PROTOMORPH_NO_BSP_INSTANCES=1): skip ALL structure
+            // instances and render cluster geometry only. Bisection tool for
+            // the huge-BSP first-frame freeze — isolate whether the hang is in
+            // cluster draws or the (potentially numerous) instance draws.
+            let skip_instances = std::env::var_os("PROTOMORPH_NO_BSP_INSTANCES").is_some();
             let instance_bounds_for_bsp = self.bsp_instance_bounds.get(bsp_idx);
             for (inst_idx, inst) in bsp.instances.iter().enumerate() {
+                if skip_instances {
+                    break;
+                }
                 let def_i = inst.definition_index;
                 if def_i < 0 {
                     continue;
@@ -472,162 +515,6 @@ impl StructureRenderer {
         // first, then outer regular batch). Sorting here would be
         // overridden anyway since object transparents are added AFTER
         // BSP submit_visibility.
-    }
-
-    /// `submit_visibility` consuming a [`CVisibleItems`] (Phase H1).
-    ///
-    /// Engine-faithful version of [`Self::submit_visibility`] that
-    /// reads the per-frame visible-items output produced by
-    /// [`crate::halo::visibility::CVisibilityCollection::compute`].
-    /// Mirrors `c_structure_renderer::submit_visibility @ 0x18068E860`'s
-    /// real path: walks `m_items.clusters` + `m_items.instances` →
-    /// dispatches the same `cluster_parts` / `instance_parts` lists
-    /// + transparency queue.
-    ///
-    /// Coexists with the legacy [`Self::submit_visibility`] method;
-    /// view types pick which one to call. Phase I migration will
-    /// shift consumers to this path.
-    pub fn submit_visibility_from_items(
-        &mut self,
-        items: &crate::halo::visibility::CVisibleItems,
-        transparency: &mut crate::halo::render::render_transparents::TransparencyRenderer,
-    ) {
-        use crate::halo::render::render_transparents::{
-            TransparentDispatch, TransparentSortLayer,
-        };
-
-        self.cluster_parts.clear();
-        self.instance_parts.clear();
-        transparency.reset();
-
-        // ---- Visible BSP clusters (m_items.clusters) ----
-        let cluster_count = items.items.clusters.get_count();
-        for i in 0..cluster_count {
-            let row = items.items.clusters[i];
-            let bsp_index = row.cluster.cluster_reference.bsp_index;
-            let cluster_index = row.cluster.cluster_reference.cluster_index as usize;
-            let mesh_index = row.mesh_index as usize;
-            if bsp_index < 0 {
-                continue;
-            }
-            let Some(bsp) = self.bsps.get(bsp_index as usize) else { continue };
-            let Some(mesh) = bsp.meshes.get(mesh_index) else { continue };
-            for (part_idx, part) in mesh.parts.iter().enumerate() {
-                let Some(mat_slot) = bsp.materials.get(part.material_index as usize) else {
-                    continue;
-                };
-                let Some(mat) = mat_slot.as_ref() else { continue };
-                // Engine `part_is_renderable` gate — lightmap_only (part_type
-                // 5) parts never draw, even transparent ones.
-                if !part_is_renderable(part.part_type) {
-                    continue;
-                }
-                let flags = if mat.is_transparent {
-                    mesh_part_flags::TRANSPARENT
-                } else {
-                    part_type_to_flags(part.part_type)
-                };
-                if mat.is_transparent {
-                    // Cluster geometry is world-space — plane passes through.
-                    transparency.add_element(
-                        part.sort_centroid.unwrap_or([0.0, 0.0, 0.0]),
-                        part.sort_plane,
-                        part.sort_radius,
-                        0.0,
-                        mat.sort_layer,
-                        TransparentDispatch::BspClusterPart {
-                            bsp_index: bsp_index as u8,
-                            cluster_index: cluster_index as u16,
-                            mesh_index: mesh_index as u16,
-                            part_index: part_idx as u16,
-                        },
-                    );
-                    continue;
-                }
-                self.cluster_parts.push(RenderClusterPart {
-                    bsp_index: bsp_index as u8,
-                    cluster_index: cluster_index as u16,
-                    mesh_index: mesh_index as u16,
-                    part_index: part_idx as u16,
-                    flags,
-                });
-            }
-        }
-
-        // ---- Visible BSP instances (m_items.instances) ----
-        let inst_count = items.items.instances.get_count();
-        for i in 0..inst_count {
-            let row = items.items.instances[i];
-            let bsp_index = row.structure_bsp_index;
-            let inst_idx = row.structure_bsp_instance_index as usize;
-            if bsp_index < 0 {
-                continue;
-            }
-            let Some(bsp) = self.bsps.get(bsp_index as usize) else { continue };
-            let Some(inst) = bsp.instances.get(inst_idx) else { continue };
-            if inst.definition_index < 0 {
-                continue;
-            }
-            let Some(def) = bsp.definitions.get(inst.definition_index as usize) else { continue };
-            if def.mesh_index < 0 {
-                continue;
-            }
-            let mesh_idx = def.mesh_index as usize;
-            let Some(mesh) = bsp.meshes.get(mesh_idx) else { continue };
-            for (part_idx, part) in mesh.parts.iter().enumerate() {
-                let Some(mat_slot) = bsp.materials.get(part.material_index as usize) else {
-                    continue;
-                };
-                let Some(mat) = mat_slot.as_ref() else { continue };
-                // Engine `part_is_renderable` gate — lightmap_only (part_type
-                // 5) parts never draw, even transparent ones.
-                if !part_is_renderable(part.part_type) {
-                    continue;
-                }
-                let flags = if mat.is_transparent {
-                    mesh_part_flags::TRANSPARENT
-                } else {
-                    part_type_to_flags(part.part_type)
-                };
-                if mat.is_transparent {
-                    let inst_center = self
-                        .bsp_instance_bounds
-                        .get(bsp_index as usize)
-                        .and_then(|b| b.get(inst_idx))
-                        .map(|b| [b.0.x, b.0.y, b.0.z])
-                        .unwrap_or([0.0, 0.0, 0.0]);
-                    // Transform the authored model-space sort plane +
-                    // centroid to world by the instance matrix.
-                    let world_centroid = part
-                        .sort_centroid
-                        .map(|c| inst.world_matrix.transform_point3(glam::Vec3::from(c)).to_array())
-                        .unwrap_or(inst_center);
-                    let world_plane = transform_sort_plane(&inst.world_matrix, part.sort_plane);
-                    transparency.add_element(
-                        world_centroid,
-                        world_plane,
-                        part.sort_radius,
-                        0.0,
-                        mat.sort_layer,
-                        TransparentDispatch::BspInstancePart {
-                            bsp_index: bsp_index as u8,
-                            structure_instance_index: inst_idx as u16,
-                            mesh_index: mesh_idx as u16,
-                            part_index: part_idx as u16,
-                        },
-                    );
-                    continue;
-                }
-                self.instance_parts.push(RenderInstancePart {
-                    bsp_index: bsp_index as u8,
-                    structure_instance_index: inst_idx as u16,
-                    mesh_index: mesh_idx as u16,
-                    part_index: part_idx as u16,
-                    alpha_byte: row.alpha_byte,
-                    flags,
-                });
-            }
-        }
     }
 
     /// `render_albedo @ 0x18068FF90`. First-pass G-buffer fill — calls
@@ -923,6 +810,19 @@ impl StructureRenderer {
             .get(inst_part.structure_instance_index as usize)
             .copied();
         let entry_choice = sel.map(|s| s.entry);
+        // Defense in depth: the StaticShPerVertex / StaticPrtAmbient pipelines
+        // declare a 2nd vertex buffer (slot 1). Only select them when their
+        // vb1 source actually exists — otherwise the draw below would bind a
+        // 2-buffer pipeline with nothing in slot 1 and wgpu panics ("requires
+        // vertex buffer 1 to be set"). The selector is gated the same way at
+        // load (bsp_gpu.rs), but guard here too so any future drift degrades
+        // to the 1-buffer SH pipeline instead of crashing.
+        let pv_present = bsp
+            .instance_per_vertex_sh_buffers
+            .get(inst_part.structure_instance_index as usize)
+            .and_then(|o| o.as_ref())
+            .is_some();
+        let prt_present = mesh.prt_ambient_buffer.is_some();
         let (artifacts, bind_groups) = match entry_point {
             HaloEntryPoint::Albedo => (
                 material.artifacts_albedo.as_ref(),
@@ -932,11 +832,11 @@ impl StructureRenderer {
                 Some(HaloEntryPoint::StaticPerPixel) => {
                     (material.artifacts.as_ref(), material.bind_group.as_ref())
                 }
-                Some(HaloEntryPoint::StaticShPerVertex) => (
+                Some(HaloEntryPoint::StaticShPerVertex) if pv_present => (
                     material.artifacts_sh_per_vertex.as_ref(),
                     material.bind_group_sh_per_vertex.as_ref(),
                 ),
-                Some(HaloEntryPoint::StaticPrtAmbient) => (
+                Some(HaloEntryPoint::StaticPrtAmbient) if prt_present => (
                     material.artifacts_prt_ambient.as_ref(),
                     material.bind_group_prt_ambient.as_ref(),
                 ),

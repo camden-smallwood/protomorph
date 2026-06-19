@@ -3,12 +3,11 @@
 //   color.xyz *= fade;
 //
 // BLEND_MODE_USES_SRC_ALPHA = false for additive (line 141-148 — additive
-// is in the excluded set) → no unconditional alpha scale here. The HLSL
-// alpha guard at line 400-403 only fires when `!IS_FLAT_VERTEX ||
-// !specular_leave`; the common bump_mapping=leave + specular=leave path
-// skips it, and additive blending (`SRC=ONE, DST=ONE`) ignores the alpha
-// channel anyway. We mirror the existing multiply / double_multiply
-// ports and leave color.w untouched.
+// is in the excluded set). The HLSL alpha clause (line 399-402) still fades
+// `color.w` when `!IS_FLAT_VERTEX || !specular_leave || USES_SRC_ALPHA`;
+// decals have no specular category (always `leave`), so the guard is
+// `(!IS_FLAT_VERTEX || BLEND_MODE_USES_SRC_ALPHA)`. For a BUMPED additive
+// decal that fades RT1.w (the bump-normal alpha) with the decal.
 //
 // BLEND_MODE_SELF_ILLUM = true (line 67). Only consumed by
 // `tint_and_modulate` under `render_pass=post_lighting` (line 364-380);
@@ -19,7 +18,12 @@
 // wired in `render_methods/pipeline_cache.rs::pick_blend_for_mode`).
 
 fn fade_out(color: vec4<f32>) -> vec4<f32> {
-    return vec4<f32>(color.xyz * decal_constants.fade, color.w);
+    let rgb = color.xyz * decal_constants.fade;
+    var a = color.w;
+    if (!IS_FLAT_VERTEX || BLEND_MODE_USES_SRC_ALPHA) {
+        a = a * decal_constants.fade;
+    }
+    return vec4<f32>(rgb, a);
 }
 
 const BLEND_MODE_SELF_ILLUM: bool = true;

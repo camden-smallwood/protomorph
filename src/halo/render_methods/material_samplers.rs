@@ -25,8 +25,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::halo::rasterizer::dx11::SamplerKey;
-use crate::halo::render_methods::material_bindings::{MaterialBindings, TextureBindingSlot};
-use crate::halo::render_methods::materials::MaterialData;
+use crate::halo::render_methods::material_bindings::MaterialBindings;
 
 /// Per-material map from texture binding name → unique sampler key
 /// index. The renderer:
@@ -54,17 +53,10 @@ pub struct MaterialSamplerMap {
 }
 
 impl MaterialSamplerMap {
-    /// Build the dedup map for a material given its bindings.
-    /// `mat.resolved.parameters` carries each bitmap binding's authored
-    /// `BitmapAddressMode` / `BitmapFilterMode`; baseline textures
-    /// without a binding fall back to `SamplerKey::FILTERING_FALLBACK`.
-    pub fn from_material(mat: &MaterialData, bindings: &MaterialBindings) -> Self {
-        Self::from_resolved(&mat.resolved, bindings)
-    }
-
-    /// Same as [`from_material`] but takes the resolved render method
-    /// directly. Used by the WGSL assembler which doesn't carry a full
-    /// `MaterialData`.
+    /// Build the dedup map for a material given the resolved render
+    /// method directly. `rm.parameters` carries each bitmap binding's
+    /// authored `BitmapAddressMode` / `BitmapFilterMode`; baseline
+    /// textures without a binding fall back to `SamplerKey::FILTERING_FALLBACK`.
     pub fn from_resolved(
         rm: &blam_tags::render_method::ResolvedRenderMethod,
         bindings: &MaterialBindings,
@@ -162,82 +154,5 @@ mod tests {
     fn dedupe_name_is_deterministic() {
         assert_eq!(MaterialSamplerMap::dedupe_name(0), "s_dedupe_0");
         assert_eq!(MaterialSamplerMap::dedupe_name(7), "s_dedupe_7");
-    }
-
-    #[test]
-    fn empty_material_produces_empty_map() {
-        // Sanity: a material with no bindings should produce empty
-        // unique_keys + empty binding map (degenerate case — shouldn't
-        // happen in practice since baseline textures always exist, but
-        // covers the algorithm's edge).
-        let bindings = MaterialBindings {
-            textures: Vec::new(),
-            sampler_slot: 0,
-            cbuffer_slot: 1,
-            decal_constants_slot: None,
-        };
-        let mat = MaterialData::stub_for_shader("test_empty");
-        let map = MaterialSamplerMap::from_material(&mat, &bindings);
-        assert!(map.unique_keys.is_empty());
-        assert!(map.binding_to_key_index.is_empty());
-    }
-
-    #[test]
-    fn baseline_only_material_dedupes_to_one_key() {
-        // All bindings without rmt2 BitmapBindings → all fall back to
-        // FILTERING_FALLBACK → one unique key, all bindings point at
-        // index 0.
-        let bindings = MaterialBindings {
-            textures: vec![
-                TextureBindingSlot {
-                    name: "base_map".into(),
-                    slot: 0,
-                    is_cube: false,
-                    source_extern: None,
-                },
-                TextureBindingSlot {
-                    name: "bump_map".into(),
-                    slot: 1,
-                    is_cube: false,
-                    source_extern: None,
-                },
-                TextureBindingSlot {
-                    name: "detail_map".into(),
-                    slot: 2,
-                    is_cube: false,
-                    source_extern: None,
-                },
-            ],
-            sampler_slot: 3,
-            cbuffer_slot: 4,
-            decal_constants_slot: None,
-        };
-        let mat = MaterialData::stub_for_shader("test_baseline");
-        let map = MaterialSamplerMap::from_material(&mat, &bindings);
-        assert_eq!(map.unique_keys.len(), 1, "all baseline → one unique key");
-        assert_eq!(map.binding_to_key_index["base_map"], 0);
-        assert_eq!(map.binding_to_key_index["bump_map"], 0);
-        assert_eq!(map.binding_to_key_index["detail_map"], 0);
-    }
-
-    #[test]
-    fn signature_is_stable_across_calls() {
-        let bindings = MaterialBindings {
-            textures: vec![
-                TextureBindingSlot {
-                    name: "base_map".into(),
-                    slot: 0,
-                    is_cube: false,
-                    source_extern: None,
-                },
-            ],
-            sampler_slot: 1,
-            cbuffer_slot: 2,
-            decal_constants_slot: None,
-        };
-        let mat = MaterialData::stub_for_shader("test_stable");
-        let a = MaterialSamplerMap::from_material(&mat, &bindings);
-        let b = MaterialSamplerMap::from_material(&mat, &bindings);
-        assert_eq!(a.signature, b.signature);
     }
 }

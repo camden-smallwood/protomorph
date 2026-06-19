@@ -25,8 +25,6 @@ use crate::halo::visibility::RealRectangle2d;
 
 pub const MAXIMUM_POINTS_PER_PORTAL_HULL: usize = 128;
 pub const MAXIMUM_WORKING_PORTALS: usize = 256;
-pub const AVERAGE_POINTS_PER_PORTAL_HULL: usize = 20;
-pub const MAXIMUM_WORKING_PORTAL_STACK_POINTS: usize = 5120;
 
 /// `e_portal_facing` (Ares `visibility_portal_traversal.cpp:54-61`).
 /// Result of `compute_portal_facing` — which side of the projection
@@ -69,10 +67,6 @@ pub struct PortalHull {
 }
 
 impl PortalHull {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             bounds: RealRectangle2d::default(),

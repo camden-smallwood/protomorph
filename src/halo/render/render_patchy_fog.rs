@@ -17,17 +17,6 @@
 
 use glam::Vec3;
 
-/// `s_patchy_fog_vertex` (Ares 32B). Vertex layout for fog-sheet
-/// quads — `__m128 position` + `real_point2d texcoord`. The 16-byte
-/// position is `(x, y, z, w)` in clip space.
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
-pub struct PatchyFogVertex {
-    pub position: [f32; 4],
-    pub texcoord: [f32; 2],
-    pub _pad: [f32; 2],
-}
-
 /// Halo: `k_fog_sheet_offset_steps`. The number of stacked offsets
 /// the fog sheet attribute index can take. Used as the `[100]`
 /// dimension of `m_lateral_offsets` / `m_vertical_offsets`.
@@ -93,15 +82,6 @@ impl Default for PatchyFog {
 }
 
 impl PatchyFog {
-    /// `c_patchy_fog::frame_advance_all(dt)` (render_patchy_fog.h:27).
-    /// Halo stores `dt` in a static `ms_dt` consumed by
-    /// `render_patchy_fog` for wind-driven UV offset advancement.
-    /// We track it inline alongside the per-sheet state.
-    pub fn frame_advance_all(&mut self, _dt: f32) {
-        // The actual integration uses the dt we receive in
-        // `update_per_frame` — no separate accumulator.
-    }
-
     /// Update per-frame state from the current camera + active
     /// atmosphere setting. Engine equivalent of the per-frame
     /// `get_relative_movement` + offset integration + ring-buffer

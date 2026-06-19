@@ -583,42 +583,11 @@ fn compute_texcoord(
     }
 }
 
-/// Mirror of `matrix4x3_inverse_transform_point @ 0x1802C4CA0`.
-/// Subtracts translation, scale-corrects with a 1e-4 epsilon guard,
-/// then transforms by the basis transpose. Equivalent to applying
-/// the inverse of an orthonormal-scaled affine transform.
-pub(crate) fn matrix4x3_inverse_transform_point(m: &RealMatrix4x3, p: RealPoint3d) -> RealPoint3d {
-    let mut dx = p.x - m.position.x;
-    let mut dy = p.y - m.position.y;
-    let mut dz = p.z - m.position.z;
-    let scale = m.scale;
-    if scale != 1.0 {
-        // Engine clamps |scale| >= 1e-4 to avoid division blow-up.
-        const EPS: f32 = 0.000099999997;
-        let safe_scale = if scale < 0.0 {
-            if scale > -EPS {
-                -EPS
-            } else {
-                scale
-            }
-        } else {
-            if scale <= EPS {
-                EPS
-            } else {
-                scale
-            }
-        };
-        let inv = 1.0 / safe_scale;
-        dx *= inv;
-        dy *= inv;
-        dz *= inv;
-    }
-    RealPoint3d {
-        x: dy * m.forward.j + dx * m.forward.i + dz * m.forward.k,
-        y: dy * m.left.j + dx * m.left.i + dz * m.left.k,
-        z: dy * m.up.j + dx * m.up.i + dz * m.up.k,
-    }
-}
+/// Canonical signed-clamp `matrix4x3_inverse_transform_point` (value
+/// form), re-exported under this module's historical name for the
+/// instance-raycast, physics-collision, and mesh-builder call sites.
+pub(crate) use crate::halo::math::matrix_math::matrix4x3_inverse_transform_point_value
+    as matrix4x3_inverse_transform_point;
 
 /// Mirror of `line_segment_intersects_unit_texture_tile @ 0x18039EB80`.
 /// True when the line segment from `start` to `end` (in projection

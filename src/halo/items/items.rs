@@ -31,7 +31,5 @@ pub struct ItemBody {
 // Engine `e_item_inventory_state` values — used by `item_in_hand` /
 // `item_stowed` predicates. Stub helpers read `ItemBody.inventory_state`
 // and compare against these.
-pub const ITEM_INVENTORY_STATE_IN_WORLD:     u8 = 0;
-pub const ITEM_INVENTORY_STATE_IN_INVENTORY: u8 = 1;
 pub const ITEM_INVENTORY_STATE_IN_HAND:      u8 = 2;
 pub const ITEM_INVENTORY_STATE_STOWED:       u8 = 3;

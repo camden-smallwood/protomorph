@@ -4,7 +4,7 @@
 //! 4-corner fullscreen quad in clip space and dispatches an explicit-
 //! shader-56 (`patchy_fog`) draw with `_alpha_blend_multiply_add` blend
 //! and `_z_buffer_mode_read`. The shader (ported in
-//! `assets/shaders/patchy_fog.wgsl`) samples 8 fog sheets, integrates
+//! `assets/halo_shaders/patchy_fog.wgsl`) samples 8 fog sheets, integrates
 //! optical depth, applies HG-phase Mie inscatter, and outputs
 //! `(inscatter * exposure, extinction)`.
 //!
@@ -244,7 +244,7 @@ impl PatchyFogPass {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("patchy_fog_wgsl"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../../assets/shaders/patchy_fog.wgsl").into(),
+                include_str!("../../../assets/halo_shaders/patchy_fog.wgsl").into(),
             ),
         });
 
@@ -394,12 +394,6 @@ impl PatchyFogPass {
             _noise_texture: None,
             frame_bind_group: None,
         }
-    }
-
-    /// Loaded noise view (`Some` once a scenario with `sky.patchy_fog_texture`
-    /// has loaded successfully).
-    pub fn noise_view(&self) -> Option<&wgpu::TextureView> {
-        self.noise_view.as_ref()
     }
 
     /// Resolve `tag_path` against `tags_root`, load it as a Halo bitmap,
@@ -743,8 +737,23 @@ pub fn build_patchy_fog_params(
     let half_v_fov = (1.0 / p_arr[1][1]).atan();
     let inv_two_pi = 0.15915494_f32;
     let r = sky.texture_repeat_rate.max(0.01);
-    let scale_const_x = r * half_h_fov * inv_two_pi;
-    let scale_const_y = r * half_v_fov * inv_two_pi;
+    // Engine `v156 = texture_repeat × 1/(2π)` — the per-frame `scale_factor`
+    // local in `c_patchy_fog::render_patchy_fog @ 0x1806B2160` (named in
+    // the Ares decompile's debug block; the body falls back to the dllcache
+    // asm at that address). It scales BOTH the per-sheet UV half-extent AND
+    // the per-sheet UV center:
+    //   half_extent.x = scale_factor × half_h_fov × depth_norm   (v156·v235·v143)
+    //   center.x      = m_lateral_offset × scale_factor          (v147·v156)
+    // Earlier the factor was applied ONLY to the half-extent, leaving the
+    // UV center to drift at `2π/repeat ×` the engine rate. That made the
+    // fog scroll-speed wildly off on levels whose `texture_repeat_rate`
+    // strays from ~2π: sidewinder_snow (repeat=0.75) scrolled ~8.4× too
+    // fast, construct (1.5) ~4.2× too fast, chillout (10) ~1.6× too slow;
+    // guardian (6 ≈ 2π) was coincidentally ~correct. Applying it to the
+    // center too restores engine-faithful, scale-consistent drift.
+    let scale_factor = r * inv_two_pi;
+    let scale_const_x = scale_factor * half_h_fov;
+    let scale_const_y = scale_factor * half_v_fov;
     use crate::halo::render::render_patchy_fog::{K_FOG_SHEET_OFFSET_STEPS, sheet_skip_count};
     let n_steps = K_FOG_SHEET_OFFSET_STEPS as i32;
     let start = state.starting_sheet_attribute_index.rem_euclid(n_steps) as usize;
@@ -760,8 +769,10 @@ pub fn build_patchy_fog_params(
         let sheet_depth_norm = ((i as f32) * sep + dist0) / sep;
         let slot = (i + start) % K_FOG_SHEET_OFFSET_STEPS;
         [
-            state.lateral_offsets[slot],
-            state.vertical_offsets[slot],
+            // Engine `center = m_offset × scale_factor` (v147·v156) — see
+            // the `scale_factor` note above.
+            state.lateral_offsets[slot] * scale_factor,
+            state.vertical_offsets[slot] * scale_factor,
             scale_const_x * sheet_depth_norm,
             scale_const_y * sheet_depth_norm,
         ]
@@ -857,7 +868,8 @@ pub fn build_patchy_fog_atmosphere(
     let one_minus_g2 = 1.0 - g * g;
     // Engine packs `g + 1`, NOT `1 + g²`. Halo HG approximation.
     let constant_2 = [0.0_f32, 0.0, 0.0, 1.0 + g];
-    let extra = [2.0 * g, 0.0, 0.0, 0.0];
+    // Engine `set_constant` broadcasts `2g` to all 4 lanes (`_mm_shuffle_ps`).
+    let extra = [2.0 * g; 4];
 
     // TOTAL_MIE_LOG2E = β_p × log2(e). Per-channel.
     let log2e = std::f32::consts::LOG2_E;
@@ -875,6 +887,41 @@ pub fn build_patchy_fog_atmosphere(
         params.beta_p_angular.k * one_minus_g2,
         0.0,
     ];
+
+    // P7 density data-hunt: one-shot dump of the runtime Mie/density inputs so
+    // the "~50× too dense" can be pinned to data (authored `mie_multiplier` →
+    // `beta_p`) vs code. Gated on PROTOMORPH_PATCHY_FOG_DUMP=1. The whole
+    // density chain (broadcast, noise², `1-exp2(-mie·od)`) is byte-faithful per
+    // audit — `total_mie_log2e.x` = `beta_p.x * log2e` is the suspect. Compare
+    // against a hand-computed engine `beta_p.x` from guardian's real
+    // `mie_multiplier` (note: `beta_p` here has already folded the multiplier).
+    if std::env::var("PROTOMORPH_PATCHY_FOG_DUMP").as_deref() == Ok("1") {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DUMPED: AtomicBool = AtomicBool::new(false);
+        if !DUMPED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[patchy-fog-dump] patchy_fog_density={:.4} beta_p=({:.6e},{:.6e},{:.6e}) \
+                 total_mie_log2e.x={:.6e} mie_height={:.3} \
+                 full_intensity_height={:.3} half_intensity_height={:.3} \
+                 reference_datum_plane={:.3}",
+                params.patchy_fog_density,
+                params.beta_p.i,
+                params.beta_p.j,
+                params.beta_p.k,
+                total_mie[0],
+                params.mie_height,
+                params.full_intensity_height,
+                params.half_intensity_height,
+                params.reference_datum_plane,
+            );
+            eprintln!(
+                "[patchy-fog-dump] optical-depth scale = patchy_fog_density × Σ(noise²·fades) \
+                 × 8 sheets; extinction = 1 - exp2(-total_mie_log2e.x · optical_depth). \
+                 If beta_p.x ≫ engine's (hand-compute from authored mie_multiplier×1000), \
+                 the divergence is the mie_multiplier read, not the fog code."
+            );
+        }
+    }
 
     PatchyFogAtmosphere {
         sun_dir,

@@ -19,10 +19,8 @@
 //! the water shader (water_fx.hlsl + water_shading_fx.hlsl) ports
 //! to WGSL. Per `reference_water_fx_blueprint.md` already in memory.
 
-use crate::halo::render::render_objects::EntryPoint;
 use crate::halo::render::SampleIntent;
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
 use wgpu::util::DeviceExt;
 
 // ---------------------------------------------------------------------------
@@ -1431,6 +1429,10 @@ impl WaterRenderer {
             // the `&mut self` insert.
             let slot = self.build_material_slot(shared, mat);
             self.material_slots.insert(*material_index, slot);
+            // Drain this material's wave/foam/cube texture staging (~12 MB
+            // each) so it doesn't pile into the first-frame submit. See
+            // `bsp_gpu::flush_staging`.
+            crate::halo::structures::bsp_gpu::flush_staging(shared);
         }
     }
 
@@ -1947,69 +1949,6 @@ impl WaterRenderer {
         }
     }
 
-    /// `c_water_renderer::game_update @ render_water.h:31`.
-    pub fn game_update(&mut self) {}
-
-    /// Set the camera-underwater flag, mirroring `g_is_underwater` in
-    /// the engine. Drives the `k_is_camera_underwater` shader
-    /// constant for the underwater fog branch
-    /// (`water_shading_fx.hlsl:1042-1046`).
-    ///
-    /// Engine sets this via water-volume containment in the render
-    /// path; protomorph defers automatic detection (would walk water
-    /// mesh AABBs vs camera position). Currently call sites just
-    /// leave it false; manually toggling exercises the shader path.
-    pub fn set_camera_underwater(&mut self, flag: bool) {
-        self.is_underwater = flag;
-    }
-
-    /// `c_water_renderer::game_interation_event_add @ h:32` (Bungie
-    /// typo "interation" preserved).
-    pub fn game_interaction_event_add(
-        &mut self,
-        _water_ripple_definition_index: i32,
-        _position: Vec3,
-        _object_velocity: Vec3,
-        _water_velocity: Vec3,
-    ) {
-    }
-
-    /// `c_water_renderer::set_performance_throttles @ h:33`.
-    pub fn set_performance_throttles(&mut self) {}
-
-    /// `c_water_renderer::ripple_check_new @ h:34`.
-    pub fn ripple_check_new(&self) -> u32 {
-        0
-    }
-
-    /// `c_water_renderer::ripple_add @ h:35`.
-    pub fn ripple_add(&mut self, _valid_event_count: u32) {}
-
-    /// `c_water_renderer::ripple_update @ h:36`.
-    pub fn ripple_update(&mut self) {}
-
-    /// `c_water_renderer::is_active_ripple_exist @ h:37`.
-    pub fn is_active_ripple_exist(&self) -> bool {
-        false
-    }
-
-    /// `c_water_renderer::update_water_part_list @ h:38`. Returns
-    /// true if water surfaces are visible this frame.
-    pub fn update_water_part_list(&mut self) -> bool {
-        false
-    }
-
-    /// `c_water_renderer::ripple_apply @ h:39`. Pumps the ripple
-    /// atlas onto the water surface normal map.
-    pub fn ripple_apply(&self) {}
-
-    /// `c_water_renderer::ripple_slope @ h:40`. Computes the slope
-    /// derivative for normal reconstruction in the shader.
-    pub fn ripple_slope(&self) {}
-
-    /// `c_water_renderer::render_tessellation @ h:41`.
-    pub fn render_tessellation(&self, _is_screenshot: bool) {}
-
     /// `c_water_renderer::render_shading @ 0x180693e90` (dllcache).
     /// Two sub-passes per `reference_dllcache_water_pipeline.md`:
     ///
@@ -2353,25 +2292,6 @@ impl WaterRenderer {
         rpass.set_bind_group(2, &self.water_extern_bind_group, &[]);
         rpass.draw(0..4, 0..1);
     }
-
-    /// `c_water_renderer::render_cluster_parts @ h:46`. Internal
-    /// driver (private in Halo).
-    fn render_cluster_parts(&self, _entry_point: EntryPoint, _mesh_part_mask: i32) {}
-
-    /// `water_interaction_clear_all @ h:53`.
-    pub fn water_interaction_clear_all(&mut self, _game_state_restore_flags: i32) {
-        self.new_interaction_event_count = 0;
-    }
-}
-
-/// `s_new_interaction_event` placeholder. Halo's struct carries
-/// position + velocity + ripple-definition for a single splash.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NewInteractionEvent {
-    pub water_ripple_definition_index: i32,
-    pub position: Vec3,
-    pub object_velocity: Vec3,
-    pub water_velocity: Vec3,
 }
 
 /// Build the fullscreen underwater-fog pipeline. Engine equivalent:
@@ -2502,7 +2422,7 @@ impl WaterVariant {
 /// a hint to use SSR if available, falling back to static otherwise).
 fn substitute_water_variant(src: &str, v: &WaterVariant) -> String {
     let b = |on: bool| -> &'static str { if on { "true" } else { "false" } };
-    src
+    let mut out = src
         // watercolor
         .replace("__WATERCOLOR_PURE__",    b(v.watercolor == "pure"))
         .replace("__WATERCOLOR_TEXTURE__", b(v.watercolor == "texture"))
@@ -2529,7 +2449,39 @@ fn substitute_water_variant(src: &str, v: &WaterVariant) -> String {
         .replace("__REFLECTION_DYNAMIC__", b(v.reflection == "dynamic"))
         // refraction
         .replace("__REFRACTION_NONE__",    b(v.refraction == "none"))
-        .replace("__REFRACTION_DYNAMIC__", b(v.refraction == "dynamic"))
+        .replace("__REFRACTION_DYNAMIC__", b(v.refraction == "dynamic"));
+    // Diagnostic: PROTOMORPH_NO_WATER_EARLYOUT=1 neutralises the depth
+    // early-out (`if (scene_depth > water_z) return scene_ldr`) — isolates
+    // whether a water surface "vanishing" at certain view angles is the
+    // occlusion bail (water reads as behind the opaque scene).
+    if std::env::var("PROTOMORPH_NO_WATER_EARLYOUT").is_ok() {
+        out = out.replace(
+            "if (_eo_depth_water > in.clip_position.z) {",
+            "if (false) {",
+        );
+    }
+    // Diagnostic: PROTOMORPH_WATER_FRESNEL=<0..1> pins the reflection↔refraction
+    // fresnel weight to a constant. =1 → pure cubemap reflection (if the white
+    // is stable+bright, the white IS the reflection); =0 → pure refraction (if
+    // the white is gone, it confirms the white was reflection, not foam).
+    if let Some(f) = std::env::var("PROTOMORPH_WATER_FRESNEL")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+    {
+        out = out.replace(
+            "let fresnel = r0 + (1.0 - r0) * pow(1.0 - fresnel_n_dot_v, 2.5);",
+            &format!("let fresnel = {:?};", f.clamp(0.0, 1.0)),
+        );
+    }
+    // Diagnostic: PROTOMORPH_WATER_NO_REFLECTION=1 zeroes the cubemap reflection
+    // (isolates whether the vanishing white is the reflection).
+    if std::env::var("PROTOMORPH_WATER_NO_REFLECTION").is_ok() {
+        out = out.replace(
+            "output_color = mix(color_refraction, color_reflection, fresnel);",
+            "output_color = color_refraction;",
+        );
+    }
+    out
 }
 
 /// Build the water-shading pipeline — minimal `water_shading()` port

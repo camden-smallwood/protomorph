@@ -16,10 +16,9 @@
 //! material can sample them as the ambient SH backdrop.
 
 use crate::halo::geometry::MAXIMUM_NUMBER_OF_MODEL_NODES;
-use crate::halo::structures::clusters::ClusterReference;
 use crate::halo::geometry::{ModelUniforms, ModelVertex, SkyVertColorVertex};
 use crate::halo::render::shared::SharedResources;
-use glam::{Mat4, Vec3};
+use glam::Mat4;
 use std::mem::size_of;
 use wgpu::util::DeviceExt;
 
@@ -69,28 +68,6 @@ pub struct SkyGpu {
     /// layout matches the active pipeline layout's corresponding entry,
     /// so we explicitly overwrite the slot to satisfy the check.
     pub empty_bind_group: wgpu::BindGroup,
-}
-
-impl SkyGpu {
-    /// Pick the sky pipeline matching the material's `blend_mode`
-    /// choice. Verbatim engine names from the rmsh rmdf's `blend_mode`
-    /// category; the variant call site dispatches on the same string
-    /// used by `pipeline_cache::blend_state_for_mode`.
-    pub fn pipeline_for_blend_mode(&self, blend_mode: &str) -> &wgpu::RenderPipeline {
-        match blend_mode {
-            "opaque" => &self.pipeline,
-            "alpha_blend" => &self.pipeline_alpha_blend,
-            "additive" => &self.pipeline_additive,
-            "multiply" => &self.pipeline_multiply,
-            "pre_multiplied_alpha" => &self.pipeline_pre_multiplied_alpha,
-            "double_multiply" => &self.pipeline_double_multiply,
-            n => panic!(
-                "[protomorph] sky pipeline missing for blend_mode '{n}' — \
-                 add a variant to `SkyGpu` + dispatch arm here. \
-                 (per feedback_wgsl_must_mirror_hlsl.md)"
-            ),
-        }
-    }
 }
 
 impl SkyGpu {
@@ -321,58 +298,4 @@ impl SkyGpu {
         }
         queue.write_buffer(&self.node_matrices_buffer, 0, &bytes);
     }
-}
-
-/// `c_sky_renderer` (h:14-19, 1B). All-static namespace.
-#[derive(Debug, Default)]
-pub struct SkyRenderer;
-
-impl SkyRenderer {
-    /// `c_sky_renderer::setup_sky_ravi_constants @ h:17`.
-    /// Uploads the active sky's SH probe to the ravi cbuffer slot
-    /// so all materials can read it. v1 stub.
-    pub fn setup_sky_ravi_constants() {
-        // todo: pull from `g_lighting_interface.sh_probe_*` and
-        // upload via render_method_data set_*_sh_constants.
-    }
-}
-
-/// `render_sky_cluster_is_visible_sky_cluster @ h:23`. Returns
-/// whether the given cluster is part of the sky group (the BSP
-/// `cluster_is_sky_bit` flag). v1 stub returns false until
-/// cluster sky-flags are tracked.
-pub fn render_sky_cluster_is_visible_sky_cluster(_cluster_reference: ClusterReference) -> bool {
-    false
-}
-
-/// `render_sky_modify_node_matrices @ h:24`. Halo applies an
-/// `offset` translation (the camera position) to every sky node
-/// matrix so the sky appears infinitely far — when the player
-/// moves, the sky stays parallax-anchored to them.
-///
-/// Returns true on success.
-pub fn render_sky_modify_node_matrices(
-    offset: Vec3,
-    node_matrices: &[Mat4],
-    destination_matrices: &mut [Mat4],
-) -> bool {
-    if node_matrices.len() != destination_matrices.len() {
-        return false;
-    }
-    let translate = Mat4::from_translation(offset);
-    for (src, dst) in node_matrices.iter().zip(destination_matrices.iter_mut()) {
-        *dst = translate * *src;
-    }
-    true
-}
-
-/// `render_sky_prepare_for_window @ h:25`. Per-window sky setup
-/// (e.g. picks the right sky tag for the player window's BSP).
-pub fn render_sky_prepare_for_window() {}
-
-/// `render_sky_get_scale @ h:26`. The scale factor applied to sky
-/// scenery (sky boxes are typically rendered at 0.1× world scale
-/// to fit infinite-distance illusion + reduce z-fighting).
-pub fn render_sky_get_scale() -> f32 {
-    1.0
 }

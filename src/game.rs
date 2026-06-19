@@ -52,19 +52,37 @@ struct PendingAttachment {
     parent_marker: String,
 }
 
+/// Engine-faithful weather lifecycle (`c_atmosphere_fog_interface::change_pvs`).
+/// Holds the active BSP's atmosphere settings + cluster geometry so each frame
+/// it can resolve which atmosphere settings are active in the camera's cluster
+/// sphere (PVS-wide) and keep one weather effect per active setting alive,
+/// spawning on activation and destroying on deactivation — a per-setting
+/// `weather_effect_indices` table keyed by setting index.
+struct WeatherDriver {
+    atmosphere: blam_tags::sky_atmosphere::SkyAtmosphere,
+    clusters: Vec<blam_tags::structure_bsp::BspCluster>,
+    portals: Vec<blam_tags::structure_bsp::BspClusterPortal>,
+    planes: Vec<blam_tags::math::RealPlane3d>,
+    palette: Vec<blam_tags::structure_bsp::BspAtmospherePaletteEntry>,
+    tags_root: std::path::PathBuf,
+    /// Per atmosphere-setting → live `effects.instances` index (engine
+    /// `g_rasterizer_game_states->weather_effect_indices[setting]`). `None` =
+    /// no live weather effect for that setting.
+    effect_indices: Vec<Option<usize>>,
+}
+
 pub struct GameState {
     pub objects: ObjectStore,
     /// Effects attached to placed objects (scenery effe attachments).
     /// Phase 1: loaded + instanced per placement; simulated/rendered in
     /// later phases. See [`crate::halo::effects`].
     pub effects: crate::halo::effects::EffectStore,
-    /// Indices into `effects.instances` of the atmosphere WEATHER effects
-    /// (rain/ash/dust). Unlike object-attached effects these are CAMERA-
-    /// RELATIVE — repositioned to the camera each frame (engine
-    /// `effect_refresh_location` keeps weather at the player's cluster), so
-    /// the emission volume always surrounds the viewer instead of sitting
-    /// at the fixed world origin it spawned at.
-    weather_instances: Vec<usize>,
+    /// Atmosphere WEATHER lifecycle driver (engine `c_atmosphere_fog_interface
+    /// ::change_pvs @0x1803AF550`): a per-setting weather-effect table that
+    /// spawns one camera-relative effect per atmosphere setting active in the
+    /// camera's cluster sphere, and destroys it when that setting leaves.
+    /// `None` until a scenario with atmosphere settings loads.
+    weather: Option<WeatherDriver>,
     /// Collected during placement load; resolved into datum world transforms
     /// by [`Self::resolve_pending_attachments`] once every object exists.
     pending_attachments: Vec<PendingAttachment>,
@@ -120,7 +138,7 @@ impl GameState {
         let mut state = Self {
             objects: ObjectStore::new(),
             effects: crate::halo::effects::EffectStore::new(),
-            weather_instances: Vec::new(),
+            weather: None,
             pending_attachments: Vec::new(),
             camera,
             model_data: Vec::new(),
@@ -278,73 +296,17 @@ impl GameState {
                     // For v1 we just take skies[0]; per-cluster sky
                     // selection (`bsp.cluster.scenario_sky_index`) lands
                     // alongside PVS in Phase H.
-                    if let Some(sky_ref) = loaded.skies().first() {
-                        if !sky_ref.sky.is_empty() {
-                            let sky_path = blam_tags::paths::resolve_tag_path(
-                                &loaded.tags_root,
-                                &sky_ref.sky,
-                                "scenery",
-                            );
-                            if sky_path.exists() {
-                                let (model, data) = renderer.load_object_tag(&sky_path);
-                                let obj = self.objects.new_object();
-                                self.model_data.push(data);
-                                let slot = self.objects.get_mut(obj);
-                                slot.model_index = Some(model);
-                                self.sky_object = Some(obj);
-                                eprintln!(
-                                    "[scenario]   sky: {} (model={})",
-                                    sky_ref.sky, model,
-                                );
-                            } else {
-                                eprintln!(
-                                    "[scenario]   sky tag missing: {}",
-                                    sky_path.display(),
-                                );
-                            }
-                        }
+                    // PROTOMORPH_MINIMAL_LOAD=1 — skip ALL object placements +
+                    // sky object + weather (renderer-side sky/decorators/decals
+                    // are gated in load_scenario). Bisection for the huge-BSP
+                    // first-frame freeze; keeps BSP + lightmap + rasg only.
+                    let minimal_load = std::env::var_os("PROTOMORPH_MINIMAL_LOAD").is_some();
+                    if !minimal_load {
+                        self.load_sky(renderer, &loaded);
                     }
 
-                    // Pick a spawn vantage from the scenery placements that
-                    // reference an MP respawn-point/zone palette entry. MP
-                    // scenarios author these as `objects/multi/spawning/
-                    // respawn_point.scenery` (and game-mode-specific zone
-                    // variants like `slayer_respawn_zone.scenery`). Halo's
-                    // runtime spawn picker is more involved (game-mode
-                    // gating + respawn timer + visibility check), but for
-                    // a flycam smoke test the first respawn point is fine.
-                    let respawns: Vec<(Vec3, f32)> = loaded
-                        .scenario
-                        .scenery
-                        .iter()
-                        .filter_map(|p| {
-                            let idx = p.palette_index;
-                            if idx < 0 { return None; }
-                            let palette = loaded.scenario.scenery_palette.get(idx as usize)?;
-                            let tp = palette.tag_path.to_ascii_lowercase();
-                            if tp.contains("respawn_point") || tp.contains("respawn_zone") {
-                                let pos = p.object_data.position;
-                                Some((
-                                    Vec3::new(pos.x, pos.y, pos.z),
-                                    p.object_data.rotation.yaw,
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if let Some(&(pos, yaw_rad)) = respawns.first() {
-                        // Eye-height offset — Halo units are world-meters,
-                        // biped eye height ≈ 1.7m.
-                        self.camera.position = pos + Vec3::new(0.0, 0.0, 1.7);
-                        self.camera.rotation = glam::Vec2::new(yaw_rad.to_degrees(), -5.0);
-                        self.camera.update();
-                        eprintln!(
-                            "[scenario]   spawning at respawn[0]: pos=({:.2}, {:.2}, {:.2}) yaw={:.1}° ({} respawn points)",
-                            self.camera.position.x, self.camera.position.y, self.camera.position.z,
-                            self.camera.rotation.x, respawns.len(),
-                        );
-                    }
+                    self.pick_spawn(&loaded);
+
                     // Diagnostic: locate placed objects by tag name. Set
                     // `PROTOMORPH_FIND_OBJECT=<substr>` to log the world
                     // position of every placement whose palette tag path
@@ -406,6 +368,7 @@ impl GameState {
                     let machine_offsets = renderer.machine_lighting_offsets.clone();
                     let control_offsets = renderer.control_lighting_offsets.clone();
                     use crate::halo::objects::object_type::ObjectType;
+                    if !minimal_load {
                     self.load_visible_placements(
                         renderer,
                         &loaded.scenario,
@@ -510,145 +473,10 @@ impl GameState {
                     // exists.
                     self.resolve_pending_attachments(renderer, &loaded.scenario);
 
-                    // Atmosphere WEATHER effects — each `AtmosphereSettings`
-                    // entry (scenario.atmospheric → .sky_atm_parameters) can
-                    // name a `weather_effect` effe (rain/snow/dust/ash). Engine
-                    // `effect_new_weather @0x1802fbac0` spawns it at world
-                    // ORIGIN, unattached, with two reserved location vectors:
-                    //   `gravity`(string_id 180) = world-down (particles fall
-                    //   along it) and `up`(187) = world-up.
-                    // First cut: spawn one instance per UNIQUE weather effect
-                    // (engine spawns per active atmosphere setting on PVS change
-                    // + refreshes location to the active cluster — deferred; for
-                    // a static flycam a single origin spawn covers the level).
-                    if let Some(atm) = loaded.atmosphere.as_ref() {
-                        // Spawn ONLY the active atmosphere setting's weather —
-                        // engine `c_atmosphere_fog_interface::change_pvs
-                        // @0x1803af550` runs `effect_new_weather` per the
-                        // camera-cluster's active setting, not all settings.
-                        // Spawning every setting layered `snow_turf` (g=1.0,
-                        // falls ~2 wu/s) AND `snow_turf_calm` (g=0.01, barely
-                        // falls) → the near-static calm snow dragged the
-                        // apparent fall speed down ~3-5×. Use the primary
-                        // (first "Enable Atmosphere") setting; per-cluster
-                        // switching as the camera moves is a follow-up (needs
-                        // the cluster→setting lookup threaded into the CPU
-                        // pulse — the renderer's lookup gets `game` immutably).
-                        for setting in atm.primary_setting() {
-                            if setting.weather_effect.is_empty() {
-                                continue;
-                            }
-                            let Some(eidx) = self
-                                .effects
-                                .load_effect(&setting.weather_effect, &loaded.tags_root)
-                            else {
-                                continue;
-                            };
-                            // Location matrices in the effect's location-name
-                            // order (system.location indexes this). Reserved
-                            // direction names → world-axis bases (forward = +X):
-                            //   gravity → +X = world-DOWN; up → +X = world-UP.
-                            let loc_names = self.effects.effect_location_markers(eidx);
-                            let location_matrices: Vec<glam::Mat4> = loc_names
-                                .iter()
-                                .map(|n| match n.as_str() {
-                                    "gravity" => glam::Mat4::from_cols(
-                                        glam::vec4(0.0, 0.0, -1.0, 0.0), // forward = down
-                                        glam::vec4(0.0, 1.0, 0.0, 0.0),
-                                        glam::vec4(1.0, 0.0, 0.0, 0.0),
-                                        glam::vec4(0.0, 0.0, 0.0, 1.0), // origin
-                                    ),
-                                    "up" => glam::Mat4::from_cols(
-                                        glam::vec4(0.0, 0.0, 1.0, 0.0), // forward = up
-                                        glam::vec4(0.0, 1.0, 0.0, 0.0),
-                                        glam::vec4(-1.0, 0.0, 0.0, 0.0),
-                                        glam::vec4(0.0, 0.0, 0.0, 1.0),
-                                    ),
-                                    _ => glam::Mat4::IDENTITY,
-                                })
-                                .collect();
-                            let inst_idx = self.effects.instances.len();
-                            self.effects.spawn_instance(
-                                eidx,
-                                u32::MAX,         // no host → identity host @ origin
-                                String::new(),    // no marker
-                                glam::Vec3::ZERO, // engine global_origin3d (repositioned per frame)
-                                location_matrices,
-                                String::new(),    // empty primary_scale → always on
-                                true, // effect_new_weather: creation flags=26 → looping instance
-                            );
-                            // Mark as cluster-flagged weather so the particle
-                            // LOD uses the cluster effect_weight path, not the
-                            // distance band (see EffectInstance::weather).
-                            self.effects.instances[inst_idx].weather = true;
-                            self.weather_instances.push(inst_idx);
-                            eprintln!(
-                                "[weather] spawned '{}' (locations={:?})",
-                                setting.weather_effect, loc_names,
-                            );
-                        }
-                    }
+                    self.spawn_weather(&loaded);
+                    } // end if !minimal_load
 
-                    // Effects summary — what the particle subsystem will
-                    // simulate/render (Phase 2+).
-                    eprintln!(
-                        "[effects] total: {} effect tags, {} instances, {} live particle systems",
-                        self.effects.effects.len(),
-                        self.effects.instances.len(),
-                        self.effects.live_system_count(),
-                    );
-                    // Build per-emitter render batches (each loads its own
-                    // base/alpha/palette bitmaps) so the billboard pass
-                    // shades each particle system faithfully (Phase 4).
-                    let descriptors = self.effects.batch_descriptors();
-                    renderer.register_particle_batches(&descriptors, &loaded.tags_root);
-                    // Track R1: cache the unique light-volume base_map textures
-                    // so the per-frame strip render can bind them.
-                    let lv_base_maps: Vec<String> = self
-                        .effects
-                        .light_volumes
-                        .values()
-                        .map(|lv| lv.render.base_map.clone())
-                        .filter(|b| !b.is_empty())
-                        .collect();
-                    renderer.register_light_volume_textures(&lv_base_maps, &loaded.tags_root);
-                    for eff in &self.effects.effects {
-                        let inst = self
-                            .effects
-                            .instances
-                            .iter()
-                            .filter(|i| self.effects.effects[i.effect_index].path == eff.path)
-                            .count();
-                        eprintln!(
-                            "[effects]   {} — {} systems, {} instances [{}]",
-                            eff.path,
-                            eff.systems.len(),
-                            inst,
-                            eff.systems
-                                .iter()
-                                .map(|s| {
-                                    s.particle_path
-                                        .rsplit(['\\', '/'])
-                                        .next()
-                                        .unwrap_or(&s.particle_path)
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        );
-                        if std::env::var("PROTOMORPH_DIAG_INST").is_ok() {
-                            for i in self
-                                .effects
-                                .instances
-                                .iter()
-                                .filter(|i| self.effects.effects[i.effect_index].path == eff.path)
-                            {
-                                eprintln!(
-                                    "[effects]     instance origin=({:.1},{:.1},{:.1})",
-                                    i.origin.x, i.origin.y, i.origin.z
-                                );
-                            }
-                        }
-                    }
+                    self.log_scenario_summary(renderer, &loaded);
                 }
                 Err(e) => eprintln!("[scenario] load failed: {e}"),
             }
@@ -662,6 +490,310 @@ impl GameState {
         // method options (e.g. `environment_map / dynamic`) fail loud at
         // load per the engine-faithful policy — that surfaces what to
         // port next rather than silently dropping the vehicle.
+    }
+
+    /// Sky load — Ares' `c_object_renderer::submit_and_render_sky`
+    /// chain. `scenario.skies[i].sky` is a `.scenery` tag-ref
+    /// pointing at the sky's `_object_definition`; the
+    /// existing object loader walks .scenery → .model →
+    /// .render_model. We register it as a regular object
+    /// and override its position to the camera per frame
+    /// (Ares' `render_sky_modify_node_matrices` applies an
+    /// offset = camera_position to keep the sky dome
+    /// centered on the viewer).
+    ///
+    /// For v1 we just take skies[0]; per-cluster sky
+    /// selection (`bsp.cluster.scenario_sky_index`) lands
+    /// alongside PVS in Phase H.
+    fn load_sky(
+        &mut self,
+        renderer: &mut Renderer,
+        loaded: &crate::halo::scenario::LoadedScenario,
+    ) {
+        if let Some(sky_ref) = loaded.skies().first() {
+            if !sky_ref.sky.is_empty() {
+                let sky_path = blam_tags::paths::resolve_tag_path(
+                    &loaded.tags_root,
+                    &sky_ref.sky,
+                    "scenery",
+                );
+                if sky_path.exists() {
+                    let (model, data) = renderer.load_object_tag(&sky_path);
+                    let obj = self.objects.new_object();
+                    self.model_data.push(data);
+                    let slot = self.objects.get_mut(obj);
+                    slot.model_index = Some(model);
+                    self.sky_object = Some(obj);
+                    eprintln!(
+                        "[scenario]   sky: {} (model={})",
+                        sky_ref.sky, model,
+                    );
+                } else {
+                    eprintln!(
+                        "[scenario]   sky tag missing: {}",
+                        sky_path.display(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Pick a spawn vantage from the scenery placements that
+    /// reference an MP respawn-point/zone palette entry. MP
+    /// scenarios author these as `objects/multi/spawning/
+    /// respawn_point.scenery` (and game-mode-specific zone
+    /// variants like `slayer_respawn_zone.scenery`). Halo's
+    /// runtime spawn picker is more involved (game-mode
+    /// gating + respawn timer + visibility check), but for
+    /// a flycam smoke test the first respawn point is fine.
+    fn pick_spawn(&mut self, loaded: &crate::halo::scenario::LoadedScenario) {
+        let respawns: Vec<(Vec3, f32)> = loaded
+            .scenario
+            .scenery
+            .iter()
+            .filter_map(|p| {
+                let idx = p.palette_index;
+                if idx < 0 { return None; }
+                let palette = loaded.scenario.scenery_palette.get(idx as usize)?;
+                let tp = palette.tag_path.to_ascii_lowercase();
+                if tp.contains("respawn_point") || tp.contains("respawn_zone") {
+                    let pos = p.object_data.position;
+                    Some((
+                        Vec3::new(pos.x, pos.y, pos.z),
+                        p.object_data.rotation.yaw,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if let Some(&(pos, yaw_rad)) = respawns.first() {
+            // Eye-height offset — Halo units are world-meters,
+            // biped eye height ≈ 1.7m.
+            self.camera.position = pos + Vec3::new(0.0, 0.0, 1.7);
+            self.camera.rotation = glam::Vec2::new(yaw_rad.to_degrees(), -5.0);
+            self.camera.update();
+            eprintln!(
+                "[scenario]   spawning at respawn[0]: pos=({:.2}, {:.2}, {:.2}) yaw={:.1}° ({} respawn points)",
+                self.camera.position.x, self.camera.position.y, self.camera.position.z,
+                self.camera.rotation.x, respawns.len(),
+            );
+        }
+    }
+
+    /// Atmosphere WEATHER effects — each `AtmosphereSettings`
+    /// entry (scenario.atmospheric → .sky_atm_parameters) can
+    /// name a `weather_effect` effe (rain/snow/dust/ash). Engine
+    /// `effect_new_weather @0x1802fbac0` spawns it at world
+    /// ORIGIN, unattached, with two reserved location vectors:
+    ///   `gravity`(string_id 180) = world-down (particles fall
+    ///   along it) and `up`(187) = world-up.
+    /// First cut: spawn one instance per UNIQUE weather effect
+    /// (engine spawns per active atmosphere setting on PVS change
+    /// + refreshes location to the active cluster — deferred; for
+    /// a static flycam a single origin spawn covers the level).
+    fn spawn_weather(&mut self, loaded: &crate::halo::scenario::LoadedScenario) {
+        let Some(atm) = loaded.atmosphere.as_ref() else { return };
+        if atm.atmosphere_settings.is_empty() {
+            return;
+        }
+        // Cache the active BSP cluster geometry so the per-frame lifecycle
+        // (`update_weather`) can resolve which atmosphere settings are active
+        // in the camera's cluster sphere (engine `change_pvs` PVS walk).
+        let (clusters, portals, planes, palette) = match loaded.active_bsps.first() {
+            Some(bsp) => (
+                bsp.sbsp.clusters.clone(),
+                bsp.sbsp.cluster_portals.clone(),
+                bsp.sbsp
+                    .collision_bsp
+                    .as_ref()
+                    .map(|c| c.planes.clone())
+                    .unwrap_or_default(),
+                bsp.sbsp.atmosphere_palette.clone(),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        };
+        let n = atm.atmosphere_settings.len();
+        self.weather = Some(WeatherDriver {
+            atmosphere: atm.clone(),
+            clusters,
+            portals,
+            planes,
+            palette,
+            tags_root: loaded.tags_root.clone(),
+            effect_indices: vec![None; n],
+        });
+        // The first spawn/destroy pass runs on the first `update()`.
+    }
+
+    /// Per-frame weather lifecycle (engine `c_atmosphere_fog_interface::change_pvs
+    /// @0x1803AF550`): resolve the atmosphere settings active in the camera's
+    /// cluster sphere, spawn a camera-relative weather effect for each newly
+    /// active setting (engine `effect_new_weather` — unattached, flags=26,
+    /// gravity=down/up=up), and destroy (`effect_handle_deleted_atmosphere
+    /// @0x1802FDD10` → `effect_destroy`) any whose setting just left the PVS.
+    fn update_weather(&mut self) {
+        let Some(mut driver) = self.weather.take() else { return };
+        let cam = self.camera.position;
+        let n = driver.atmosphere.atmosphere_settings.len();
+
+        // 1. Active-setting set = settings referenced by any cluster in the
+        //    camera's atmosphere search sphere (PVS-wide activation).
+        let mut active = vec![false; n];
+        if let Some(start) = crate::halo::render::atmosphere_fog_interface::find_cluster_for_eye(
+            &driver.clusters,
+            cam,
+        ) {
+            let search_r = (driver.atmosphere.cluster_search_radius * 3.0).max(20.0);
+            let gathered = if driver.clusters.is_empty() {
+                vec![start]
+            } else {
+                crate::halo::structures::clusters_in_sphere::clusters_in_sphere(
+                    &driver.clusters,
+                    &driver.portals,
+                    &driver.planes,
+                    start,
+                    [cam.x, cam.y, cam.z],
+                    search_r,
+                    100,
+                )
+            };
+            for c in gathered {
+                let atm_idx = driver.clusters.get(c).map(|cl| cl.atmosphere_index).unwrap_or(-1);
+                if let Some(si) =
+                    crate::halo::render::atmosphere_fog_interface::resolve_atmosphere_setting_index(
+                        atm_idx,
+                        &driver.palette,
+                        n,
+                    )
+                {
+                    if si < n {
+                        active[si] = true;
+                    }
+                }
+            }
+        }
+
+        // 2. Spawn newly-active settings; destroy newly-inactive ones.
+        for si in 0..n {
+            let weather_tag = driver.atmosphere.atmosphere_settings[si].weather_effect.clone();
+            let want = active[si] && !weather_tag.is_empty();
+            let have = driver.effect_indices[si].is_some();
+            if want && !have {
+                let tags_root = driver.tags_root.clone();
+                if let Some(idx) = self.spawn_weather_instance(&weather_tag, &tags_root) {
+                    driver.effect_indices[si] = Some(idx);
+                }
+            } else if !want && have {
+                if let Some(idx) = driver.effect_indices[si].take() {
+                    self.effects.destroy_instance(idx);
+                    eprintln!("[weather] destroyed setting #{si} instance {idx}");
+                }
+            }
+        }
+
+        // 3. Keep every live weather effect anchored at the camera
+        //    (engine `effect_refresh_location`).
+        for slot in &driver.effect_indices {
+            if let Some(idx) = *slot {
+                self.effects.set_instance_origin(idx, cam);
+            }
+        }
+        self.weather = Some(driver);
+    }
+
+    /// Spawn one camera-relative weather effect (engine `effect_new_weather
+    /// @0x1802FBAC0`): unattached, looping (flags=26), reserved location bases
+    /// `gravity`(+X=world-down) / `up`(+X=world-up). Returns the instance index.
+    fn spawn_weather_instance(&mut self, weather_tag: &str, tags_root: &Path) -> Option<usize> {
+        let eidx = self.effects.load_effect(weather_tag, tags_root)?;
+        let loc_names = self.effects.effect_location_markers(eidx);
+        let location_matrices: Vec<glam::Mat4> = loc_names
+            .iter()
+            .map(|nm| crate::halo::effects::reserved_location_basis(nm.as_str()))
+            .collect();
+        let idx = self.effects.spawn_instance(
+            eidx,
+            u32::MAX,             // no host → identity host @ origin
+            String::new(),        // no marker
+            self.camera.position, // spawn at the viewer; repositioned per frame
+            location_matrices,
+            String::new(), // empty primary_scale → always on
+            true,          // effect_new_weather: creation flags=26 → looping
+        );
+        // Cluster-flagged weather → cluster effect_weight LOD path, not the
+        // distance band (see EffectInstance::weather).
+        self.effects.instances[idx].weather = true;
+        eprintln!("[weather] spawned '{weather_tag}' (instance {idx}, locations={loc_names:?})");
+        Some(idx)
+    }
+
+    /// Effects summary — what the particle subsystem will
+    /// simulate/render (Phase 2+). Also builds the per-emitter
+    /// render batches and caches the light-volume textures.
+    fn log_scenario_summary(
+        &mut self,
+        renderer: &mut Renderer,
+        loaded: &crate::halo::scenario::LoadedScenario,
+    ) {
+        eprintln!(
+            "[effects] total: {} effect tags, {} instances, {} live particle systems",
+            self.effects.effects.len(),
+            self.effects.instances.len(),
+            self.effects.live_system_count(),
+        );
+        // Build per-emitter render batches (each loads its own
+        // base/alpha/palette bitmaps) so the billboard pass
+        // shades each particle system faithfully (Phase 4).
+        let descriptors = self.effects.batch_descriptors();
+        renderer.register_particle_batches(&descriptors, &loaded.tags_root);
+        // Track R1: cache the unique light-volume base_map textures
+        // so the per-frame strip render can bind them.
+        let lv_base_maps: Vec<String> = self
+            .effects
+            .light_volumes
+            .values()
+            .map(|lv| lv.render.base_map.clone())
+            .filter(|b| !b.is_empty())
+            .collect();
+        renderer.register_light_volume_textures(&lv_base_maps, &loaded.tags_root);
+        for eff in &self.effects.effects {
+            let inst = self
+                .effects
+                .instances
+                .iter()
+                .filter(|i| self.effects.effects[i.effect_index].path == eff.path)
+                .count();
+            eprintln!(
+                "[effects]   {} — {} systems, {} instances [{}]",
+                eff.path,
+                eff.systems.len(),
+                inst,
+                eff.systems
+                    .iter()
+                    .map(|s| {
+                        s.particle_path
+                            .rsplit(['\\', '/'])
+                            .next()
+                            .unwrap_or(&s.particle_path)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            if std::env::var("PROTOMORPH_DIAG_INST").is_ok() {
+                for i in self
+                    .effects
+                    .instances
+                    .iter()
+                    .filter(|i| self.effects.effects[i.effect_index].path == eff.path)
+                {
+                    eprintln!(
+                        "[effects]     instance origin=({:.1},{:.1},{:.1})",
+                        i.origin.x, i.origin.y, i.origin.z
+                    );
+                }
+            }
+        }
     }
 
     /// Walk a `[ObjectPlacement]` array + palette and create an object
@@ -913,33 +1045,9 @@ impl GameState {
                                                 vec![glam::Mat4::IDENTITY]
                                             };
                                             // Spin the lean azimuth about the host's
-                                            // LOCAL up axis (placement up), pre-composed
-                                            // with the marker so the vertical base is
-                                            // preserved. null_up's 'marker' has up-axis
-                                            // −X, so the emitter relative_direction's
-                                            // pitch leans the jet −X (sideways off the
-                                            // ramp). The visible launch markers (man
-                                            // cannon 'fire', guardian crate 'up') lean
-                                            // +Y — up the throat. A −90° spin about up
-                                            // turns −X→+Y (up the ramp) while leaving the
-                                            // vertical column unchanged (holy_light, a
-                                            // pure +Z jet, is invariant under up-axis
-                                            // rotation). Override via PROTOMORPH_UP_YAW.
-                                            let up_yaw_deg: f32 =
-                                                std::env::var("PROTOMORPH_UP_YAW")
-                                                    .ok()
-                                                    .and_then(|s| s.parse().ok())
-                                                    .unwrap_or(-90.0);
-                                            if up_yaw_deg != 0.0 {
-                                                let spin = glam::Mat4::from_rotation_z(
-                                                    up_yaw_deg.to_radians(),
-                                                );
-                                                base.into_iter()
-                                                    .map(|m| spin * m)
-                                                    .collect()
-                                            } else {
-                                                base
-                                            }
+                                            // LOCAL up axis (see
+                                            // `effects::up_yaw_spin` for the rationale).
+                                            crate::halo::effects::up_yaw_spin(base)
                                         })
                                         .collect();
                                     let variant_count = per_loc
@@ -1372,10 +1480,11 @@ impl GameState {
         // viewer each frame (engine `effect_refresh_location`) so falling
         // ash/rain/dust surrounds the player instead of sitting at the fixed
         // world origin it spawned at.
+        // Weather lifecycle (engine change_pvs): spawn/destroy per-setting
+        // weather effects for the camera's active atmosphere settings and
+        // re-anchor them at the viewer.
+        self.update_weather();
         let cam_pos = self.camera.position;
-        for &wi in &self.weather_instances {
-            self.effects.set_instance_origin(wi, cam_pos);
-        }
         // Per-location particle LOD needs the camera position; fov_scale 1.0
         // until the real camera field_of_view_scale is threaded (engine
         // scales distance by it — wider FOV reads as farther).

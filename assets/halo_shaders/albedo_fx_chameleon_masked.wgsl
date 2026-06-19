@@ -36,10 +36,13 @@ fn calc_albedo_chameleon_masked_ps(
 ) {
     let base = textureSample(base_map, base_map_sampler, transform_texcoord(texcoord, material.base_map_xform));
     let detail = textureSample(detail_map, detail_map_sampler, transform_texcoord(texcoord, material.detail_map_xform));
-    let mask = textureSample(chameleon_mask_map, chameleon_mask_map_sampler, texcoord).r;
+    // HLSL albedo_fx.hlsl:363 — mask sampled through transform_texcoord.
+    let mask = textureSample(chameleon_mask_map, chameleon_mask_map_sampler,
+        transform_texcoord(texcoord, material.chameleon_mask_map_xform)).r;
 
-    // color = lerp(1.0, calc_chameleon(N, V), mask)
-    let color = mix(vec3<f32>(1.0), calc_chameleon(normalize(normal), misc.xyz), mask);
+    // color = lerp(1.0, calc_chameleon(N, V), mask). HLSL passes the raw
+    // (already-unit) normal — no normalize.
+    let color = mix(vec3<f32>(1.0), calc_chameleon(normal, misc.xyz), mask);
 
     (*albedo).r = base.r * (detail.r * DETAIL_MULTIPLIER) * color.r;
     (*albedo).g = base.g * (detail.g * DETAIL_MULTIPLIER) * color.g;

@@ -67,60 +67,6 @@ pub fn test_point(nodes: &[CollisionBsp2dNode], point: Vec2, mut child_index: i3
     }
 }
 
-/// `bsp2d_test_point_node_offset` @ dllcache `0x180576960`.
-///
-/// Like [`test_point`] but `root_index` is the per-call OFFSET added to each
-/// node-index step. Engine uses this when one shared `nodes` slice hosts
-/// multiple per-surface trees (the BSP3D leaf's `bsp2d_references` point at
-/// the root of one such sub-tree by offset). Returns surface index or [`NONE`].
-///
-/// Verbatim port — early-return for negative `root_index`, additive descent.
-pub fn test_point_node_offset(nodes: &[CollisionBsp2dNode], point: Vec2, root_index: i32) -> u32 {
-    if root_index < 0 {
-        // Engine fast path: a negative root is either NONE (-1) or itself a
-        // leaf designator. Mask the leaf bit off (`& 0x7FFFFFFF`).
-        return if root_index == -1 {
-            NONE
-        } else {
-            (root_index & 0x7FFF_FFFF) as u32
-        };
-    }
-
-    let py = point.y;
-    let px = point.x;
-    // Engine starts the iteration with `LOWORD(v6) = 0` (a fake "previous
-    // step" with both halves zero so the first add lands on `root_index + 0`).
-    let mut step: i32 = 0;
-    let mut current = root_index;
-    loop {
-        current += step & 0x7FFF;
-        let node_opt = if current >= 0 {
-            nodes.get(current as usize)
-        } else {
-            None
-        };
-        let node = match node_opt {
-            Some(n) => n,
-            None => {
-                // Out-of-range — engine reads from null pointer (yields zeros).
-                // Treat as leaf-NONE so the caller doesn't loop forever.
-                return NONE;
-            }
-        };
-        step = pick_child(node, Vec2::new(px, py));
-        // Engine loop guard: `(step & 0x8000) == 0` keeps iterating. We use
-        // bit 31 instead because of the canonical i32 promotion.
-        if step < 0 {
-            break;
-        }
-    }
-    if step == -1 {
-        NONE
-    } else {
-        (step & 0x7FFF_FFFF) as u32
-    }
-}
-
 /// Inner step of both walkers: evaluate the node's 2D plane at `point` and
 /// return the appropriate child index.
 ///

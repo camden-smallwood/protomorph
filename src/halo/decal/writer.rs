@@ -305,22 +305,6 @@ fn pack_short_n4(x: f32, y: f32, z: f32) -> [i16; 4] {
     [pack(x), pack(y), pack(z), 0]
 }
 
-#[inline]
-pub(super) fn matrix4x3_transform_point(m: &RealMatrix4x3, p: RealPoint3d) -> RealPoint3d {
-    let s = m.scale;
-    RealPoint3d {
-        x: s * (p.x * m.forward.i + p.y * m.left.i + p.z * m.up.i) + m.position.x,
-        y: s * (p.x * m.forward.j + p.y * m.left.j + p.z * m.up.j) + m.position.y,
-        z: s * (p.x * m.forward.k + p.y * m.left.k + p.z * m.up.k) + m.position.z,
-    }
-}
-
-#[inline]
-fn matrix4x3_transform_normal(m: &RealMatrix4x3, n: RealVector3d) -> RealVector3d {
-    let s = m.scale;
-    RealVector3d {
-        i: s * (n.i * m.forward.i + n.j * m.left.i + n.k * m.up.i),
-        j: s * (n.i * m.forward.j + n.j * m.left.j + n.k * m.up.j),
-        k: s * (n.i * m.forward.k + n.j * m.left.k + n.k * m.up.k),
-    }
-}
+pub(super) use crate::halo::math::matrix_math::{
+    matrix4x3_transform_normal, matrix4x3_transform_point,
+};

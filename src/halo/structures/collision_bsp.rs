@@ -24,20 +24,19 @@ use blam_tags::structure_bsp::{Bsp3d, Bsp3dNode};
 // `global_projection3d_mappings @ 0x180B255B0` — verified via IDA read_bytes
 // =============================================================================
 //
-// `short[3][2][3]` indexed by `(projection_axis, projection_sign, kind)`.
-// kind=0 → which 3D component becomes 2D X.
-// kind=1 → which 3D component becomes 2D Y.
-// kind=2 → which 3D component was dropped (= projection_axis; unused by
-//          collision testing, kept for parity with the engine table).
+// SINGLE SOURCE OF TRUTH lives in `physics::collision_bsp::PROJECTION3D_MAPPINGS_FULL`
+// (the more complete port). This module references it directly so the two
+// homes can never re-diverge. The full table is `short[3][2][3]` indexed by
+// `(projection_axis, projection_sign, kind)`:
+//   kind=0 → which 3D component becomes 2D X.
+//   kind=1 → which 3D component becomes 2D Y.
+//   kind=2 → which 3D component was dropped (= projection_axis; unused here,
+//            kept for parity with the engine table).
 //
 // projection_axis selects the component with the largest |plane normal|;
 // projection_sign captures the orientation of that normal so the 2D
 // edge-cross-product winding stays consistent with 3D surface winding.
-const PROJECTION_3D_MAPPINGS: [[[usize; 3]; 2]; 3] = [
-    [[2, 1, 0], [1, 2, 0]], // drop X
-    [[0, 2, 1], [2, 0, 1]], // drop Y
-    [[1, 0, 2], [0, 1, 2]], // drop Z
-];
+use crate::halo::physics::collision_bsp::PROJECTION3D_MAPPINGS_FULL as PROJECTION_3D_MAPPINGS;
 
 // =============================================================================
 // Collision test flag bits — matches engine `s_collision_test_flags::collision_flags`
@@ -159,7 +158,7 @@ struct TestData<'a> {
 // `collision_bsp_test_vector_recursive @ 0x180513f80`
 // -----------------------------------------------------------------------------
 
-fn test_recursive(data: &mut TestData, mut child_index: i32, mut t0: f64, mut t1: f64) -> bool {
+fn test_recursive(data: &mut TestData, mut child_index: i32, mut t0: f64, t1: f64) -> bool {
     // Engine `collision_bsp_test_vector_recursive @ 0x180513f80`.
     // Descend through interior nodes until we land in a leaf or hit
     // the sentinel `-1` exit. Engine iterative-then-recursive shape
@@ -416,7 +415,7 @@ fn leaf_test_vector(
             point[2] + t * vector[2],
         ];
         let map = &PROJECTION_3D_MAPPINGS[axis][sign_idx];
-        let p2d = [hit3[map[0]], hit3[map[1]]];
+        let p2d = [hit3[map[0] as usize], hit3[map[1] as usize]];
 
         // Descend the BSP2D tree for this surface.
         let bsp2d_root = bsp2d_ref.bsp2d_node as i32;
@@ -438,22 +437,21 @@ fn leaf_test_vector(
 // `bsp2d_test_point` — BSP2D recursive descent
 // -----------------------------------------------------------------------------
 
-fn bsp2d_test_point(bsp: &Bsp3d, point: [f32; 2], mut child: i32) -> Option<i32> {
-    // Engine `bsp2d_test_point @ 0x180576A50` (SMALL variant) reads
-    // children as i16 with bit 15 as the leaf flag. The LARGE variant
-    // stores them as i32 with bit 31. Our parser normalizes BOTH to
-    // canonical bit-31 form (negative i32 = leaf, low 31 bits = leaf
-    // payload), so this walker uses a single sign-bit check + 31-bit
-    // mask regardless of source format.
-    while child >= 0 {
-        let node = bsp.bsp2d_nodes.get(child as usize)?;
-        let dist = node.plane.i * point[0] + node.plane.j * point[1] - node.plane.d;
-        child = if dist >= 0.0 { node.right_child } else { node.left_child };
-    }
-    if child == -1 {
+fn bsp2d_test_point(bsp: &Bsp3d, point: [f32; 2], child: i32) -> Option<i32> {
+    // Shared implementation lives in `physics::bsp2d::test_point` (the more
+    // complete port). Adapt its `u32` / `NONE` sentinel into the `Option<i32>`
+    // form this module's callers expect. Logic was previously duplicated
+    // verbatim here — both walked the canonical bit-31 leaf encoding
+    // identically (engine `bsp2d_test_point @ 0x180576A50`).
+    let surface = crate::halo::physics::bsp2d::test_point(
+        &bsp.bsp2d_nodes,
+        glam::Vec2::new(point[0], point[1]),
+        child,
+    );
+    if surface == crate::halo::physics::bsp2d::NONE {
         None
     } else {
-        Some(child & 0x7FFF_FFFF)
+        Some(surface as i32)
     }
 }
 
@@ -503,12 +501,12 @@ fn surface_test_point(
         };
 
         let from = [
-            [from_v.point.x, from_v.point.y, from_v.point.z][map[0]],
-            [from_v.point.x, from_v.point.y, from_v.point.z][map[1]],
+            [from_v.point.x, from_v.point.y, from_v.point.z][map[0] as usize],
+            [from_v.point.x, from_v.point.y, from_v.point.z][map[1] as usize],
         ];
         let to = [
-            [to_v.point.x, to_v.point.y, to_v.point.z][map[0]],
-            [to_v.point.x, to_v.point.y, to_v.point.z][map[1]],
+            [to_v.point.x, to_v.point.y, to_v.point.z][map[0] as usize],
+            [to_v.point.x, to_v.point.y, to_v.point.z][map[1] as usize],
         ];
 
         // Engine `collision_surface_test_point @ 0x180514870` form:
@@ -529,5 +527,68 @@ fn surface_test_point(
             return true;
         }
         edge_idx = next as i32;
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+    use crate::halo::physics::bsp2d;
+    use crate::halo::physics::collision_bsp::{PROJECTION3D_MAPPINGS, PROJECTION3D_MAPPINGS_FULL};
+    use blam_tags::math::RealPlane2d;
+    use blam_tags::structure_bsp::CollisionBsp2dNode;
+
+    /// Both collision homes must read the SAME projection table. The decal
+    /// path (this module) imports `PROJECTION3D_MAPPINGS_FULL` as
+    /// `PROJECTION_3D_MAPPINGS`; the geometry/physics path reads the derived
+    /// 2-wide `PROJECTION3D_MAPPINGS`. They must agree on the first two
+    /// (kept) columns for every (axis, sign) — this is the regression guard
+    /// that prevents the tables from ever re-diverging.
+    #[test]
+    fn structures_and_physics_share_one_projection_table() {
+        for axis in 0..3 {
+            for sign in 0..2 {
+                assert_eq!(
+                    [PROJECTION_3D_MAPPINGS[axis][sign][0], PROJECTION_3D_MAPPINGS[axis][sign][1]],
+                    PROJECTION3D_MAPPINGS[axis][sign],
+                    "axis {axis} sign {sign} table mismatch between decal and physics paths"
+                );
+                assert_eq!(
+                    PROJECTION_3D_MAPPINGS[axis][sign], PROJECTION3D_MAPPINGS_FULL[axis][sign],
+                    "decal path table is not the canonical full table"
+                );
+            }
+        }
+    }
+
+    /// The structures `bsp2d_test_point` adapter must return exactly what the
+    /// shared `physics::bsp2d::test_point` core returns (just re-typed from
+    /// the `u32`/`NONE` sentinel into `Option<i32>`). This pins the dedup:
+    /// the decal walker now drives the SAME 2D point test as the
+    /// geometry-sampling walker.
+    #[test]
+    fn structures_bsp2d_adapter_matches_shared_core() {
+        // Single bsp2d node: plane x >= 0 → right (leaf surface 7), else left
+        // (leaf surface 3). Children encoded canonical bit-31 leaf form.
+        let leaf_right = (0x8000_0000u32 | 7) as i32;
+        let leaf_left = (0x8000_0000u32 | 3) as i32;
+        let nodes = vec![CollisionBsp2dNode {
+            plane: RealPlane2d { i: 1.0, j: 0.0, d: 0.0 },
+            left_child: leaf_left,
+            right_child: leaf_right,
+        }];
+        let mut bsp = Bsp3d::default();
+        bsp.bsp2d_nodes = nodes.clone();
+
+        for &(px, py) in &[(1.0f32, 0.0f32), (-1.0, 0.0), (0.0, 5.0), (0.25, -3.0)] {
+            let core = bsp2d::test_point(&nodes, glam::Vec2::new(px, py), 0);
+            let adapted = bsp2d_test_point(&bsp, [px, py], 0);
+            let expected = if core == bsp2d::NONE { None } else { Some(core as i32) };
+            assert_eq!(adapted, expected, "mismatch at ({px}, {py})");
+        }
+
+        // Empty-leaf sentinel (-1) round-trips to None through both.
+        assert_eq!(bsp2d_test_point(&bsp, [0.0, 0.0], -1), None);
+        assert_eq!(bsp2d::test_point(&nodes, glam::Vec2::ZERO, -1), bsp2d::NONE);
     }
 }

@@ -235,17 +235,8 @@ pub fn reconstruct_quadratic_lightprobe_from_linear_and_intensity(
 }
 
 // =============================================================================
-// sh_add + sh_eval_directional_light — Ares `math/spherical_harmonics.cpp`
+// sh_eval_directional_light — Ares `math/spherical_harmonics.cpp`
 // =============================================================================
-
-/// `sh_add(out, order, a, b)` @ dllcache `0x18051b590`. Element-wise add
-/// over `order * order` floats — for `order=3` that's 9 elements (SH3).
-pub fn sh_add(out: &mut [f32], a: &[f32], b: &[f32], order: u32) {
-    let n = (order as usize) * (order as usize);
-    for i in 0..n {
-        out[i] = a[i] + b[i];
-    }
-}
 
 /// `sh_eval_directional_light(order, dir, r_intensity, g_intensity, b_intensity, ...)`
 /// @ dllcache `0x18051bd90`. Generates SH coefficients representing a
@@ -387,50 +378,4 @@ impl LightingInterface {
         }
     }
 
-    /// Analytical SH3 projection of (directional sun + ambient).
-    /// Same math as `env_probe_pass::compute_analytical_sh`, just
-    /// split per-channel. Used when only `(sun_dir, sun_color,
-    /// ambient_color)` are available — no baked probe.
-    ///
-    /// `sun_dir` is the direction TO the sun.
-    pub fn from_sun_and_ambient(sun_dir: Vec3, sun_color: Vec3, ambient_color: Vec3) -> Self {
-        // SH basis constants (matches env_probe_pass)
-        const Y00: f32 = 0.282095;   // 1/(2√π)
-        const Y1X: f32 = 0.488603;   // √3/(2√π)
-        const Y20: f32 = 0.315392;   // √5/(4√π) * (1/2)
-        const Y21: f32 = 1.092548;   // √15/(2√π)
-        const Y22: f32 = 0.546274;   // √15/(4√π)
-
-        let d = sun_dir.normalize_or_zero();
-
-        // L0 — ambient + directional constant term
-        let l0 = (sun_color + ambient_color) * Y00;
-        // L1 (Halo convention — see spherical_harmonics_fx.hlsl
-        // `ravi_order_2_with_dominant_light`'s `dir_eval`).
-        let l1_m1 = -sun_color * Y1X * d.y;
-        let l1_0 =   sun_color * Y1X * d.z;
-        let l1_1 =  -sun_color * Y1X * d.x;
-        // L2
-        let l2_m2 = sun_color * Y21 * d.x * d.y;
-        let l2_m1 = sun_color * Y21 * d.y * d.z;
-        let l2_0 = sun_color * Y20 * (3.0 * d.z * d.z - 1.0);
-        let l2_1 = sun_color * Y21 * d.x * d.z;
-        let l2_2 = sun_color * Y22 * (d.x * d.x - d.y * d.y);
-
-        let pack = |c: fn(Vec3) -> f32| -> [f32; 9] {
-            [
-                c(l0),
-                c(l1_m1), c(l1_0), c(l1_1),
-                c(l2_m2), c(l2_m1), c(l2_0), c(l2_1), c(l2_2),
-            ]
-        };
-
-        Self {
-            dominant_light_dir: Vec4::new(d.x, d.y, d.z, 1.0),
-            dominant_light_intensity: sun_color,
-            sh_probe_r: pack(|v| v.x),
-            sh_probe_g: pack(|v| v.y),
-            sh_probe_b: pack(|v| v.z),
-        }
-    }
 }

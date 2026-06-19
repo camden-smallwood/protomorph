@@ -122,6 +122,59 @@ fn load_image_from_bitmap(
         });
     }
 
+    // `A8` → DX11 `DXGI_FORMAT_A8_UNORM` (verified: engine
+    // `c_rasterizer::bitmap_format_to_hardware_format_pc_unchecked`
+    // table_16[0] = 0x41), which samples `(0, 0, 0, a)`. wgpu/Metal has
+    // no native A8 and no stable view swizzle, so decode to RGBA8 with
+    // rgb zeroed. CRUCIALLY decode the FULL MIP PYRAMID — the engine's A8
+    // masks are mipped (e.g. guardian glass `specular_mask` is 2048² ×12
+    // mips); dropping mips makes the mask's dark texels alias into dark,
+    // unreflective patches at distance instead of averaging to the engine's
+    // smooth value. blam-tags `decode_a8` is white-with-alpha (a preview
+    // convention), so we zero rgb to match DXGI. Linear (A8 has no sRGB
+    // variant; alpha is the mask). Non-cube only (cube A8 is unobserved;
+    // it falls through to the mip-0 decode below).
+    if format == BitmapFormat::A8 && !is_cube {
+        if std::env::var("PROTOMORPH_LOG_A8").is_ok() {
+            eprintln!("[a8] {} ({}x{} {} mips)", bitm_path.display(), width, height, mip_count);
+        }
+        let mut data = Vec::with_capacity(width as usize * height as usize * 4 * 2);
+        for layer in 0..layers as usize {
+            let layer_base = layer * per_layer;
+            let mut lvl_off = 0usize;
+            for mip in 0..mip_count {
+                let mw = (width >> mip).max(1);
+                let mh = (height >> mip).max(1);
+                let lvl_bytes = format.level_bytes(mw, mh) as usize;
+                let src = &surface_bytes[layer_base + lvl_off..layer_base + lvl_off + lvl_bytes];
+                match decode_to_rgba8(format, mw, mh, src) {
+                    Ok(mut v) => {
+                        for px in v.chunks_mut(4) {
+                            px[0] = 0;
+                            px[1] = 0;
+                            px[2] = 0;
+                        }
+                        data.extend_from_slice(&v);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[halo_bitmap] {}: A8 decode failed (layer {layer} mip {mip}): {e}",
+                            bitm_path.display(),
+                        );
+                        return None;
+                    }
+                }
+                lvl_off += lvl_bytes;
+            }
+        }
+        return Some(InlineTexture {
+            width, height, mip_count, layers, is_cube: false,
+            format: InlinePixelFormat::Rgba8Unorm,
+            encoding: TexelEncoding::Linear,
+            data,
+        });
+    }
+
     // Native passthrough where wgpu has the format.
     if let Some(inline_fmt) = native_passthrough(format) {
         return Some(InlineTexture {
@@ -151,6 +204,22 @@ fn load_image_from_bitmap(
                 );
                 return None;
             }
+        }
+    }
+    // DX11 `DXGI_FORMAT_A8_UNORM` samples as `(0, 0, 0, a)`. blam-tags
+    // `decode_a8` expands to white-with-alpha (its documented "useful
+    // preview" convention), so zero the rgb here to give shaders the
+    // engine's sample (e.g. `decal_fx::sample_diffuse` reads `.rgb`,
+    // which must be 0 for an alpha_blend A8 decal to darken rather than
+    // paint colour).
+    if format == BitmapFormat::A8 {
+        if std::env::var("PROTOMORPH_LOG_A8").is_ok() {
+            eprintln!("[a8] {}", bitm_path.display());
+        }
+        for px in rgba8.chunks_mut(4) {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
         }
     }
     Some(InlineTexture {
@@ -194,7 +263,16 @@ fn native_passthrough(fmt: BitmapFormat) -> Option<InlinePixelFormat> {
         B::Q8w8v8u8 => I::Rgba8Snorm,
         B::V8u8 => I::Rg8Snorm,
         B::A8y8 => I::Rg8Unorm,
-        B::A8 | B::Y8 | B::R8 => I::R8Unorm,
+        // `A8` is intentionally NOT here — DX11 `DXGI_FORMAT_A8_UNORM`
+        // samples as `(0, 0, 0, a)`, but wgpu/Metal has no native A8 and
+        // no stable texture-view swizzle, so an `R8Unorm` upload would
+        // sample as `(a, 0, 0, 1)` — leaking the mask into red and
+        // pinning alpha to 1 (the snow scorpion's `scorpion_decal` then
+        // alpha-blended an opaque red box instead of darkening). A8 falls
+        // through to the decode path below, which zeroes rgb to match
+        // DXGI. `Y8`/`R8` keep R8Unorm: their value genuinely belongs in
+        // a colour channel (luma / red), not alpha.
+        B::Y8 | B::R8 => I::R8Unorm,
         // Ay8 (8-bit packed luma+alpha), A4r4g4b4, DxnMonoAlpha need decode
         _ => return None,
     })

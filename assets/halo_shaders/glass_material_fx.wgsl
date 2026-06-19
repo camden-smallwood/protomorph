@@ -47,19 +47,10 @@ fn calc_material(
     let _u1 = diffuse_reflectance;
     let _u2 = texcoord;
 
-    // GLASS_SPECULAR_DIM — SCOPED WORKAROUND (2026-06-08).
-    // The glass reflection terms (area_specular × area_specular_contribution=5,
-    // and the env-cube reflection) are engine-faithful and now fed the CORRECT
-    // per-instance probe (see the transparent BspInstancePart routing fix,
-    // d34b378). But on sun-FACING glass instances the bright probe drives
-    // `area_specular×5 + env` to a high HDR value that blows past protomorph's
-    // shared cubic tone curve to white, where the engine lands grey — a
-    // residual ~2× bright-specular HDR-magnitude gap that is NOT a
-    // data/routing/decode bug (all verified to match the engine/HLSL). Dimming
-    // both glass specular terms tames the sun-facing windows while barely
-    // touching shadowed glass (whose probe is already dim). Remove when the
-    // bright-specular HDR magnitude / exposure is reconciled with the engine.
-    const GLASS_SPECULAR_DIM: f32 = 0.3;
+    // (GLASS_SPECULAR_DIM=0.3 workaround removed 2026-06-18 — glass is now
+    // HLSL-faithful. It had counteracted the global non-faithful `sqrt`
+    // brightening in final_composite, itself a band-aid for a ~2×
+    // scene-radiance gap that has since had lighting work.)
 
     // Area specular — gated on contribution > 0 per HLSL line 80.
     // HLSL line 86 hardcodes `false` for the order3 toggle (glass uses
@@ -73,6 +64,12 @@ fn calc_material(
             material.roughness.x,
             false,
         );
+        // DIAG (PROTOMORPH_GLASS_AREASPEC_DC=1): force area-specular to the
+        // un-clamped DC ambient to test whether the clamp is what's killing
+        // the blue-gray sheen and letting the green reflection dominate.
+        if (__GLASS_AREASPEC_DC__ != 0u) {
+            area_specular = sh_lighting_coefficients[0].xyz * 0.282095;
+        }
     }
 
     // Analytical specular — gated on contribution > 0 per HLSL line 91.
@@ -121,7 +118,7 @@ fn calc_material(
 
     // HLSL line 121: combined specular × specular_coefficient × specular_mask.
     let combined =
-          area_specular * material.area_specular_contribution.x * GLASS_SPECULAR_DIM
+          area_specular * material.area_specular_contribution.x
         + analytical_specular * material.analytical_specular_contribution.x
         + simple.specular;
     let specular_color = vec4<f32>(
@@ -136,8 +133,7 @@ fn calc_material(
     //   env_multiplyer = specular_coefficient * fresnel * specular_mask
     //   envmap_reflectance = (env_multiplyer, env_multiplyer, env_multiplyer, roughness)
     // HLSL line 124: env_mult = specular_coefficient * fresnel * specular_mask.
-    // × GLASS_SPECULAR_DIM (scoped workaround — see top of fn).
-    let env_mult = material.specular_coefficient.x * fresnel * specular_mask * GLASS_SPECULAR_DIM;
+    let env_mult = material.specular_coefficient.x * fresnel * specular_mask;
     let envmap_specular_reflectance_and_roughness =
         vec4<f32>(env_mult, env_mult, env_mult, material.roughness.x);
 

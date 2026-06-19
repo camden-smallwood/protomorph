@@ -185,7 +185,8 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     // own albedo-pass dispatch, leaving the SL depth-test passing
     // (leaf depth > sky depth in reverse-Z) and the SL Load returning
     // sky color → ghost leaf-card silhouettes lit by leaf SH.
-    let alpha = textureSample(alpha_test_map, alpha_test_map_sampler, in.tex_coords).a;
+    // HLSL alpha_test_fx.hlsl:20 — alpha sampled through transform_texcoord.
+    let alpha = textureSample(alpha_test_map, alpha_test_map_sampler, transform_texcoord(in.tex_coords, material.alpha_test_map_xform)).a;
     if (alpha < FOLIAGE_ALPHA_THRESHOLD) {
         discard;
     }

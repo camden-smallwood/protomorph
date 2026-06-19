@@ -107,16 +107,6 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
-// Evaluate `ravi_order_2` per channel at `n` using the interpolated
-// per-vertex `(DC, X, Y, -Z)` packing. Same coefficients as
-// `bake.rs::ravi_eval_order2` so the bake math and the per-fragment
-// runtime path agree.
-fn pv_ravi_order2(n: vec3<f32>, sh: vec4<f32>) -> f32 {
-    let dc = sh.x;
-    let l1 = sh.yzw;
-    return (0.886227 * dc + (-1.023328) * dot(n, l1)) * 0.31830989;
-}
-
 // Engine `accum_pixel` (render_target_fx.hlsl:8-18). See entry_static_sh.wgsl.
 struct AccumPixel {
     @location(0) color: vec4<f32>,
@@ -168,21 +158,17 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
         calc_bumpmap(texcoord, in.fragment_to_camera_world, tangent, binormal, normal, &bump_normal_unnorm);
         calc_albedo(texcoord, &albedo, bump_normal_unnorm, misc);
         bump_normal = normalize(bump_normal_unnorm + 1e-6 * normal);
+        // Two-sided transparent surfaces (glass): face the normal toward the
+        // camera (engine decorators_hlsl.hlsl:265). See entry_static_per_pixel.
+        bump_normal = bump_normal * sign(dot(bump_normal, in.fragment_to_camera_world));
         calc_specular_mask(texcoord, albedo.w, &specular_mask);
     }
     let view_dot_normal = dot(view_dir, bump_normal);
     let view_reflect_dir = (view_dot_normal * bump_normal - view_dir) * 2.0 + view_dir;
 
-    // Per-vertex SH eval at the fragment's bump normal. The 4 vec4
-    // SH array expected by `calc_material` mirrors how the cbuffer
-    // path packs ravi constants:
-    //   sh[0] = (R_DC, G_DC, B_DC, _)
-    //   sh[1..3] = (X, Y, -Z) in each channel slot, padded order-2
-    //              to order-3 with zero L2 bands.
-    let diffuse_r = pv_ravi_order2(bump_normal, in.sh_r);
-    let diffuse_g = pv_ravi_order2(bump_normal, in.sh_g);
-    let diffuse_b = pv_ravi_order2(bump_normal, in.sh_b);
-    let diffuse_radiance_initial = vec3<f32>(diffuse_r, diffuse_g, diffuse_b);
+    // (diffuse_radiance_initial is computed below, AFTER the dominant
+    // light is extracted — the engine's static_per_vertex_ps uses
+    // ravi_order_2_with_dominant_light, which needs the dominant dir/intensity.)
 
     // Build the 10-vec4 SH array `calc_material` expects. Order-2
     // SH (DC + 3 L1) fills sh[0..3]; the remaining 6 slots (L2 bands +
@@ -232,6 +218,17 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     let dominant_light_dir = -dom_raw / dom_len;
     let dominant_light_intensity = in.dominant_intensity.xyz;
 
+    // HLSL static_per_vertex_ps → calc_output_color_with_explicit_light_linear_with_dominant_light
+    // (entry_points_fx.hlsl:348): the diffuse term uses
+    // `ravi_order_2_with_dominant_light` — subtract the dominant light from
+    // the SH, evaluate order-2 on the residual, then re-add the dominant as a
+    // sharper analytical lobe. (Plain `ravi_order_2` gives a too-soft
+    // directional response.) sh[0..3] is already in the channel-major
+    // (x, y, -z) layout this function expects (same as the cbuffer path).
+    let sh_linear = array<vec4<f32>, 4>(sh[0], sh[1], sh[2], sh[3]);
+    let diffuse_radiance_initial = ravi_order_2_with_dominant_light(
+        bump_normal, sh_linear, dominant_light_dir, dominant_light_intensity);
+
     // Engine `entry_points_fx.hlsl:760` — `(1, 1, 1, dot(N, L))`.
     // `.y` is unused per HLSL comment but written as 1.0 not 0.0.
     let prt_ravi_diff = vec4<f32>(1.0, 1.0, 1.0, dot(normal, dominant_light_dir));
@@ -276,7 +273,11 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
     var out_rgb: vec3<f32>;
     var alpha_out: f32 = __ALPHA_CHANNEL_OUTPUT__;
     if (BLEND_MULTIPLICATIVE_ENABLED > 0.5) {
-        out_rgb = (albedo_for_illum + self_illum_radiance) * BLEND_MULTIPLICATIVE_FACTOR;
+        // APPLY_OVERLAYS runs BEFORE the multiply factor (entry_points_fx.hlsl:254-256).
+        out_rgb = albedo_for_illum + self_illum_radiance;
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
+        out_rgb = out_rgb * BLEND_MULTIPLICATIVE_FACTOR;
     } else if (BLEND_FRESNEL_ENABLED > 0.5) {
         // glass BLEND_FRESNEL (entry_points_fx.hlsl:258) — diffuse
         // premultiplied by albedo.w; reflections additive; alpha =
@@ -285,6 +286,9 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
             + self_illum_radiance
             + envmap_radiance
             + mat.specular_color.xyz;
+        // APPLY_OVERLAYS (shared umbrella, all lighting variants) — overlay then edge_fade.
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
         out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
         alpha_out = saturate(mat.specular_color.w + albedo.w);
     } else {
@@ -292,6 +296,9 @@ fn fs_main(in: VertexOutput) -> AccumPixel {
             + mat.specular_color.xyz
             + self_illum_radiance
             + envmap_radiance;
+        // APPLY_OVERLAYS — overlay then edge_fade, before extinction/exposure.
+        out_rgb = calc_overlay_ps(out_rgb, texcoord);
+        out_rgb = calc_edge_fade_ps(out_rgb, view_dot_normal);
         out_rgb = (out_rgb * in.extinction + in.inscatter * BLEND_FOG_INSCATTER_SCALE) * g_exposure();
     }
     // Engine applies underwater fog via the separate `render_underwater_fog`

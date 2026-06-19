@@ -40,12 +40,3 @@ pub struct VisibleObjectRenderVisibility {
 
 const _: () = assert!(std::mem::size_of::<VisibleObjectRenderVisibility>() == 96);
 
-/// `e_visibility_object_flags` (visibility_collection_objects.h:13-21).
-pub mod visibility_object_flags {
-    pub const VISIBLE: u8 = 1 << 0;
-    pub const HAS_WIDGET: u8 = 1 << 1;
-    pub const NEVER_ACTIVE_CAMOS: u8 = 1 << 2;
-    pub const HAS_SHIELD_IMPACT_EFFECT: u8 = 1 << 3;
-    pub const IS_FIRST_PERSON: u8 = 1 << 4;
-    pub const FIRST_PERSON_DRAW_SQUISHED: u8 = 1 << 5;
-}

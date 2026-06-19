@@ -262,54 +262,6 @@ impl MaterialBindings {
         }
     }
 
-    /// Emit the WGSL declarations for @group(2) — one `var <name>:
-    /// texture_*<f32>;` per texture + the sampler at `sampler_slot`.
-    /// The cbuffer struct itself is emitted separately by
-    /// `cbuffer::emit_wgsl` at `cbuffer_slot`.
-    ///
-    /// Legacy single-sampler path — emits one `s_material` binding.
-    /// New call sites should use [`Self::emit_wgsl_per_binding`] with
-    /// a [`MaterialSamplerMap`] to honor the rmt2's authored per-binding
-    /// sampler config.
-    pub fn emit_wgsl(&self) -> String {
-        let mut out = String::new();
-        for tb in &self.textures {
-            let kind = if tb.is_cube {
-                "texture_cube<f32>"
-            } else {
-                "texture_2d<f32>"
-            };
-            out.push_str(&format!(
-                "@group(2) @binding({}) var {}: {};\n",
-                tb.slot, tb.name, kind,
-            ));
-        }
-        out.push_str(&format!(
-            "@group(2) @binding({}) var s_material: sampler;\n",
-            self.sampler_slot,
-        ));
-        // Per-draw decal constants — engine `set_shader_constant
-        // (0x140000, fade)` + `(0x130000, sprite_corner)` ports.
-        // Layout matches `DecalConstantsGpu` in
-        // `src/halo/render/render_decals.rs`.
-        if let Some(slot) = self.decal_constants_slot {
-            out.push_str(
-                "struct DecalConstants {\n\
-                    fade: f32,\n\
-                    pixel_kill_enabled: u32,\n\
-                    u_tiles: f32,\n\
-                    v_tiles: f32,\n\
-                    sprite_corner: vec4<f32>,\n\
-                };\n",
-            );
-            out.push_str(&format!(
-                "@group(2) @binding({}) var<uniform> decal_constants: DecalConstants;\n",
-                slot,
-            ));
-        }
-        out
-    }
-
     /// Per-binding-sampler emit. Lays out @group(2) as:
     /// - `[0..N)` — texture bindings (same as legacy)
     /// - `[N..N+K)` — one sampler per unique `SamplerKey` in
@@ -390,92 +342,6 @@ impl MaterialBindings {
         })
     }
 
-    /// Build the matching `wgpu::BindGroupLayout`.
-    pub fn build_bgl(&self, device: &wgpu::Device) -> wgpu::BindGroupLayout {
-        let filterable = wgpu::TextureSampleType::Float { filterable: true };
-        let mut entries = Vec::with_capacity(self.textures.len() + 2);
-        for tb in &self.textures {
-            let view_dimension = if tb.is_cube {
-                wgpu::TextureViewDimension::Cube
-            } else {
-                wgpu::TextureViewDimension::D2
-            };
-            entries.push(wgpu::BindGroupLayoutEntry {
-                binding: tb.slot,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    multisampled: false,
-                    view_dimension,
-                    sample_type: filterable,
-                },
-                count: None,
-            });
-        }
-        entries.push(wgpu::BindGroupLayoutEntry {
-            binding: self.sampler_slot,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-            count: None,
-        });
-        entries.push(wgpu::BindGroupLayoutEntry {
-            binding: self.cbuffer_slot,
-            // VERTEX_FRAGMENT — the foliage VS reads
-            // `material.animation_amplitude_horizontal.x` for the wind
-            // displacement (foliage_fx.hlsl:38 PARAM). Texture / sampler
-            // entries remain FRAGMENT-only.
-            //
-            // **Path B per-object cbuffer pool (2026-05-20):**
-            // `has_dynamic_offset: true` so a single material props
-            // buffer can host N per-(object, material) slots, picked
-            // via per-draw `set_bind_group(2, bg, &[slot * slot_size])`.
-            // Engine analog: `g_ps_parameters_data` / `g_vs_parameters_data`
-            // global pools (the engine writes per-draw into the slot
-            // indicated by `destination_indices` from
-            // `render_method_submit_volatile_per_node`).
-            //
-            // Static materials use offset 0 (single slot, never
-            // overwritten with per-object data). Animated materials
-            // get one slot per draw instance.
-            //
-            // **Engine fidelity note (P6.3 — 2026-05-13):** the engine
-            // technically has TWO separate cbuffers — `_ParametersPS`
-            // (pool 0x6F) and `_ParametersVS` (pool 0x6E), each sized
-            // independently from `pass.pixel_parameters_size` /
-            // `pass.vertex_parameters_size`. Protomorph merges them
-            // into this single binding with all of `rmt2.float_constants`
-            // in source order.
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: true,
-                min_binding_size: None,
-            },
-            count: None,
-        });
-        // Per-draw decal constants UBO (DecalConstants). Has dynamic
-        // offset so a single buffer can host ring-buffered per-decal
-        // payloads + the per-`draw_indexed` offset picks each decal's
-        // slice. VERTEX_FRAGMENT — sprite_corner is read in the VS.
-        if let Some(slot) = self.decal_constants_slot {
-            entries.push(wgpu::BindGroupLayoutEntry {
-                binding: slot,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<crate::halo::render::render_decals::DecalConstantsGpu>() as u64,
-                    ),
-                },
-                count: None,
-            });
-        }
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("halo_material_bgl_per_variant"),
-            entries: &entries,
-        })
-    }
-
     /// Per-binding-sampler BGL — one sampler entry per unique
     /// `SamplerKey` in `sampler_map`, plus the texture and cbuffer
     /// entries. Engine-faithful sampler routing per [`emit_wgsl_per_binding`].
@@ -551,10 +417,6 @@ impl MaterialBindings {
         })
     }
 
-    /// Look up a texture binding slot by Halo parameter name.
-    pub fn find(&self, name: &str) -> Option<&TextureBindingSlot> {
-        self.textures.iter().find(|t| t.name == name)
-    }
 }
 
 fn is_bitmap_param(p: &ResolvedParameter) -> bool {

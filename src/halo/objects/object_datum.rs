@@ -64,13 +64,6 @@ pub struct ObjectIdentifier {
     pub m_source: i8,
 }
 
-/// Engine `s_location` (4 bytes). The placement's BSP cluster + leaf.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Location {
-    pub cluster_reference: u16,
-    pub leaf_index: u16,
-}
-
 /// Engine `s_damage_owner` (12 bytes). Tracks who caused damage to
 /// this object — relevant once damage simulation lands.
 #[derive(Debug, Clone, Copy, Default)]
@@ -114,7 +107,7 @@ pub struct ObjectBody {
     pub scenario_datum_index: i16,
     pub map_variant_index: i16,
     pub pad0: i16,
-    pub location: Location,
+    pub location: crate::halo::scenario::location::Location,
     pub bounding_sphere_center: RealPoint3d,
     pub bounding_sphere_radius: f32,
     pub attached_bounds_center: RealPoint3d,
@@ -228,7 +221,7 @@ impl Default for ObjectBody {
             scenario_datum_index: -1,
             map_variant_index: -1,
             pad0: 0,
-            location: Location::default(),
+            location: crate::halo::scenario::location::Location::default(),
             bounding_sphere_center: RealPoint3d { x: 0.0, y: 0.0, z: 0.0 },
             bounding_sphere_radius: 0.0,
             attached_bounds_center: RealPoint3d { x: 0.0, y: 0.0, z: 0.0 },
@@ -665,14 +658,6 @@ impl ObjectDatum {
             _ => None,
         }
     }
-    pub fn as_mover(&self) -> Option<&MoverBody> {
-        match &self.layers {
-            TypeLayers::Biped(m, _, _)
-            | TypeLayers::Vehicle(m, _, _)
-            | TypeLayers::Giant(m, _, _) => Some(m),
-            _ => None,
-        }
-    }
     pub fn as_biped(&self) -> Option<&BipedBody> {
         match &self.layers {
             TypeLayers::Biped(_, _, b) => Some(b),
@@ -685,45 +670,15 @@ impl ObjectDatum {
             _ => None,
         }
     }
-    pub fn as_giant(&self) -> Option<&GiantBody> {
-        match &self.layers {
-            TypeLayers::Giant(_, _, g) => Some(g),
-            _ => None,
-        }
-    }
     pub fn as_device(&self) -> Option<&DeviceBody> {
         match &self.layers {
             TypeLayers::Machine(d, _) | TypeLayers::Control(d, _) | TypeLayers::Terminal(d, _) => Some(d),
             _ => None,
         }
     }
-    pub fn as_machine(&self) -> Option<&MachineBody> {
-        match &self.layers {
-            TypeLayers::Machine(_, m) => Some(m),
-            _ => None,
-        }
-    }
-    pub fn as_control(&self) -> Option<&ControlBody> {
-        match &self.layers {
-            TypeLayers::Control(_, c) => Some(c),
-            _ => None,
-        }
-    }
     pub fn as_terminal(&self) -> Option<&TerminalBody> {
         match &self.layers {
             TypeLayers::Terminal(_, t) => Some(t),
-            _ => None,
-        }
-    }
-    pub fn as_scenery(&self) -> Option<&SceneryBody> {
-        match &self.layers {
-            TypeLayers::Scenery(s) => Some(s),
-            _ => None,
-        }
-    }
-    pub fn as_crate(&self) -> Option<&CrateBody> {
-        match &self.layers {
-            TypeLayers::Crate(c) => Some(c),
             _ => None,
         }
     }

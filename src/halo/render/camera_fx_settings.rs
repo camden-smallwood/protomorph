@@ -280,9 +280,6 @@ const EXPOSURE_HISTORY_TICK_RATE: f32 = 30.0;
 /// `c_exposure` instance in the process. Used by `downsample_generate`
 /// to pick the next 1×1 R16Float ring slot (0..7) for the current
 /// frame's auto-exposure sample.
-///
-/// Reset via `Exposure::reset_next_render_target()` (engine-equivalent
-/// of zeroing the static on `initialize_for_new_map`).
 static EXPOSURE_M_NEXT_RENDER_TARGET: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
@@ -324,15 +321,6 @@ impl Exposure {
         let slot = EXPOSURE_M_NEXT_RENDER_TARGET.load(Ordering::Relaxed);
         EXPOSURE_M_NEXT_RENDER_TARGET.store((slot + 1) % 8, Ordering::Relaxed);
         slot
-    }
-
-    /// Reset `m_next_render_target` to 0. Engine equivalent of zeroing
-    /// the class-static during `s_render_game_state::initialize_for_new_map`
-    /// (engine doesn't explicitly call this — the static persists across
-    /// maps in practice — but protomorph exposes the reset for test
-    /// determinism and scenario teardown symmetry).
-    pub fn reset_next_render_target() {
-        EXPOSURE_M_NEXT_RENDER_TARGET.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `c_exposure::set_exposure @ 0x180687410` — verbatim port.
@@ -1320,13 +1308,6 @@ impl CameraFxValues {
             + g_exposure_stops
             + self.exposure_boost;
         v1.exp2() * tone_curve_white_point * 0.66943294
-    }
-
-    /// `c_camera_fx_values::get_display_exposure_stops @ 0x1806887C0` —
-    /// returns the exposure stops directly (post-blend, pre-pow2). Used
-    /// by debug HUD readouts. Engine reads `m_exposure.m_exposure`.
-    pub fn get_display_exposure_stops(&self) -> f32 {
-        self.exposure.exposure
     }
 
     /// `c_camera_fx_values::get_illum_render_scale @ 0x18068E390` —

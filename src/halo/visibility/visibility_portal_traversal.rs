@@ -229,14 +229,13 @@ pub fn visibility_build_region_from_projections(
     let mut clusters_to_region = ClustersToRegionClusters::new();
     let mut working_portal_stack = SWorkingPortalStack::new();
     let mut cluster_working_portals = SClusterWorkingPortals::new();
-    let mut working_portal_index_queue = SStaticIndexQueue::new();
     let mut transformed_portal_cache = STransformedPortalCache::new();
 
     for projection_index in 0..projection_count {
         // Reset per-projection scratch.
         working_portal_stack.clear();
         cluster_working_portals.clear();
-        working_portal_index_queue = SStaticIndexQueue::new();
+        let mut working_portal_index_queue = SStaticIndexQueue::new();
         transformed_portal_cache.clear();
 
         // Seed the BFS at the camera's cluster.

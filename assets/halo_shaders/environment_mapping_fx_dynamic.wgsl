@@ -57,7 +57,13 @@ fn calc_environment_map_dynamic_ps(
     let reflection = (reflection_0.rgb * reflection_0.a * 256.0) * blend
                    + (reflection_1.rgb * reflection_1.a * 256.0) * (vec3<f32>(1.0) - blend);
 
-    return reflection
+    // `__ENV_REFLECTION_GAIN__` is a DIAGNOSTIC A/B multiplier (default
+    // 1.0), substituted from `PROTOMORPH_ENV_GAIN` at WGSL assembly. Used
+    // to localize the pre-existing reflection-magnitude deficit on
+    // env-mapped surfaces (guardian glass/floor read matte vs MCC) — find
+    // the gain that matches MCC, then fix the real upstream term
+    // (ambient SH / env-cube level / exposure). Not engine-faithful; 1.0 = off.
+    return (__ENV_REFLECTION_GAIN__) * reflection
          * specular_reflectance_and_roughness.xyz
          * material.env_tint_color.xyz
          * low_frequency_specular_color;
