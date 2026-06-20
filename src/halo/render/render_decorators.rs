@@ -871,11 +871,20 @@ impl DecoratorRenderer {
                     let subpart_aabb: crate::halo::decorators::light_placement::MeshBounds = {
                         match rm.render_geometry.compression_info.first() {
                             Some(ci) => {
-                                let b0 = ci.position_bounds[0];
-                                let b1 = ci.position_bounds[1];
+                                // ⭐`position_bounds` is NOT a (min,max) corner pair — it's the
+                                // SEQUENTIAL tuple [xmin,xmax,ymin,ymax,zmin,zmax] packed across
+                                // the two real_point3d fields (engine `extract_rigid_vertex_data
+                                // @0x180490610` reads bounds[0..5] this way; same as blam-tags
+                                // `read_compression_bounds`). Reading them as corners mixes the
+                                // per-axis bounds → wrong `mesh_min`/`mesh_extent` → the bake's
+                                // sample ray START positions (`mesh_min + sample.pos × extent`)
+                                // land at the wrong place → down-rays miss the ground for
+                                // tall/asymmetric decorators → light_placement fails → full-bright.
+                                let pb0 = ci.position_bounds[0]; // (xmin, xmax, ymin)
+                                let pb1 = ci.position_bounds[1]; // (ymax, zmin, zmax)
                                 crate::halo::decorators::light_placement::MeshBounds {
-                                    min: Vec3::new(b0.x.min(b1.x), b0.y.min(b1.y), b0.z.min(b1.z)),
-                                    max: Vec3::new(b0.x.max(b1.x), b0.y.max(b1.y), b0.z.max(b1.z)),
+                                    min: Vec3::new(pb0.x, pb0.z, pb1.y), // (xmin, ymin, zmin)
+                                    max: Vec3::new(pb0.y, pb1.x, pb1.z), // (xmax, ymax, zmax)
                                 }
                             }
                             None => crate::halo::decorators::light_placement::MeshBounds {
@@ -1045,6 +1054,29 @@ impl DecoratorRenderer {
                         } else {
                             None
                         };
+                        // ⭐ DROP-ON-NONE (engine-faithful). When light_placement
+                        // (tool.exe `sub_140C4AF00`) returns false for a placement,
+                        // the engine's caller `structure_bsp_light_decorators_from_
+                        // scenario` (`sub_140C4BE80`) does NOT keep it: it compacts
+                        // the cluster block — copying only successful placements
+                        // forward (`if (light_placement(...)) { ++survivors; dst+=16 }`)
+                        // then writing `block.count = survivors` — so failed-bake
+                        // placements are REMOVED and MCC renders them ABSENT (the
+                        // engine even logs "could not light %d / %d decorators").
+                        // Painting them with the placement albedo
+                        // (`encode_tint_as_unbaked`) is the non-faithful "bright white
+                        // decorator" bug. These are genuine bake misses (e.g. lichen
+                        // whose hanging-pattern rays barely don't reach the ground, or
+                        // placements off any surface) — verified every bake input
+                        // (bounds/quat/scale/sample-table) is engine-exact, so the
+                        // engine's identical rays also miss. Skip the instance.
+                        if baked_color.is_none() {
+                            fallback_count += 1;
+                            if hist_diag {
+                                hist_dropped += 1;
+                            }
+                            continue;
+                        }
                         let (encoded, valid) = match baked_color {
                             Some(bc) => (bc.hdr_encoded, true),
                             None => (encode_tint_as_unbaked(&p.tint_color), false),
@@ -1199,22 +1231,29 @@ impl DecoratorRenderer {
                             pv, pp, sg, nl,
                         );
                     }
-                    let instance_buffer =
-                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("decorator_instances"),
-                            contents: bytemuck::cast_slice(&instances),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
+                    // Skip subgroups with zero instances — every placement here
+                    // was dropped (drop-on-None: genuine bake misses / floaters).
+                    // An empty `create_buffer_init` yields a 0-byte buffer whose
+                    // `.slice(..)` panics ("buffer slices can not be empty") at
+                    // draw time. No instances → nothing to draw, so skip.
+                    if !instances.is_empty() {
+                        let instance_buffer =
+                            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("decorator_instances"),
+                                contents: bytemuck::cast_slice(&instances),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            });
 
-                    subgroups.push(DecoratorSubgroup {
-                        vertex_buffer,
-                        index_buffer,
-                        index_count: mesh.indices.len() as u32,
-                        instance_buffer,
-                        instance_count: instances.len() as u32,
-                        mesh_index: *mesh_idx,
-                        cluster_runs,
-                    });
+                        subgroups.push(DecoratorSubgroup {
+                            vertex_buffer,
+                            index_buffer,
+                            index_count: mesh.indices.len() as u32,
+                            instance_buffer,
+                            instance_count: instances.len() as u32,
+                            mesh_index: *mesh_idx,
+                            cluster_runs,
+                        });
+                    }
                 }
 
                 if subgroups.is_empty() {

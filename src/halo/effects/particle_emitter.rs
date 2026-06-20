@@ -387,43 +387,32 @@ pub fn pulse_emitter(
     location_matrix: glam::Mat4,
     dt: f32,
     birth_time: f32,
-    duration: f32,
-    looping: bool,
+    fire_burst: bool,
+    active: bool,
     random_rotation: bool,
     lod: f32,
     max_new: u32,
     inherit_velocity: bool,
     out: &mut Vec<ParticleState>,
 ) -> u32 {
-    rt.age += dt;
+    // Event timing is owned by the event-lifecycle FSM (engine
+    // `effect_update_time` / `event_update_time`, see
+    // [`super::effect_event_fsm`]). The FSM tells this emitter, per frame,
+    // whether its event just started (`fire_burst` → re-fire `starting_count`,
+    // engine `event_create_particle_systems` at event start) and whether the
+    // event is in its duration window (`active` → emit `emission_rate*dt`).
+    // `rt.age` (the `system age` property input) is the time since the current
+    // activation: reset on the start edge, advanced while active.
+    if fire_burst {
+        rt.age = 0.0;
+    } else if active {
+        rt.age += dt;
+    }
     // `rt.live` is the emitter's true live-particle count (sum of its row
     // `used` counts), set by the caller after row retirement — the engine
     // reads the same from the emitter_gpu record at +0x14 for the clamp.
     // Engine `c_particle_emitter::pulse @0x180568690`: keep only the
-    // fractional accumulator at frame start, then add this frame's
-    // emission.
-    // Event lifecycle by `duration` (engine `effect_update_time
-    // @0x180309870`):
-    //  - non-looping: the event runs once and stops at `duration`.
-    //  - looping: `duration` is the RESTART PERIOD — the event re-runs each
-    //    cycle (`effect_restart_all_events`), which RE-FIRES `starting_count`.
-    //    Constant-rate effects (steam/snow) are unchanged (their burst is 0
-    //    and the rate is continuous); burst effects (sparks: starting_count
-    //    > 0, rate = 0) re-emit each period instead of firing once and
-    //    vanishing.
-    if duration > 0.0 {
-        if looping {
-            if rt.next_restart <= 0.0 {
-                rt.next_restart = duration; // first period
-            }
-            if rt.age >= rt.next_restart {
-                rt.started = false; // re-fire starting_count below
-                rt.next_restart += duration;
-            }
-        } else if rt.age >= duration {
-            return 0;
-        }
-    }
+    // fractional accumulator at frame start, then add this frame's emission.
     let sys_age = rt.age;
 
     // Emitter matrix + world origin for this frame (engine `this->m_matrix`).
@@ -460,11 +449,25 @@ pub fn pulse_emitter(
     // faithful property evaluator (state-list input/range + output modifier),
     // NOT the old stub — so a ranged/modified rate evaluates against the real
     // system_random / location_lod instead of 0.
-    if !rt.started {
-        rt.started = true;
-        rt.accumulator += eval_property(&emitter.particle_starting_count, &state).max(0.0);
+    if fire_burst {
+        let sc = eval_property(&emitter.particle_starting_count, &state);
+        if std::env::var_os("PROTOMORPH_DIAG_BURST").is_some() {
+            eprintln!(
+                "[burst] t={:.2} sc={:.3} rate_fn={} active={}",
+                birth_time,
+                sc,
+                emitter.particle_emission_rate.function.is_some(),
+                active,
+            );
+        }
+        rt.accumulator += sc.max(0.0);
     }
-    let rate = eval_property(&emitter.particle_emission_rate, &state).max(0.0);
+    // Continuous emission only while the event is in its duration window.
+    let rate = if active {
+        eval_property(&emitter.particle_emission_rate, &state).max(0.0)
+    } else {
+        0.0
+    };
     rt.accumulator += rate * dt;
     // max_count caps the accumulator by the live-particle headroom — engine
     // `if (max>0) acc = min(acc, max_count - live)`. The `× location_lod`

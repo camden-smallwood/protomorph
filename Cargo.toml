@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 # DEV: pointed at local checkout for the enum/flags-by-name refactor.
 # Re-pin to a git rev before merging (see task "Verify + re-pin blam-tags rev").
-blam-tags = { git = "https://github.com/camden-smallwood/blam-tags", rev = "80fa25adba9c32c007d3d760c48bea78cc6c4973" }
+blam-tags = { git = "https://github.com/camden-smallwood/blam-tags", rev = "cddbca9fe5eeeed68913ec067bde60d2b439a71c" }
 bitflags = "2"
 bytemuck = { version = "1.24", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }

@@ -1278,14 +1278,23 @@ fn convert_mesh(mesh: &RenderMesh, region_index: u8) -> ModelMesh {
     // Earlier comments claiming this was "data-blocked" were wrong for
     // tag format.) Construct's skydome carries a real blue gradient here.
     //
-    // The engine applies NO per-vertex heuristic — if the bit is set it
-    // uses the stream verbatim. We only guard the genuinely-empty case
-    // (`max < 1/255` ⇒ the block decoded to all-zero), where binding it
-    // would render the whole mesh black. A legitimate gradient that
-    // reaches 0 at some vertices (the skydome zenith) is NOT dropped.
-    // When dropped the dispatcher routes the mesh through the
-    // `_entry_point_static_lighting_sh` fallback (`render_mesh_part_default
-    // @ 0x18069EBC0:64-82`).
+    // The engine applies NO per-vertex heuristic — if the
+    // `_mesh_has_vertex_color_bit` is set it routes the mesh through
+    // `_entry_point_vertex_color_lighting` and uses the stream VERBATIM
+    // (`render_mesh_part_default @ 0x18069EBC0:64-82`). We mirror that:
+    // bit set ⇒ keep the stream, whatever the values.
+    //
+    // ⭐An ALL-ZERO stream is NOT "no data" — it can be intentional baked
+    // black. salvation's `tower_shadow` sky mesh (a flat alpha_blend
+    // ground-shadow decal authored near-black-blue × coverage-alpha) bakes
+    // its vertices to (0,0,0): the engine renders `vert_color·albedo ≈ 0`
+    // → the blend darkens the sand into a soft shadow. The old guard
+    // dropped exactly this stream (`max < 1/255`) and fell back to the
+    // bright sky-lightprobe SH path, which lit the BLUE albedo full-bright
+    // → the whole shadow turned saturated blue. A legitimate gradient that
+    // only touches 0 at the skydome zenith was never the problem (its
+    // `max` is well above the threshold). `PROTOMORPH_DROP_ZERO_SKY_VC=1`
+    // restores the old drop for A/B.
     let vert_color_stream: Vec<[f32; 3]> = if mesh.has_vertex_color {
         let stream: Vec<[f32; 3]> = mesh
             .vertices
@@ -1300,7 +1309,8 @@ fn convert_mesh(mesh: &RenderMesh, region_index: u8) -> ModelMesh {
                 if c[k] < min_seen { min_seen = c[k]; }
             }
         }
-        let drop = max_seen < 1.0 / 255.0;
+        let all_zero = max_seen < 1.0 / 255.0;
+        let drop = all_zero && std::env::var_os("PROTOMORPH_DROP_ZERO_SKY_VC").is_some();
         if std::env::var_os("PROTOMORPH_TRACE_SKY_VC").is_some() {
             let n = stream.len() as f32;
             if n > 0.0 {
@@ -1308,7 +1318,13 @@ fn convert_mesh(mesh: &RenderMesh, region_index: u8) -> ModelMesh {
                 for c in &stream {
                     for k in 0..3 { sum[k] += c[k]; }
                 }
-                let tag = if drop { "[DROPPED — all-zero stream]" } else { "" };
+                let tag = if drop {
+                    "[DROPPED — all-zero stream]"
+                } else if all_zero {
+                    "[KEPT — all-zero (baked black, e.g. shadow decal)]"
+                } else {
+                    ""
+                };
                 eprintln!(
                     "[sky/vc-stats] {} verts: avg=({:.4},{:.4},{:.4}) min={:.4} max={:.4} {}",
                     stream.len(),

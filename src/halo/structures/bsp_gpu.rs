@@ -385,6 +385,13 @@ pub struct BspGpu {
     /// the engine-faithful per-vertex vertex-stream pipeline ships
     /// (see reference_bsp_per_vertex_sh_stream.md).
     pub cluster_lighting_offsets: Vec<u32>,
+    /// Whether this BSP has a baked scenario lightmap (`bsp.lightmap.is_some()`).
+    /// When false (loose-tag data gap — e.g. mainmenu, whose scenario MCC never
+    /// loads), the per-pixel atlas is empty, so `render_cluster_mesh_part`
+    /// routes ALL clusters to the SH path (default sky probe) instead of
+    /// sampling a black atlas. When true, per-pixel materials keep their baked
+    /// lightmap (real shadows respected).
+    pub has_lightmap: bool,
     /// Per-cluster per-vertex SH vertex buffer — `Some(buf)` when the
     /// cluster has `pervertex_block_index >= 0` AND the lightmap
     /// `bsp_per_vertex_data[block_idx].lightprobe_data` count matches
@@ -1034,6 +1041,7 @@ impl BspGpu {
         };
         use crate::halo::render_methods::HaloEntryPoint;
         let lbsp = bsp.lightmap.as_ref();
+        let has_lightmap = lbsp.is_some();
         let instance_selections: Vec<SelectedEntry> = bsp
             .sbsp
             .instanced_geometry_instances
@@ -1465,6 +1473,7 @@ impl BspGpu {
             instance_selections,
             instance_lighting_offsets,
             cluster_lighting_offsets,
+            has_lightmap,
             cluster_per_vertex_sh_buffers,
             // Default — populated by `bake_cluster_simple_lights` at
             // scenario load once `scenario_lights` is resolved.

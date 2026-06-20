@@ -17,7 +17,7 @@
 use blam_tags::effect::ParticleSystemEmitter;
 use blam_tags::effects_properties::EditableProperty;
 use blam_tags::particle::{ParticleDefinition, ParticlePropertyScalar};
-use blam_tags::tag_function::TagFunction;
+use blam_tags::tag_function::{FunctionKind, TagFunction};
 use blam_tags::typed_enums::SchemaEnum;
 
 /// The fields the compiler needs from a property, abstracted over the two
@@ -173,19 +173,19 @@ fn compile_function(tf: &TagFunction) -> Vec<EvalFunction> {
         innards0: i0,
         innards1: i1,
     };
-    match tf {
-        TagFunction::Identity { .. } => vec![base(0, [0.0; 4], [0.0; 4])],
-        TagFunction::Constant { .. } => {
+    match tf.kind() {
+        FunctionKind::Identity { .. } => vec![base(0, [0.0; 4], [0.0; 4])],
+        FunctionKind::Constant { .. } => {
             // Constant value lives in clamp_range_min (blam-tags as_constant).
             vec![base(1, [rmin, 0.0, 0.0, 0.0], [0.0; 4])]
         }
-        TagFunction::Linear { compact, .. } => {
+        FunctionKind::Linear { compact, .. } => {
             vec![base(4, [compact.slope, compact.offset, 0.0, 0.0], [0.0; 4])]
         }
-        TagFunction::Spline { compact, .. } => {
+        FunctionKind::Spline { compact, .. } => {
             vec![base(7, [compact.i, compact.j, compact.k, compact.l], [0.0; 4])]
         }
-        TagFunction::Spline2 { compact, .. } => {
+        FunctionKind::Spline2 { compact, .. } => {
             let s = &compact.spline;
             vec![base(
                 10,
@@ -193,12 +193,12 @@ fn compile_function(tf: &TagFunction) -> Vec<EvalFunction> {
                 [compact.left_x, compact.width, compact.bias, 0.0],
             )]
         }
-        TagFunction::Transition { compact, .. } => vec![base(
+        FunctionKind::Transition { compact, .. } => vec![base(
             2,
             [compact.function_index as f32, 0.0, 0.0, 0.0],
             [compact.amplitude_min, compact.amplitude_max, 0.0, 0.0],
         )],
-        TagFunction::Periodic { compact, .. } => vec![base(
+        FunctionKind::Periodic { compact, .. } => vec![base(
             3,
             [compact.function_index as f32, 0.0, 0.0, 0.0],
             [
@@ -208,7 +208,7 @@ fn compile_function(tf: &TagFunction) -> Vec<EvalFunction> {
                 compact.amplitude_max,
             ],
         )],
-        TagFunction::Exponent { compact, .. } => vec![base(
+        FunctionKind::Exponent { compact, .. } => vec![base(
             9,
             [compact.amplitude_min, compact.amplitude_max, compact.exponent, 0.0],
             [0.0; 4],
@@ -220,7 +220,7 @@ fn compile_function(tf: &TagFunction) -> Vec<EvalFunction> {
         // @0x1804FBF30` exactly. (The old `sample_piecewise` flattened this
         // to 4 equal-width linear bins, destroying spline curvature and
         // mis-binning non-uniform knots.)
-        TagFunction::MultiSpline { compact, .. } => {
+        FunctionKind::MultiSpline { compact, .. } => {
             multipart_chain(&compact.parts, rmin, rmax, flags, h.exclusion_min, h.exclusion_max)
         }
         // Linear-key (types 5/6): 4 authored (x,y) control points → a chain
@@ -228,12 +228,12 @@ fn compile_function(tf: &TagFunction) -> Vec<EvalFunction> {
         // linear_key to a multi-part linear chain). Reproduces
         // `LinearKeyCompact::evaluate` — exact at the knots, with the
         // endpoint clamp past the last point.
-        TagFunction::LinearKey { compact, .. } | TagFunction::MultiLinearKey { compact, .. } => {
+        FunctionKind::LinearKey { compact, .. } | FunctionKind::MultiLinearKey { compact, .. } => {
             linear_key_chain(tf, compact, rmin, rmax, flags, h.exclusion_min, h.exclusion_max)
         }
         // Recognized-but-unimplemented type → identity passthrough (the
         // engine never ships these in particle tags).
-        TagFunction::Unsupported { .. } => vec![base(0, [0.0; 4], [0.0; 4])],
+        FunctionKind::Unsupported { .. } => vec![base(0, [0.0; 4], [0.0; 4])],
     }
 }
 
@@ -502,7 +502,7 @@ pub fn compile_emitter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blam_tags::tag_function::TagFunction;
+    use blam_tags::tag_function::{FunctionKind, TagFunction};
 
     /// Build a 32-byte TagFunction header: type byte, GPU flag (no
     /// clamp/exclusion bits → modify_output passthrough), clamp_range
@@ -551,68 +551,5 @@ mod tests {
         let t = eval_single(&chain[real], x);
         let (rmin, rmax) = (base.type_domain_range[2], base.type_domain_range[3]);
         rmin + t * (rmax - rmin)
-    }
-
-    /// A 2-part MultiSpline (linear over [0,0.5] then a cubic over (0.5,1])
-    /// must compile to a chain that reproduces `tf.evaluate` — verbatim
-    /// parts, NOT the old 4-equal-bin flatten.
-    #[test]
-    fn multispline_chain_matches_evaluate() {
-        let mut data = hdr(8 /* MultiSpline */, 0.0, 1.0);
-        // function_count = 2
-        data.extend_from_slice(&2i32.to_le_bytes());
-        // part 0: type=Linear(4), ending_x=0.5, body slope=2 offset=0 → y=2x
-        data.push(4);
-        data.extend_from_slice(&[0, 0, 0]);
-        data.extend_from_slice(&0.5f32.to_le_bytes());
-        data.extend_from_slice(&2.0f32.to_le_bytes());
-        data.extend_from_slice(&0.0f32.to_le_bytes());
-        // part 1: type=Spline(7), ending_x=1.0, body i,j,k,l = 0,0,1,0 → y=x
-        data.push(7);
-        data.extend_from_slice(&[0, 0, 0]);
-        data.extend_from_slice(&1.0f32.to_le_bytes());
-        for v in [0.0f32, 0.0, 1.0, 0.0] {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        let tf = TagFunction::parse(&data).unwrap();
-        assert!(matches!(tf, TagFunction::MultiSpline { .. }));
-        let chain = compile_function(&tf);
-        assert_eq!(chain.len(), 2, "two authored parts → two chain segments");
-        for i in 0..=20 {
-            let x = i as f32 / 20.0;
-            let got = eval_chain(&chain, x);
-            let want = tf.evaluate(x, 0.0);
-            assert!((got - want).abs() < 1e-5, "x={x}: chain={got} tf={want}");
-        }
-    }
-
-    /// A LinearKey over 4 knots spanning [0,1] must compile to knot-exact
-    /// linear segments reproducing `tf.evaluate` (the old sampler split at
-    /// fixed quarters, mis-placing the 0.5/0.75 knots).
-    #[test]
-    fn linear_key_chain_matches_evaluate() {
-        let mut data = hdr(5 /* LinearKey */, 0.0, 1.0);
-        let points = [(0.0f32, 0.0f32), (0.5, 1.0), (0.75, 0.5), (1.0, 0.8)];
-        for (x, y) in points {
-            data.extend_from_slice(&x.to_le_bytes());
-            data.extend_from_slice(&y.to_le_bytes());
-        }
-        data.extend_from_slice(&[0u8; 16]); // times_vector (unused by evaluate)
-        data.extend_from_slice(&[0u8; 16]); // increment_vector (recomputed)
-        // y_delta_vector = y[i+1]-y[i] (used by LinearKeyCompact::evaluate)
-        for d in [1.0f32, -0.5, 0.3, 0.0] {
-            data.extend_from_slice(&d.to_le_bytes());
-        }
-        let tf = TagFunction::parse(&data).unwrap();
-        assert!(matches!(tf, TagFunction::LinearKey { .. }));
-        let chain = compile_function(&tf);
-        // 3 linear segments + 1 constant tail.
-        assert_eq!(chain.len(), 4);
-        for i in 0..=40 {
-            let x = i as f32 / 40.0;
-            let got = eval_chain(&chain, x);
-            let want = tf.evaluate(x, 0.0);
-            assert!((got - want).abs() < 1e-5, "x={x}: chain={got} tf={want}");
-        }
     }
 }

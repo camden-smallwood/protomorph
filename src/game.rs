@@ -942,10 +942,17 @@ impl GameState {
             let renderer_model_idx = match palette_to_model.get(&idx).copied() {
                 Some(v) => v,
                 None => {
+                    // Resolve the on-disk extension from the palette entry's
+                    // group FOURCC (e.g. `mach` -> `device_machine`), NOT the
+                    // object-type label — a machine's tag is `.device_machine`,
+                    // not `.machine` (the mainmenu storm). Falls back to the
+                    // label for NONE refs / unknown groups.
+                    let ext = blam_tags::paths::group_tag_to_extension(entry.group_tag)
+                        .unwrap_or(ext_and_label);
                     let path = blam_tags::paths::resolve_tag_path(
                         tags_root,
                         &entry.tag_path,
-                        ext_and_label,
+                        ext,
                     );
                     let result = if !path.exists() {
                         eprintln!(
@@ -1181,8 +1188,10 @@ impl GameState {
             {
                 let parent_world = self.objects.get(obj).model_matrix();
                 let parent_lighting = self.objects.get(obj).engine_lighting_offset;
+                let parent_ext = blam_tags::paths::group_tag_to_extension(entry.group_tag)
+                    .unwrap_or(ext_and_label);
                 let parent_path =
-                    blam_tags::paths::resolve_tag_path(tags_root, &entry.tag_path, ext_and_label);
+                    blam_tags::paths::resolve_tag_path(tags_root, &entry.tag_path, parent_ext);
                 let placement_variant = p.permutation_data.variant_name.clone();
                 attached_child_count += self.spawn_attached_children(
                     renderer,

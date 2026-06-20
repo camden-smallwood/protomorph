@@ -125,6 +125,12 @@ pub struct LoadedScenario {
     /// + bloom + tonemap. Used to compute Halo's `view_exposure`
     /// (typically ~0.67) that's applied as `g_exposure` in shaders.
     pub camera_fx: Option<blam_tags::camera_fx_settings::CameraFxSettings>,
+    /// Global screen effect loaded from `scenario.global_screen_effect`
+    /// → `.area_screen_effect` (`sefc`). The full-screen color grade
+    /// (hue/saturation/desaturation/color-filter tint/gamma) the engine
+    /// accumulates every frame at falloff = 1.0 (`screen_effect_sample @
+    /// 0x1803A4E90`) — e.g. the mainmenu blue tint. `None` when unset.
+    pub screen_effect: Option<blam_tags::area_screen_effect::AreaScreenEffect>,
     /// Chocolate mountain table loaded from
     /// `scenario.chocolate_mountain` → `.chocolate_mountain_new`
     /// (`chmt`). Per-object-type minimum-luminance floor; the engine
@@ -563,6 +569,19 @@ impl LoadedScenario {
             let cfx_path = resolve_tag_path(&tags_root, &scenario.camera_fx_settings, "camera_fx_settings");
             TagFile::read(&cfx_path).ok().and_then(|t|
                 blam_tags::camera_fx_settings::CameraFxSettings::from_tag(&t).ok()
+            )
+        } else {
+            None
+        };
+
+        // Load the global screen effect (scenario.global_screen_effect →
+        // .area_screen_effect). The engine accumulates it every frame at
+        // falloff=1.0 and applies it as the final-composite color grade
+        // (`postprocess_player_view`). e.g. mainmenu's blue tint.
+        let screen_effect = if !scenario.global_screen_effect.is_empty() {
+            let sefc_path = resolve_tag_path(&tags_root, &scenario.global_screen_effect, "area_screen_effect");
+            TagFile::read(&sefc_path).ok().and_then(|t|
+                blam_tags::area_screen_effect::AreaScreenEffect::from_tag(&t).ok()
             )
         } else {
             None
@@ -1413,6 +1432,7 @@ impl LoadedScenario {
             default_wind,
             atmosphere,
             camera_fx,
+            screen_effect,
             chocolate_mountain,
             sky_lighting,
             decorator_sets,

@@ -776,8 +776,17 @@ impl FinalCompositePass {
         tone_curve_enabled: bool,
         tone_curve_white_point: f32,
         bling_scale: f32,
+        screen_grade: crate::halo::render::screen_effect::ScreenEffectGrade,
     ) {
         let mut params = CompositeParams::IDENTITY;
+        // Screen-effect (sefc) color grade. `hue_saturation_matrix` = engine
+        // `ps_postprocess_hue_saturation_matrix` (const 0x420002: hue/sat/
+        // desaturate/color-filter, contrast_enhance folded in). `contrast.x` =
+        // engine `ps_postprocess_contrast` (const 0x420005) which actually
+        // carries the GAMMA — the shader applies `pow(luminance, contrast.x)`.
+        // IDENTITY (matrix=I, gamma=1) when no global screen effect is active.
+        params.hue_saturation_matrix = screen_grade.matrix;
+        params.contrast[0] = screen_grade.gamma;
         params.cg_blend_factor[0] = cg_blend_factor;
         params.dof_focus = dof_focus;
         params.tone_curve_constants =

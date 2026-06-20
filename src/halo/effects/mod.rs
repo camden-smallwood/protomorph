@@ -32,6 +32,7 @@
 //! `effect_new_from_object @0x1802fb050`, `effects_update @0x1802fc080`.
 
 pub mod effect_definitions;
+pub mod effect_event_fsm;
 pub mod effects;
 pub mod light_volumes;
 pub mod particle_emitter;

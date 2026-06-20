@@ -123,6 +123,18 @@ pub struct LoadedModel {
     /// by `object_compute_function_value` case `variant` for the
     /// count (engine sid 501: `(index+1) / count`).
     pub variant_names: Vec<String>,
+
+    /// `model object data[0].radius` — the cache-builder's vertex-walked
+    /// auto-bake bounding sphere radius. The object datum's
+    /// `bounding_sphere_radius` is sourced from the object tag's
+    /// `bounding_radius` when authored, else this (engine: object-tag
+    /// 0 → `s_model_object_data[0]` flows through). `lights_distant_
+    /// lighting_at_point_new @ 0x1808A3220` reads that radius to size the
+    /// per-object lighting raycast (`ray = 10·max(radius, 0.4)`), so a
+    /// missing model radius makes tall objects (zanzibar main_crane) cast
+    /// a too-short ray, miss all geometry, and render black. `0.0` when the
+    /// hlmt has no `model object data`.
+    pub bounding_sphere_radius: f32,
 }
 
 impl LoadedTag {
@@ -429,7 +441,17 @@ fn parse_model(tag: &TagFile) -> LoadedModel {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    LoadedModel { variant_names }
+    // `model object data[0].radius` — auto-bake bounding sphere. Source for
+    // the object datum's bounding_sphere_radius when the object tag authored 0.
+    let bounding_sphere_radius = tag
+        .root()
+        .field("model object data")
+        .and_then(|f| f.as_block())
+        .and_then(|b| b.element(0))
+        .and_then(|e| e.read_real("radius"))
+        .filter(|r| *r > 0.0)
+        .unwrap_or(0.0);
+    LoadedModel { variant_names, bounding_sphere_radius }
 }
 
 fn fourcc_str(g: FourCC) -> String {

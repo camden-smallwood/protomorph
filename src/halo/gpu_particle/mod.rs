@@ -22,7 +22,7 @@ mod common_gpu;
 mod particle_block;
 pub mod light_volume_gpu;
 
-pub use common_gpu::{bake_sprite_frames, default_sprite_corner};
+pub use common_gpu::{bake_sprite_frames, default_sprite_corner, sprite_corner};
 pub use particle_block::{BatchMaterial, ParticleGpu};
 // Crate-internal re-exports — keep `crate::halo::gpu_particle::blend_state`
 // and `::MAX_SPRITE_FRAMES` resolving from their canonical `common_gpu` home.

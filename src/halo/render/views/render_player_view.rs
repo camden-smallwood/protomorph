@@ -1887,6 +1887,25 @@ impl PlayerView {
         } else {
             [0.0, 0.0, 0.0, 0.0]
         };
+        // Screen-effect (sefc) color grade — engine `screen_effect_sample` +
+        // `set_hue_saturaton_and_color_filters` accumulated each frame at
+        // falloff=1.0 for the scenario's global screen effect (the mainmenu
+        // blue tint). IDENTITY when no global screen effect is active.
+        // P-key toggle (renderer.screen_effect_enabled): when disabled, force
+        // the IDENTITY grade so the scene renders untinted.
+        let screen_grade = if renderer.screen_effect_enabled {
+            renderer
+                .loaded_scenario
+                .as_ref()
+                .and_then(|s| s.screen_effect.as_ref())
+                .map(|ase| {
+                    let settings = crate::halo::render::screen_effect::sample_global(ase);
+                    crate::halo::render::screen_effect::build_grade(&settings)
+                })
+                .unwrap_or(crate::halo::render::screen_effect::ScreenEffectGrade::IDENTITY)
+        } else {
+            crate::halo::render::screen_effect::ScreenEffectGrade::IDENTITY
+        };
         renderer.final_composite_pass.set_composite_params(
             &renderer.shared.queue,
             renderer.screen_postprocess.color_grading_blend_factor(),
@@ -1894,6 +1913,7 @@ impl PlayerView {
             renderer.screen_postprocess.settings_internal.tone_curve,
             renderer.screen_postprocess.settings_internal.tone_curve_white_point,
             renderer.screen_postprocess.bling_scale(),
+            screen_grade,
         );
 
         // DIAGNOSTIC (PROTOMORPH_NO_COMPOSITE=1): skip the final composite +

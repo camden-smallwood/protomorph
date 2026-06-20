@@ -83,6 +83,15 @@ pub struct EffectInstance {
     /// stay valid) but skipped by the pulse + render. A later
     /// [`EffectStore::spawn_instance`] reuses dead slots before growing the vec.
     pub dead: bool,
+    /// Per-event lifecycle timing (one per `definition.events`) — the engine
+    /// event_datum chain. Drives delay→duration→advance via
+    /// [`super::effect_event_fsm`]. Empty for weather (continuous, no FSM).
+    pub event_runtimes: Vec<super::effect_event_fsm::EventRuntime>,
+    /// Sequential event cursor (engine `event_datum_head`); `-1` = chain ended.
+    /// Unused for parallel (`RunEventsInParallel`) effects, which tick all events.
+    pub current_event: i32,
+    /// Engine LCG seed for delay/duration/skip randomization, seeded per instance.
+    pub rng_seed: u32,
 }
 
 /// Holds every loaded effect (deduped by path) and all live instances.
@@ -269,6 +278,20 @@ impl EffectStore {
                     emitter_physics.push(physics);
                     emitter_batches.push(batch_index);
                 }
+                // DIAG isolation (read-only): PROTOMORPH_ONLY_PSYS=<substr> keeps
+                // ONLY particle systems whose particle path contains <substr>;
+                // PROTOMORPH_SKIP_PSYS=<substr> drops matching ones. Lets us
+                // isolate beam_streak / beam_ember / beam_ring to see which draws what.
+                if let Ok(only) = std::env::var("PROTOMORPH_ONLY_PSYS") {
+                    if !particle_path.to_ascii_lowercase().contains(&only.to_ascii_lowercase()) {
+                        continue;
+                    }
+                }
+                if let Ok(skip) = std::env::var("PROTOMORPH_SKIP_PSYS") {
+                    if particle_path.to_ascii_lowercase().contains(&skip.to_ascii_lowercase()) {
+                        continue;
+                    }
+                }
                 systems.push(LoadedParticleSystem {
                     event_index,
                     particle_path,
@@ -397,6 +420,16 @@ impl EffectStore {
                     .collect()
             })
             .collect();
+        // Event-lifecycle FSM state: one runtime per definition event, an LCG
+        // seed per instance, and the sequential cursor armed at the first event.
+        let mut rng_seed = 0x9E3779B9u32
+            .wrapping_mul(instance_index as u32 + 1)
+            .wrapping_add(0x85EBCA6B);
+        let def = &self.effects[effect_index].definition;
+        let mut event_runtimes: Vec<super::effect_event_fsm::EventRuntime> =
+            vec![super::effect_event_fsm::EventRuntime::default(); def.events.len()];
+        let current_event =
+            super::effect_event_fsm::init_cursor(&mut event_runtimes, &mut rng_seed, def);
         let inst = EffectInstance {
             effect_index,
             host_header_index,
@@ -408,6 +441,9 @@ impl EffectStore {
             looping,
             weather: false,
             dead: false,
+            event_runtimes,
+            current_event,
+            rng_seed,
         };
         if instance_index == self.instances.len() {
             self.instances.push(inst);
@@ -578,27 +614,48 @@ impl EffectStore {
                 );
                 v
             };
-            // Looping if this is a looping INSTANCE (attachment/weather —
-            // engine `effect_update_time` skips the event lifecycle
-            // entirely for those, see [`EffectInstance::looping`]), or if
-            // the DEFINITION restarts its events when they finish (engine
-            // gate: definition flags bit1 — the restart branch in
-            // `effect_update_time @0x180309870`; `loop_start_event` only
-            // picks WHERE the restart begins).
-            let looping = inst.looping
-                || effect
-                    .definition
-                    .flags
-                    .contains(blam_tags::effect::EffectFlags::RunEventsInParallel)
-                || effect.definition.loop_start_event >= 0;
+            // Tick the event-lifecycle FSM (engine `effect_update_time` →
+            // `event_update_time`): delay→start(burst)→duration→advance, looping
+            // via `loop_start_event`. Produces a per-event {active, fire_burst}
+            // directive for this frame; only an ACTIVE event's emitters emit.
+            // Parallel effects (`RunEventsInParallel`) run every event's own
+            // cycle independently. See [`super::effect_event_fsm`].
+            let parallel = effect
+                .definition
+                .flags
+                .contains(blam_tags::effect::EffectFlags::RunEventsInParallel);
+            let event_fires = if effect.definition.events.is_empty() {
+                Vec::new()
+            } else if parallel {
+                super::effect_event_fsm::tick_parallel(
+                    &mut inst.event_runtimes,
+                    &mut inst.rng_seed,
+                    &effect.definition,
+                    dt,
+                )
+            } else {
+                super::effect_event_fsm::tick_sequential(
+                    &mut inst.event_runtimes,
+                    &mut inst.current_event,
+                    &mut inst.rng_seed,
+                    &effect.definition,
+                    dt,
+                )
+            };
             for (si, sys) in effect.systems.iter().enumerate() {
-                // Event duration drives the loop period. Use the upper bound.
-                let duration = effect
-                    .definition
-                    .events
+                // This system's per-frame event directive. Weather emits
+                // continuously (camera-anchored snow/rain) regardless of FSM
+                // phase; everything else follows the FSM. The emitter is pulsed
+                // EVERY frame (so its rows retire / particles age out on time
+                // even during the event's delay gap — skipping the pulse froze
+                // retirement and made looping effects pop); emission itself is
+                // gated to `active`/`fire_burst` inside `pulse_emitter`.
+                let fire = event_fires
                     .get(sys.event_index)
-                    .map(|e| e.duration_bounds.upper.max(e.duration_bounds.lower))
-                    .unwrap_or(0.0);
+                    .copied()
+                    .unwrap_or_default();
+                let fire_burst = fire.fire_burst;
+                let active = fire.active || inst.weather;
                 // Location matrix = host_world × marker_local (the marker
                 // rotation orients emission). Falls back to host_world.
                 let loc_idx = sys.system.location.max(0) as usize;
@@ -646,8 +703,8 @@ impl EffectStore {
                         lod,
                         dt,
                         birth_time,
-                        duration,
-                        looping,
+                        fire_burst,
+                        active,
                         emit_scale,
                         &mut remaining_emitters,
                         &mut remaining_budget,

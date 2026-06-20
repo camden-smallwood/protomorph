@@ -16,7 +16,6 @@
 //! See `reference_h3_structure_render_pipeline.md` for the deep
 //! dllcache trace of the call chain.
 
-use std::sync::Arc;
 
 use crate::halo::render::shared::FrameContext;
 use crate::halo::render_methods::HaloEntryPoint;
@@ -153,9 +152,6 @@ pub struct RenderInstancePart {
 /// `g_render_structure_globals`; we own the state on the struct and
 /// the methods take `&mut self` / `&self` as appropriate.
 pub struct StructureRenderer {
-    /// `g_render_structure_globals.lightmap_bsp_data[16]` — populated
-    /// per scenario load, `None` for empty BSP slots.
-    pub lightmap_bsp_data: Vec<Option<Arc<blam_tags::scenario_lightmap::LightmapBspData>>>,
     /// `render_cluster_parts` flat list — built each frame by
     /// `submit_visibility`.
     pub cluster_parts: Vec<RenderClusterPart>,
@@ -204,7 +200,6 @@ pub struct StructureRenderer {
 impl StructureRenderer {
     pub fn new() -> Self {
         Self {
-            lightmap_bsp_data: Vec::new(),
             cluster_parts: Vec::new(),
             instance_parts: Vec::new(),
             bsps: Vec::new(),
@@ -224,8 +219,8 @@ impl StructureRenderer {
     /// load: every field below is already empty / `next_probe_slot == 1`,
     /// so the clears are byte-identical to today.
     ///
-    /// `lightmap_bsp_data`, `bsps`, `bsp_cluster_meshes`,
-    /// `bsp_cluster_bounds` and `bsp_instance_bounds` are all repopulated
+    /// `bsps`, `bsp_cluster_meshes`, `bsp_cluster_bounds` and
+    /// `bsp_instance_bounds` are all repopulated
     /// by `Renderer::upload_bsp` (driven from `game.rs::load_scene` after
     /// `load_scenario` returns). `cluster_parts` / `instance_parts` are
     /// rebuilt every frame by `submit_visibility`, so they're cleared here
@@ -234,7 +229,6 @@ impl StructureRenderer {
     /// `is_none()`), so they're left alone — they're shared per-frame
     /// scratch bindings, not per-scenario content.
     pub fn reset(&mut self) {
-        self.lightmap_bsp_data.clear();
         self.cluster_parts.clear();
         self.instance_parts.clear();
         self.bsps.clear();
@@ -661,12 +655,21 @@ impl StructureRenderer {
         // guaranteed for foliage clusters either. Treating both
         // subclasses the same as terrain is the safe engine-faithful
         // route.
-        let group = material.render_method_group_tag.to_be_bytes();
-        let force_sh = group == *b"rmtr" || group == *b"rmfl";
-        let use_per_vertex = !force_sh
-            && cluster_pv_buf.is_some()
-            && !matches!(entry_point, HaloEntryPoint::Albedo);
-        let use_sh = force_sh || cluster_offset != 0;
+        // Centralized cluster pipeline pick (mirrors the engine's
+        // render_cluster_mesh_part @0x18068F7F0: rmtr/rmfl → SH) + protomorph's
+        // no-lightmap-BSP → SH routing (loose-tag data gap, e.g. mainmenu, whose
+        // empty per-pixel atlas would render StaticPerPixel clusters black). Lives
+        // in select_entry_point.rs next to select_instance_entry_point so the
+        // cluster + instance lighting selections can't silently diverge again.
+        let sel = crate::halo::render::select_entry_point::select_cluster_entry_point(
+            material.render_method_group_tag,
+            bsp.has_lightmap,
+            cluster_offset,
+            cluster_pv_buf.is_some(),
+            matches!(entry_point, HaloEntryPoint::Albedo),
+        );
+        let use_per_vertex = sel.use_per_vertex;
+        let use_sh = sel.use_sh;
 
         let (artifacts_opt, bind_groups_opt) = match entry_point {
             HaloEntryPoint::Albedo => (

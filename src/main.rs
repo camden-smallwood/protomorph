@@ -102,11 +102,10 @@ impl ApplicationHandler for App {
                                 );
                             }
                             if key == KeyCode::KeyP {
-                                let d = &mut gpu.decal_gpu;
-                                d.render_enabled = !d.render_enabled;
+                                gpu.screen_effect_enabled = !gpu.screen_effect_enabled;
                                 eprintln!(
-                                    "[diag] decal_gpu.render_enabled = {}",
-                                    d.render_enabled,
+                                    "[diag] screen_effect_enabled = {}",
+                                    gpu.screen_effect_enabled,
                                 );
                             }
                         }

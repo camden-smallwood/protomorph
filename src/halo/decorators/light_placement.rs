@@ -280,6 +280,13 @@ pub fn light_placement(
     let mut acc_normal = Vec3::ZERO;
     let mut total_weight = 0.0_f32;
     let mut diag_hits = 0u8;
+    // Failure-mode counters (PROTOMORPH_DIAG_DECO_FAIL): per failing placement,
+    // how many of the 10 sample rays MISSED (no geometry hit) vs HIT a surface
+    // read as dark (SH[0] <= 0, dropped by the engine drop-zero gate).
+    let mut n_miss = 0u8;
+    let mut n_hit_dark = 0u8;
+    let mut n_nohit = 0u8;
+    let mut n_hitfail = 0u8;
 
     // Engine lines 220-270: sample loop.
     for sample in table {
@@ -300,6 +307,7 @@ pub fn light_placement(
         // occluded" gate.
         let mut hit_sample = GeometrySample::default();
         let mut got_hit = false;
+        let mut main_outcome = GeometrySamplerOutcome::NoHit;
 
         if visibility_gate {
             let precast_dir = world_sample_pos - bsphere_world;
@@ -348,9 +356,27 @@ pub fn light_placement(
             if outcome == GeometrySamplerOutcome::Success {
                 got_hit = true;
             }
+            main_outcome = outcome;
         }
 
+        if std::env::var("PROTOMORPH_DIAG_BAKE_AT").ok().and_then(|s| {
+            let p: Vec<f32> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+            if p.len() != 4 { return None; }
+            let d = placement_pos - Vec3::new(p[0], p[1], p[2]);
+            if d.length_squared() <= p[3]*p[3] { Some(()) } else { None }
+        }).is_some() {
+            eprintln!(
+                "[ray] start=({:.3},{:.3},{:.3}) dir_len=({:.3},{:.3},{:.3}) |len|={:.4} hit={got_hit} outcome={main_outcome:?}",
+                world_sample_pos.x, world_sample_pos.y, world_sample_pos.z,
+                ray_dir_world.x, ray_dir_world.y, ray_dir_world.z, ray_dir_world.length(),
+            );
+        }
         if !got_hit {
+            n_miss += 1;
+            match main_outcome {
+                GeometrySamplerOutcome::HitButFailure => n_hitfail += 1,
+                _ => n_nohit += 1,
+            }
             continue;
         }
 
@@ -383,6 +409,7 @@ pub fn light_placement(
             && hit_sample.light_probe_g[0] <= 0.0
             && hit_sample.light_probe_b[0] <= 0.0
         {
+            n_hit_dark += 1;
             continue;
         }
 
@@ -453,9 +480,69 @@ pub fn light_placement(
         );
     }
 
+    // ── GROUND-SAMPLE FALLBACK (deliberate, documented divergence) ──
+    // The engine's HANGING pattern (lichen) has NO downward ray — it samples
+    // sideways/up, for lichen clinging to walls. A lichen authored on flat
+    // OPEN ground therefore samples nothing and the engine DROPS it
+    // (`sub_140C4BE80` compacts it out). But it genuinely sits on lit ground:
+    // verified a straight-down ray hits the lit floor 1-5mm below, and the
+    // down-gap distribution cleanly separates on-ground placements (≤~5mm) from
+    // genuine floaters (>16cm / hit-nothing). So when ALL pattern rays miss,
+    // give the placement the SAME primary down-ray a GROUND-pattern decorator
+    // already casts (length `radius·2.8·scale`): on-ground placements light from
+    // the real lit floor, genuine floaters (ray hits air) stay dropped. The
+    // engine does not do this — it's a knowing improvement so a lichen on lit
+    // ground renders lit instead of vanishing. Disable with the env below to
+    // get strict engine-faithful drop-on-miss.
+    if total_weight <= 0.0 && std::env::var_os("PROTOMORPH_NO_DECORATOR_GROUND_FALLBACK").is_none() {
+        let down_len = (radius * 2.8 * placement_scale).max(1e-3);
+        let mut hit = GeometrySample::default();
+        let oc = c_geometry_sampler_sample(
+            scenario,
+            lightprobe_atlas,
+            intensity_atlas,
+            lightprobe_pixels_per_probe,
+            dominant_pixels_per_probe,
+            RealPoint3d { x: placement_pos.x, y: placement_pos.y, z: placement_pos.z },
+            RealVector3d { i: 0.0, j: 0.0, k: -down_len },
+            /*ignore_all_objects*/ true,
+            /*ignore_object_index*/ -1,
+            /*light_probe*/ true,
+            /*diffuse*/ true,
+            &mut hit,
+        );
+        if oc == GeometrySamplerOutcome::Success
+            && (hit.light_probe_r[0] > 0.0 || hit.light_probe_g[0] > 0.0 || hit.light_probe_b[0] > 0.0)
+        {
+            let hp = Vec3::new(hit.sample_point.x, hit.sample_point.y, hit.sample_point.z);
+            let w = 1.0 / ((hp - placement_pos).length() + r_threshold);
+            for k in 0..9 {
+                acc_sh_r[k] += hit.light_probe_r[k] * w;
+                acc_sh_g[k] += hit.light_probe_g[k] * w;
+                acc_sh_b[k] += hit.light_probe_b[k] * w;
+            }
+            acc_diffuse += Vec3::new(hit.diffuse.i, hit.diffuse.j, hit.diffuse.k) * w;
+            acc_normal += Vec3::new(hit.normal.i, hit.normal.j, hit.normal.k) * w;
+            total_weight += w;
+        }
+    }
+
     // Engine line 277-278: no hits → return false (placement dropped).
     if total_weight <= 0.0 {
         if diag { eprintln!("[bake-diag]   DROPPED (total_weight=0)"); }
+        if std::env::var_os("PROTOMORPH_DIAG_DECO_FAIL").is_some() {
+            let raw_q_mag2 = placement.rotation.i * placement.rotation.i
+                + placement.rotation.j * placement.rotation.j
+                + placement.rotation.k * placement.rotation.k
+                + placement.rotation.w * placement.rotation.w;
+            eprintln!(
+                "[deco-fail] pos=({:.3},{:.3},{:.3}) radius={radius:.4} scale={placement_scale:.4} \
+                 raw_|q|^2={raw_q_mag2:.4} max_ray_len={:.4} miss={n_miss}/10 (nohit={n_nohit} hitfail={n_hitfail}) hit_dark={n_hit_dark}/10 extent=({:.3},{:.3},{:.3})",
+                placement_pos.x, placement_pos.y, placement_pos.z,
+                radius * 2.8 * placement_scale,
+                mesh_extent.x, mesh_extent.y, mesh_extent.z,
+            );
+        }
         return None;
     }
 

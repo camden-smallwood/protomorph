@@ -45,6 +45,49 @@ pub fn default_sprite_corner(bitmap_w: u32, bitmap_h: u32, center_offset: [f32; 
     [(-1.0 - rx) * ax, (-1.0 - ry) * ay, 2.0 * ax, 2.0 * ay]
 }
 
+/// Bake the sprite corner from a sequence sprite's UV rect + registration —
+/// the per-sprite case `default_sprite_corner` defers. A sprite-sheet sprite
+/// (e.g. a lightning bolt: `left..right` ≈ 0.23 wide, `top..bottom` = 1.0 tall)
+/// is tall+narrow, so the quad MUST take the sprite's aspect; using the full
+/// bitmap (square) stretches a narrow bolt across a square quad → ~4× too wide.
+/// Generalizes `default_sprite_corner` (same engine formula) with the sprite's
+/// own rect + sprite-local `registration_point` instead of the full-bitmap
+/// `(0,1,0,1)` / centered registration.
+pub fn sprite_corner(
+    sprite: &blam_tags::bitmap::BitmapSprite,
+    bitmap_w: u32,
+    bitmap_h: u32,
+    center_offset: [f32; 2],
+) -> [f32; 4] {
+    let v50 = if bitmap_w != bitmap_h && bitmap_h != 0 {
+        bitmap_w as f32 / bitmap_h as f32
+    } else {
+        1.0
+    };
+    let sw = sprite.right - sprite.left;
+    let sh = sprite.bottom - sprite.top;
+    let mut ax = 1.0f32;
+    let mut ay = 1.0f32;
+    if sw <= sh {
+        ax = sw / sh;
+    } else {
+        ay = sh / sw;
+    }
+    ax *= v50;
+    // Registration → pivot. VERIFIED against the engine
+    // `c_particle_definition::postprocess_frame_animation` (Reach XEX
+    // @0x82ed5c30, lines 218-230): the sprite registration_point gets the
+    // particle center_offset added (y inverted), then is divided by the sprite
+    // extent — `rx = (reg_x / sw)*2 - 1`. (registration_point is the UV offset
+    // within the sprite, not a [0,1] fraction.) Same formula as
+    // `default_sprite_corner`, fed the sprite's own rect + registration.
+    let reg_x = sprite.registration_point[0] + center_offset[0];
+    let reg_y = sprite.registration_point[1] - center_offset[1];
+    let rx = (reg_x / sw) * 2.0 - 1.0;
+    let ry = (reg_y / sh) * 2.0 - 1.0;
+    [(-1.0 - rx) * ax, (-1.0 - ry) * ay, 2.0 * ax, 2.0 * ay]
+}
+
 /// Bake a sprite-sheet sequence's frames into the engine `frame_texcoord`
 /// UV form `(left, top, right-left, bottom-top)`. `seq_index` selects the
 /// particle's `first sequence index`; out-of-range or empty → no frames

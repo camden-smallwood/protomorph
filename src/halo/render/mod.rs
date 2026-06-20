@@ -19,6 +19,7 @@ pub mod structure_renderer;
 pub mod camera_fx_settings;
 pub mod chocalate_mountain;
 pub mod color_grading;
+pub mod screen_effect;
 // Phase 9.2 cleanup (2026-05-26): `render::geometry_sampler` shim deleted;
 // the engine-verbatim `lights_distant_lighting_at_point_new` lives in
 // [`crate::halo::geometry::geometry_sampling`] using the full 504-B
@@ -598,6 +599,12 @@ pub struct Renderer {
     /// `c_vertex_allocator` / `c_index_allocator` LRU pools.
     pub decal_gpu: crate::halo::render::render_decals::DecalGpuState,
 
+    /// Runtime toggle for the global screen-effect (sefc) color grade — the
+    /// mainmenu blue tint. `false` forces the IDENTITY grade in
+    /// `render_player_view` so the scene renders untinted. Toggled with the P key
+    /// (see main.rs). Default `true`.
+    pub screen_effect_enabled: bool,
+
     /// GPU particle subsystem — the persistent RawParticleState grid +
     /// spawn/update/render compute (effects: waterfall mist, etc.).
     pub particle_gpu: crate::halo::gpu_particle::ParticleGpu,
@@ -1034,6 +1041,7 @@ impl Renderer {
             rasterizer_globals: blam_tags::rasterizer_globals::RasterizerGlobals::default(),
             loaded_scenario: None,
             decal_gpu: crate::halo::render::render_decals::DecalGpuState::default(),
+            screen_effect_enabled: true,
             particle_gpu,
             camera_visibility: crate::halo::visibility::CVisibilityCollection::new(),
             visible_items: crate::halo::visibility::CVisibleItems::new(),
@@ -1202,11 +1210,26 @@ impl Renderer {
                     ph.rot_friction,
                     0.0,
                 ],
-                corner: crate::halo::gpu_particle::default_sprite_corner(
-                    base_w,
-                    base_h,
-                    d.center_offset,
-                ),
+                // Corner (the billboard quad) takes the SPRITE's aspect when the
+                // bitmap is a sprite sheet — a tall+narrow bolt sprite must not
+                // be stretched across a square quad (renders ~4× too wide). The
+                // per-frame UV is handled separately by `bake_sprite_frames`;
+                // here we take the first sprite of the selected sequence for the
+                // geometry aspect (frames share aspect in practice).
+                corner: usize::try_from(d.first_sequence_index)
+                    .ok()
+                    .and_then(|i| sequences.get(i))
+                    .and_then(|seq| seq.sprites.first())
+                    .map(|sp| {
+                        crate::halo::gpu_particle::sprite_corner(sp, base_w, base_h, d.center_offset)
+                    })
+                    .unwrap_or_else(|| {
+                        crate::halo::gpu_particle::default_sprite_corner(
+                            base_w,
+                            base_h,
+                            d.center_offset,
+                        )
+                    }),
                 rotation_offset: d.rotation_offset,
                 depth_fade: d.render_info.depth_fade,
                 fog: d.render_info.fog,
@@ -1443,6 +1466,15 @@ impl Renderer {
             // tone curve constants are recomputed from
             // `screen_postprocess.settings_internal` instead of the
             // default-1.0 fallback baked into `set_cg_blend_factor`.
+            let screen_grade = self
+                .loaded_scenario
+                .as_ref()
+                .and_then(|s| s.screen_effect.as_ref())
+                .map(|ase| {
+                    let settings = crate::halo::render::screen_effect::sample_global(ase);
+                    crate::halo::render::screen_effect::build_grade(&settings)
+                })
+                .unwrap_or(crate::halo::render::screen_effect::ScreenEffectGrade::IDENTITY);
             self.final_composite_pass.set_composite_params(
                 &self.shared.queue,
                 self.screen_postprocess.color_grading_blend_factor(),
@@ -1450,6 +1482,7 @@ impl Renderer {
                 self.screen_postprocess.settings_internal.tone_curve,
                 self.screen_postprocess.settings_internal.tone_curve_white_point,
                 self.screen_postprocess.bling_scale(),
+                screen_grade,
             );
             match cfx.color_grading.as_ref() {
                 Some(cg) if cg.is_enabled() => {

@@ -348,6 +348,28 @@ pub fn populate_from_scenario(
             .unwrap_or_default()
     }
 
+    /// Effective object bounding-sphere radius, matching engine
+    /// `c_object::initialize` / `object_get_bounding_sphere`: the object
+    /// tag's `bounding_radius` when authored (>0), otherwise the model's
+    /// `model object data[0]` auto-bake radius. Raw tags author 0 for most
+    /// objects (the value is filled at cache-build), so without the model
+    /// fallback tall objects get a 0 radius → too-short per-object lighting
+    /// raycast (`lights_distant_lighting_at_point_new`: ray = 10·max(r,0.4))
+    /// → miss → black (zanzibar main_crane).
+    fn effective_bounding_radius(obj_def: &ObjectDefinition) -> f32 {
+        if obj_def.has_authored_bounding_sphere() {
+            return obj_def.bounding_radius;
+        }
+        if obj_def.model.is_empty() {
+            return obj_def.bounding_radius;
+        }
+        tag_get(*b"hlmt", &obj_def.model)
+            .and_then(|t| t.as_model())
+            .map(|m| m.bounding_sphere_radius)
+            .filter(|r| *r > 0.0)
+            .unwrap_or(obj_def.bounding_radius)
+    }
+
     fn push_block(
         out: &mut Vec<ObjectHeaderDatum>,
         empty: &Arc<ObjectDefinition>,
@@ -385,7 +407,7 @@ pub fn populate_from_scenario(
                     &variant_names,
                     i as u32,
                     header_index,
-                    object_definition.bounding_radius,
+                    effective_bounding_radius(&object_definition),
                 ),
             ));
             out.push(ObjectHeaderDatum {

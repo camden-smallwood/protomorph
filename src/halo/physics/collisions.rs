@@ -476,11 +476,25 @@ pub fn instanced_geometry_test_vector_internal(
     let transformed_point = matrix4x3_inverse_transform_point(&xform, point);
     let transformed_vector = matrix4x3_inverse_transform_vector(&xform, vector);
 
-    // 6. Pick which collision BSP to test. Engine flag bit 0x10 (render-only-
-    //    BSPs) switches to `definition.render_bsp` when set; otherwise the
-    //    standard `definition.bsp`. We currently only carry `definition.bsp`
-    //    in blam-tags — render_bsp is a TODO for when needed.
-    let collision_bsp = match definition.bsp.as_ref() {
+    // 6. Pick which collision BSP to test. Engine
+    //    `instanced_geometry_test_vector_internal @ 0x180400170`:
+    //      p_bsp = &definition.bsp;                    // `collision info`
+    //      if ((flags & 0x10) && render_bsp.count) p_bsp = render_bsp[0];
+    //    Flag bit 0x10 (RENDER_ONLY_BSPS) is ALWAYS set by
+    //    `c_geometry_sampler::geometry_test_vector` (flags 0x4811/0x4819), so
+    //    per-object LIGHTING raycasts must use the DETAILED `render bsp` —
+    //    whose bsp2d leaves return surface indices into the definition's
+    //    95-element `structure_surfaces`. `collision info` is the simplified
+    //    physics box (e.g. 6 faces); its surface indices (0..5) mis-index
+    //    `structure_surfaces`, which made instance-mounted objects (zanzibar
+    //    turret/main_crane/markers) sample the wrong surface → black.
+    let use_render_bsp = (flags.collision_flags.bits() & 0x0010) != 0;
+    let collision_bsp = if use_render_bsp {
+        definition.render_bsp.as_ref().or(definition.bsp.as_ref())
+    } else {
+        definition.bsp.as_ref()
+    };
+    let collision_bsp = match collision_bsp {
         Some(b) => b,
         None => return false,
     };

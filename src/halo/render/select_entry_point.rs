@@ -221,3 +221,37 @@ pub fn select_instance_entry_point(
     out.default_lighting_fallback = true;
     out
 }
+
+/// Which pipeline a CLUSTER mesh part draws through. Clusters don't have the
+/// per-instance UV-stream / single-probe variety of instances, so the choice is
+/// simpler than [`select_instance_entry_point`], but centralized here so the
+/// cluster and instance lighting selections live side by side (the cluster path
+/// previously diverged inline and silently lacked the no-lightmap case).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClusterSelection {
+    /// Route through `StaticShPerVertex` (per-vertex SH 2nd stream).
+    pub use_per_vertex: bool,
+    /// Route through `StaticSh` (cbuffer SH probe). When both are false the
+    /// cluster uses `StaticPerPixel` (the baked lightmap atlas).
+    pub use_sh: bool,
+}
+
+/// `render_cluster_mesh_part @ 0x18068F7F0`'s pipeline pick. The engine forces
+/// terrain (`rmtr`) and foliage (`rmfl`) to the SH path; protomorph also routes
+/// ALL clusters to SH when the BSP has no baked lightmap at all (loose-tag data
+/// gap, e.g. mainmenu) so they light from the cluster sky probe instead of an
+/// empty per-pixel atlas. A non-zero `cluster_lighting_offset` (authored
+/// per-vertex SH bridged to a cbuffer probe) also forces SH.
+pub fn select_cluster_entry_point(
+    render_method_group_tag: u32,
+    bsp_has_lightmap: bool,
+    cluster_lighting_offset: u32,
+    cluster_has_per_vertex_buffer: bool,
+    is_albedo_pass: bool,
+) -> ClusterSelection {
+    let group = render_method_group_tag.to_be_bytes();
+    let force_sh = group == *b"rmtr" || group == *b"rmfl";
+    let use_per_vertex = !force_sh && cluster_has_per_vertex_buffer && !is_albedo_pass;
+    let use_sh = force_sh || cluster_lighting_offset != 0 || !bsp_has_lightmap;
+    ClusterSelection { use_per_vertex, use_sh }
+}
